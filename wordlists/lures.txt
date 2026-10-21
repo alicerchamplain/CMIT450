@@ -1,0 +1,120 @@
+Повістка
+Повістка про виклик
+Виклик
+Підозрюваний
+Суд
+Ухвала
+Постанова
+Рішення суду
+Виконавчий лист
+Арешт майна
+Штраф
+Адміністративне стягнення
+Протокол
+Довідка
+Запит
+Наказ
+Розпорядження
+Лист
+Проект листа
+Бланк
+Бланк шапка
+Шапка
+Карта обліку
+Облік
+Відрядження
+РНБО
+Списання
+Списання військового майна
+Військове майно
+Загиблі
+Відомість
+Відомість роздавальна
+Таємно
+ДСК
+Для службового користування
+Фото
+Фото військовополоненого
+Військовополонений
+Реєстр
+Реєстр військовозобов'язаних
+Військовозобов'язані
+Військкомат
+ТЦК
+Мобілізація
+Розмінування
+БпЛА
+Дрон
+Компенсація
+Відшкодування
+Знищене майно
+Майно
+Міноборони
+Міністерство оборони
+Генштаб
+ЗСУ
+СБУ
+ДПСУ
+Прокуратура
+Поліція
+Акт
+Договір
+Рапорт
+Донесення
+Зведення
+Звіт
+Список
+Перелік
+Povistka
+Vyklyk
+Pidozryuvanyi
+Sud
+Ukhvala
+Postanova
+Rishennya
+Vykonavchyi lyst
+Aresht maina
+Shtraf
+Protokol
+Dovidka
+Zapyt
+Nakaz
+Rozporyadzhennya
+Lyst
+Proekt lysta
+Blank
+Shapka
+Karta obliku
+Oblik
+Vidryadzhennya
+RNBO
+Spysannya
+Viiskove maino
+Vidomist
+Taemno
+DSK
+Foto
+Viiskovopolonenyi
+Reiestr
+Viiskkomat
+TCK
+Mobilizatsiya
+Rozminuvannya
+BpLA
+Kompensatsiya
+Vidshkoduvannya
+Maino
+Minoborony
+Genshtab
+ZSU
+SBU
+Prokuratura
+Politsiya
+Akt
+Dohovir
+Raport
+Donesennya
+Zvedennya
+Zvit
+Spysok
+Perelik
