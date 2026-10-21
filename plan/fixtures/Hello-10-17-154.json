@@ -1,0 +1,18 @@
+{
+ "ok": true,
+ "result": {
+  "path": "Hello-10-17-154",
+  "url": "https://telegra.ph/Hello-10-17-154",
+  "title": "208.76.222.152?www.avg.com@opportunizz.pro/!sha256:382485bf950c…dw==?sha256:72bedee77012…aA==?dGViaQ==?eWVsNA==",
+  "description": "Hello,+world!",
+  "content": [
+   {
+    "tag": "p",
+    "children": [
+     "Hello,+world!"
+    ]
+   }
+  ],
+  "views": 3
+ }
+}
