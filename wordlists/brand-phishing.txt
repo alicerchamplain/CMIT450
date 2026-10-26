@@ -7,7 +7,6 @@ Verification
 Verified
 Confirm
 Confirmation
-Update
 Security
 Alert
 Notice
@@ -64,9 +63,6 @@ Barclays
 Sberbank
 Tinkoff
 Gosuslugi
-Госуслуги
-Сбербанк
-Тинькофф
 Вход
 Пароль
 Аккаунт

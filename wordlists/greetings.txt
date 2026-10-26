@@ -3,7 +3,7 @@ Test
 Hi
 Title
 Hey
-Privet
+Привет
 Links
 Info
 Hello World
@@ -19,12 +19,10 @@ Update
 Link
 File
 Data
-Config
 Settings
 Status
 Check
 Ping
-Server
 Index
 Main
 Home
@@ -33,21 +31,12 @@ Welcome
 Message
 Msg
 Report
-Log
-Logs
 Key
-Keys
-Token
 Address
 Addr
-Host
-Hosts
-Domain
-Ip
 Url
 Api
 App
-Bot
 Doc
 Docs
 Read
@@ -65,7 +54,6 @@ Job
 Task
 Tasks
 Todo
-List
 Items
 Item
 Content
@@ -76,11 +64,5 @@ Demo
 Draft
 Temp
 Tmp
-Backup
-Mirror
-Proxy
-Gateway
-Relay
-Node
 Client
 Service

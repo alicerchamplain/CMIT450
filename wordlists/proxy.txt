@@ -42,26 +42,17 @@ OpenVPN
 Прокси лист
 Бесплатные прокси
 Соксы
-Впн
 Ключи
 Конфиги
 Аккаунты
 Accounts
-Account
 Logins
-Login
 Pass
-Password
 Passwords
 Credentials
 Creds
-Combo
-Combolist
-Checker
 Cookies
 Keys
-License
 Licenses
-Serial
 Codes
 Promo

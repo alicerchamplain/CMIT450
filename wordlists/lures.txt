@@ -10,7 +10,6 @@
 Арешт майна
 Штраф
 Адміністративне стягнення
-Протокол
 Довідка
 Запит
 Наказ
@@ -63,58 +62,4 @@
 Донесення
 Зведення
 Звіт
-Список
 Перелік
-Povistka
-Vyklyk
-Pidozryuvanyi
-Sud
-Ukhvala
-Postanova
-Rishennya
-Vykonavchyi lyst
-Aresht maina
-Shtraf
-Protokol
-Dovidka
-Zapyt
-Nakaz
-Rozporyadzhennya
-Lyst
-Proekt lysta
-Blank
-Shapka
-Karta obliku
-Oblik
-Vidryadzhennya
-RNBO
-Spysannya
-Viiskove maino
-Vidomist
-Taemno
-DSK
-Foto
-Viiskovopolonenyi
-Reiestr
-Viiskkomat
-TCK
-Mobilizatsiya
-Rozminuvannya
-BpLA
-Kompensatsiya
-Vidshkoduvannya
-Maino
-Minoborony
-Genshtab
-ZSU
-SBU
-Prokuratura
-Politsiya
-Akt
-Dohovir
-Raport
-Donesennya
-Zvedennya
-Zvit
-Spysok
-Perelik
