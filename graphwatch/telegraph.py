@@ -1,3 +1,5 @@
+"""Read-only client for the Telegraph API (api.telegra.ph)."""
+
 import json
 import time
 import urllib.parse
@@ -8,11 +10,14 @@ import requests
 
 BASE_URL = "https://api.telegra.ph"
 ALLOWED_HOSTS = frozenset(["api.telegra.ph"])
-BLOCK_TAGS = frozenset(["p","br","li","h3","h4","blockquote","pre","figcaption","hr"])
+BLOCK_TAGS = frozenset(
+    ["p", "br", "li", "h3", "h4", "blockquote", "pre", "figcaption", "hr"]
+)
+
 
 class Outcome(Enum):
-    """The three ways a page lookup can end
-    """
+    """The three ways a page lookup can end"""
+
     FOUND = auto()
     NOT_FOUND = auto()
     FAILED = auto()
@@ -23,17 +28,17 @@ class Fetch:
     """
     Class for storing telegraph page fetch results
     """
-    path: str # the path to fetch
-    outcome: Outcome # the outcome of the fetch request
-    page: dict | None # the page result
-    error: str | None # API error strings
-    status: int | None # HTTP status codes
-    elapsed_ms: int # How long the fetch took
+
+    path: str  # the path to fetch
+    outcome: Outcome  # the outcome of the fetch request
+    page: dict | None  # the page result
+    error: str | None  # API error strings
+    status: int | None  # HTTP status codes
+    elapsed_ms: int  # How long the fetch took
 
 
 def build_path(slug: str, month: int, day: int, n: int | None = None) -> str:
-    """Takes in the page slug, month, day, and post # and returns the path string like Vizit-01-28
-
+    """Takes in the page slug, month, day, and post # and returns the path string like Vizit-12-28
 
     Args:
         slug (str): page slug
@@ -42,7 +47,7 @@ def build_path(slug: str, month: int, day: int, n: int | None = None) -> str:
         n (int | None, optional): the number of the post if multiple posts with the same slug exist. Defaults to None.
 
     Returns:
-        str: Built and padded path string like Vizit-01-28
+        str: Built and padded path string like Vizit-12-28
     """
     path = f"{slug}-{month:02d}-{day:02d}"
     if n is not None:
@@ -76,11 +81,15 @@ def parse_envelope(status: int, body: bytes) -> tuple[Outcome, dict | None, str 
     if ok is False and data.get("error") == "PAGE_NOT_FOUND":
         return Outcome.NOT_FOUND, None, "PAGE_NOT_FOUND"
 
-    return Outcome.FAILED, None, data.get("error") or f"Unexpected response envelope. Status: {status}"
+    return (
+        Outcome.FAILED,
+        None,
+        data.get("error") or f"Unexpected response envelope. Status: {status}",
+    )
 
 
 def _node_text(node) -> str:
-    """Walks nodes for text, takes one node and returns a string
+    """Walks DOM nodes for text, takes one node and returns a string
 
     Args:
         node (str | dict): Node to check for text
@@ -89,9 +98,9 @@ def _node_text(node) -> str:
         str: found text as a string
     """
 
-    if isinstance(node,str):
+    if isinstance(node, str):
         return node
-    if isinstance(node,dict):
+    if isinstance(node, dict):
         pieces = []
         for child in node.get("children", []):
             pieces.append(_node_text(child))
@@ -103,7 +112,7 @@ def _node_text(node) -> str:
 
 
 def _node_links(node) -> list[str]:
-    """Walks nodes for links, takes one node and returns a list of links in string format
+    """Walks DOM nodes for links, takes one node and returns a list of links in string format
 
     Args:
         node (str | dict): text node to check for links
@@ -111,10 +120,10 @@ def _node_links(node) -> list[str]:
     Returns:
         list[str]: list of links found in node
     """
-    if isinstance(node,str):
+    if isinstance(node, str):
         return []
 
-    if isinstance(node,dict):
+    if isinstance(node, dict):
         links = []
         attrs = node.get("attrs", {})
         for key in ("href", "src"):
@@ -140,7 +149,7 @@ def page_text(page: dict) -> str:
     for block in page.get("content", []):
         pieces.append(_node_text(block))
     body = "".join(pieces)
-    result = [page.get("title", ""),page.get("description", ""), body]
+    result = [page.get("title", ""), page.get("description", ""), body]
     return "\n".join(result)
 
 
@@ -154,6 +163,133 @@ def page_links(page: dict) -> list[str]:
         list[str]: list of links found in page content
     """
     links = []
-    for block in page.get("content",[]):
+    for block in page.get("content", []):
         links.extend(_node_links(block))
     return links
+
+
+class BudgetExceeded(Exception):
+    """Raised by TelegraphClient.get_page when the request budget is spent"""
+
+
+class TelegraphClient:
+    """Paced, allowlisted, read-only client for Telegraph's getPage method
+
+    Every request goes through get_page, which is the only place in the
+    package that touches the network. The clock, sleep function, session and
+    log sink are all injectable so tests can run without waiting or connecting.
+    """
+
+    def __init__(
+        self,
+        rate_per_s: float = 8.0,
+        budget: int | None = None,
+        session=None,
+        clock=time.monotonic,
+        sleep=time.sleep,
+        log=None,
+        user_agent: str = "graphwatch",
+    ):
+        """Stores the client settings and creates a requests.Session if none was given
+
+        Args:
+            rate_per_s (float, optional): maximum requests per second. Defaults to 8.0.
+            budget (int | None, optional): maximum requests this client may make, or None for no limit. Defaults to None.
+            session (optional): object with a requests-style get() method. Defaults to a new requests.Session.
+            clock (optional): function returning monotonic seconds, used for pacing and timing. Defaults to time.monotonic.
+            sleep (optional): function that blocks for the given seconds. Defaults to time.sleep.
+            log (optional): callable given one dict per request attempt, or None to skip logging. Defaults to None.
+            user_agent (str, optional): User-Agent header sent with every request. Defaults to "graphwatch".
+        """
+        self.rate_per_s = rate_per_s
+        self.budget = budget
+        self.session = session if session is not None else requests.Session()
+        self.clock = clock
+        self.sleep = sleep
+        self.log = log
+        self.user_agent = user_agent
+        self.requests_made = 0
+        self.next_allowed = 0.0
+
+    def _wait_turn(self):
+        """Blocks until the next request slot opens, then books the slot after it
+
+        Slots are 1 / rate_per_s seconds apart. The first call never waits.
+        """
+        now = self.clock()
+        wait = self.next_allowed - now
+        if wait > 0:
+            self.sleep(wait)
+        self.next_allowed = self.clock() + 1.0 / self.rate_per_s
+
+    def _check_host(self, url: str) -> None:
+        """Checks if url is in allowed hosts list
+
+        Args:
+            url (str): url to check
+
+        Raises:
+            ValueError: error if host not in allowed hosts
+        """
+        host = urllib.parse.urlparse(url).hostname
+        if host not in ALLOWED_HOSTS:
+            raise ValueError(f"Host {host} not in allowed hosts")
+
+    def get_page(self, path: str) -> Fetch:
+        """Fetches one Telegraph page by path and returns the outcome as a Fetch
+
+        Checks the budget, paces the request, verifies the host, performs the
+        GET, parses the envelope and writes one log row. A missing page is a
+        normal NOT_FOUND result; network errors and unexpected responses are
+        FAILED, never exceptions.
+
+        Args:
+            path (str): Telegraph path such as Vizit-12-28, not percent-encoded
+
+        Returns:
+            Fetch: record of the request with outcome, page, error, status and timing
+
+        Raises:
+            BudgetExceeded: if requests_made has reached budget; nothing is sent
+            ValueError: if the built URL is not on an allowed host
+        """
+        if self.budget is not None and self.requests_made >= self.budget:
+            raise BudgetExceeded(
+                f"Requests Made:{self.requests_made}, Budget:{self.budget}"
+            )
+        url = f"{BASE_URL}/getPage/{urllib.parse.quote(path, safe='')}?return_content=true"
+        self._check_host(url)
+        self._wait_turn()
+        self.requests_made += 1
+        started = self.clock()
+        try:
+            resp = self.session.get(
+                url,
+                timeout=10,
+                allow_redirects=False,
+                headers={"User-Agent": self.user_agent},
+            )
+            status = resp.status_code
+            body = resp.content
+            outcome, page, error = parse_envelope(status, body)
+        except requests.RequestException as e:
+            status = None
+            body = b""
+            outcome = Outcome.FAILED
+            page = None
+            error = f"request error: {e}"
+        elapsed_ms = int((self.clock() - started) * 1000)
+        fetch = Fetch(path, outcome, page, error, status, elapsed_ms)
+        if self.log is not None:
+            self.log(
+                {
+                    "ts": time.time(),
+                    "path": path,
+                    "status": status,
+                    "outcome": outcome.name,
+                    "error": error,
+                    "elapsed_ms": elapsed_ms,
+                    "bytes": len(body),
+                }
+            )
+        return fetch
