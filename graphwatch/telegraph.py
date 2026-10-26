@@ -189,6 +189,8 @@ class TelegraphClient:
         sleep=time.sleep,
         log=None,
         user_agent: str = "graphwatch",
+        retries: int = 2,
+        backoff_s: float = 1.0
     ):
         """Stores the client settings and creates a requests.Session if none was given
 
@@ -200,6 +202,8 @@ class TelegraphClient:
             sleep (optional): function that blocks for the given seconds. Defaults to time.sleep.
             log (optional): callable given one dict per request attempt, or None to skip logging. Defaults to None.
             user_agent (str, optional): User-Agent header sent with every request. Defaults to "graphwatch".
+            retries (int, optional): how many more attempts get_page makes after a FAILED outcome. Defaults to 2.
+            backoff_s (float, optional): wait before the first retry, in seconds; doubles each retry. Defaults to 1.0.
         """
         self.rate_per_s = rate_per_s
         self.budget = budget
@@ -208,6 +212,8 @@ class TelegraphClient:
         self.sleep = sleep
         self.log = log
         self.user_agent = user_agent
+        self.retries = retries
+        self.backoff_s = backoff_s
         self.requests_made = 0
         self.next_allowed = 0.0
 
@@ -235,30 +241,29 @@ class TelegraphClient:
         if host not in ALLOWED_HOSTS:
             raise ValueError(f"Host {host} not in allowed hosts")
 
-    def get_page(self, path: str) -> Fetch:
-        """Fetches one Telegraph page by path and returns the outcome as a Fetch
+    def _attempt(self, path: str, url: str, attempt: int) -> Fetch:
+        """Makes one request for an already-built URL and returns it as a Fetch
 
-        Checks the budget, paces the request, verifies the host, performs the
-        GET, parses the envelope and writes one log row. A missing page is a
-        normal NOT_FOUND result; network errors and unexpected responses are
-        FAILED, never exceptions.
+        Counts against the budget, waits for the pacer, performs the GET,
+        parses the envelope and writes one log row. Never raises for network
+        or parse problems; those become a FAILED Fetch.
 
         Args:
-            path (str): Telegraph path such as Vizit-12-28, not percent-encoded
+            path (str): the Telegraph path, for the Fetch and the log row
+            url (str): the full URL, already percent-encoded and host-checked
+            attempt (int): 1 for the first try, counting up on retries; logged
 
         Returns:
-            Fetch: record of the request with outcome, page, error, status and timing
+            Fetch: the result of this single attempt
 
         Raises:
             BudgetExceeded: if requests_made has reached budget; nothing is sent
-            ValueError: if the built URL is not on an allowed host
         """
         if self.budget is not None and self.requests_made >= self.budget:
             raise BudgetExceeded(
                 f"Requests Made:{self.requests_made}, Budget:{self.budget}"
             )
-        url = f"{BASE_URL}/getPage/{urllib.parse.quote(path, safe='')}?return_content=true"
-        self._check_host(url)
+
         self._wait_turn()
         self.requests_made += 1
         started = self.clock()
@@ -285,6 +290,7 @@ class TelegraphClient:
                 {
                     "ts": time.time(),
                     "path": path,
+                    "attempt": attempt,
                     "status": status,
                     "outcome": outcome.name,
                     "error": error,
@@ -293,3 +299,39 @@ class TelegraphClient:
                 }
             )
         return fetch
+
+
+    def get_page(self, path: str, content: bool = True) -> Fetch:
+        """Fetches one Telegraph page by path and returns the outcome as a Fetch
+
+        Builds and host-checks the URL, then calls _attempt up to retries + 1
+        times. FOUND and NOT_FOUND are returned at once; a FAILED attempt is
+        retried after backoff_s seconds, doubling each time, and the last
+        FAILED Fetch is returned if every attempt fails. A missing page is a
+        normal NOT_FOUND result; network errors and unexpected responses are
+        FAILED, never exceptions. Each attempt writes its own log row.
+
+        Args:
+            path (str): Telegraph path such as Vizit-12-28, not percent-encoded
+            content (bool, optional): if True, ask for the page body too. False
+                only asks whether the page exists, which is cheaper and faster;
+                the crowd check uses it. Defaults to True.
+
+        Returns:
+            Fetch: record of the request with outcome, page, error, status and timing
+
+        Raises:
+            BudgetExceeded: if the budget is reached before any attempt, or
+                between retries; the refused attempt is never sent
+            ValueError: if the built URL is not on an allowed host
+        """
+        url = f"{BASE_URL}/getPage/{urllib.parse.quote(path, safe='')}?return_content={'true' if content else 'false'}"
+        self._check_host(url)
+        for attempt in range(1, self.retries + 2):
+            fetch =  self._attempt(path, url, attempt)
+            if fetch.outcome is not Outcome.FAILED:
+                return fetch
+            if attempt <= self.retries:
+                self.sleep(self.backoff_s * 2 ** (attempt - 1))
+        return fetch
+
