@@ -8,7 +8,7 @@ from pathlib import Path
 from sqlite3 import Connection
 
 from graphwatch.slugify import Entry
-from graphwatch.telegraph import Outcome, page_text
+from graphwatch.telegraph import Fetch, Outcome, page_text
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS titles (
@@ -71,21 +71,19 @@ CREATE INDEX IF NOT EXISTS http_log_ts ON http_log (ts);
 """
 
 
-path_regex = r"^(.+)-(\d{2})-(\d{2})(?:-(\d+))?$"
 # ^ and $	anchors: match the whole string, not a fragment inside it
 # (.+)             : group 1, the slug: one or more of any character
 # -(\d{2})	       : hyphen then group 2, exactly two digits: the month
 # -(\d{2})	       : hyphen then group 3, two digits: the day
 # (?:-(\d+))?	   : optional: a hyphen then group 4, one or more digits, the counter
+PATTERN = re.compile(r"^(.+)-(\d{2})-(\d{2})(?:-(\d+))?$")
 
-PATTERN = re.compile(path_regex)
 
-
-def connect(path: str):
+def connect(path: str | Path):
     """Function to connect to the sqlite3 db, loads SCHEMA and enables foreign keys
 
     Args:
-        path (_type_): Path to the db file
+        path (String): Path to the db file
 
     Returns:
         sqlite3 connection: Connection to the db
@@ -97,7 +95,38 @@ def connect(path: str):
     return conn
 
 
-def add_event(conn: Connection, page_id: int, kind: str, ts: float, detail=None) -> int:
+
+def parse_path(path: str) -> tuple[str, int, int, int | None]:
+    """Parses a Telegraph path into its 3-4 parts
+
+    Args:
+        path (str): The slug path
+
+    Raises:
+        ValueError: Error if the path doesn't match the regex for valid slugs
+
+    Returns:
+        tuple[str, int, int, int | None]: Slug in 4 parts (title, month, day, counter)
+    """
+    m = PATTERN.fullmatch(path)
+    if not m:
+        raise ValueError(path)
+    return (
+        m.group(1),
+        int(m.group(2)),
+        int(m.group(3)),
+        int(m.group(4)) if m.group(4) is not None else None,
+    )
+
+
+
+def add_event(
+    conn: Connection,
+    page_id: int | None,
+    kind: str,
+    ts: float,
+    detail: str | None = None,
+) -> int:
     """Generic function to insert events into the db
 
     Args:
@@ -116,6 +145,74 @@ def add_event(conn: Connection, page_id: int, kind: str, ts: float, detail=None)
     newrowid = cur.lastrowid
     conn.commit()
     return newrowid
+
+
+
+def upsert_title(conn: Connection, entry: Entry, ts: float) -> int:
+    """Update and insert (upsert) title entries into the db
+
+    Args:
+        conn (Connection): SQL Connection
+        entry (Entry): Entry to upsert
+        ts (float): Timestamp
+
+    Returns:
+        int: row id
+    """
+    sql_insert = """
+    INSERT INTO titles (title, slug, source, crowd_only, added_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(slug) DO NOTHING
+    """
+    params_insert = (entry.title, entry.slug, entry.source, int(entry.crowd_only), ts)
+    conn.execute(sql_insert, params_insert)
+    sql_select = "SELECT id FROM titles WHERE slug = ?"
+    params_select = (entry.slug,)
+    row = conn.execute(sql_select, params_select).fetchone()
+    title_id = row["id"]
+    conn.commit()
+    return title_id
+
+
+
+def upsert_page(conn: Connection, path: str, ts: float, held_out: bool = False) -> int:
+    """Update and insert (upsert) a page in the db
+
+    Args:
+        conn (Connection): SQL db connection
+        path (str): Page path
+        ts (float): timestamp
+        held_out (bool, optional): Bool to flag if the page is part of the eval set. Defaults to False.
+
+    Returns:
+        int: Page id
+    """
+    slug, month, day, counter = parse_path(path)
+    page_select = "SELECT id FROM pages WHERE path = ?"
+    page_params = (path,)
+    existing = conn.execute(page_select, page_params).fetchone()
+    title_select = "SELECT id FROM titles WHERE slug = ? COLLATE NOCASE"
+    title_params = (slug,)
+    title_row = conn.execute(title_select, title_params).fetchone()
+    title_id = title_row["id"] if title_row is not None else None
+    upsert_sql = """
+    INSERT INTO pages (path, slug, month, day, counter, title_id, held_out, first_seen, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+    last_seen = excluded.last_seen,
+    held_out  = MAX(held_out, excluded.held_out)
+    """
+    upsert_params = (path, slug, month, day, counter, title_id, int(held_out), ts, ts)
+    cur = conn.execute(upsert_sql, upsert_params)
+    if existing is not None:
+        page_id = existing["id"]
+    else:
+        page_id = cur.lastrowid
+        add_event(conn, page_id, "discovered", ts)
+    conn.commit()
+
+    return page_id
+
 
 
 def add_snapshot(
@@ -167,105 +264,89 @@ def add_snapshot(
     return cur.lastrowid, changed
 
 
-def held_out_paths():
-    return
 
-
-def http_logger():
-    return
-
-
-def load_known():
-    return
-
-
-def parse_path(path: str) -> tuple[str, int, int, int | None]:
-    """Parses Slug path into it's 3-4 parts
-
-    Args:
-        path (str): The slug path
-
-    Raises:
-        ValueError: Error if the path doesn't match the regex for valid slugs
-
-    Returns:
-        tuple[str, int, int, int | None]: Slug in 4 parts (title, month, day, counter)
-    """
-    m = PATTERN.fullmatch(path)
-    if not m:
-        raise ValueError(path)
-    return (
-        m.group(1),
-        int(m.group(2)),
-        int(m.group(3)),
-        int(m.group(4)) if m.group(4) is not None else None,
-    )
-
-
-def store_fetch():
-    return
-
-
-def upsert_page(conn: Connection, path: str, ts: float, held_out: bool = False) -> int:
-    """Update and insert (upsert) a page in the db
+def store_fetch(
+    conn: Connection, fetch: Fetch, ts: float, held_out: bool = False
+) -> int | None:
+    """The glue between the client and the database for storing fetch results in the db
 
     Args:
         conn (Connection): SQL db connection
-        path (str): Page path
-        ts (float): timestamp
-        held_out (bool, optional): Bool to flag if the page is part of the eval set. Defaults to False.
+        fetch (Fetch): The fetch to store
+        ts (float): Timestamp
+        held_out (bool, optional): If the fetch is part of the eval set. Defaults to False.
 
     Returns:
-        int: _description_
+        int|None: Page id or none if no outcome
     """
-    slug, month, day, counter = parse_path(path)
-    page_select = "SELECT id FROM pages WHERE path = ?"
-    page_params = (path,)
-    existing = conn.execute(page_select, page_params).fetchone()
-    title_select = "SELECT id FROM titles WHERE slug = ? COLLATE NOCASE"
-    title_params = (slug,)
-    title_row = conn.execute(title_select, title_params).fetchone()
-    title_id = title_row["id"] if title_row is not None else None
-    upsert_sql = """
-    INSERT INTO pages (path, slug, month, day, counter, title_id, held_out, first_seen, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(path) DO UPDATE SET
-    last_seen = excluded.last_seen,
-    held_out  = MAX(held_out, excluded.held_out)
-    """
-    upsert_params = (path, slug, month, day, counter, title_id, int(held_out), ts, ts)
-    cur = conn.execute(upsert_sql, upsert_params)
-    if existing is not None:
-        page_id = existing["id"]
-    else:
-        page_id = cur.lastrowid
-        add_event(conn, page_id, "discovered", ts)
-    conn.commit()
-
+    if fetch.outcome is not Outcome.FOUND:
+        return None
+    page_id = upsert_page(conn, fetch.page["path"], ts, held_out=held_out)
+    add_snapshot(conn, page_id, fetch.page, ts)
     return page_id
 
 
-def upsert_title(conn: Connection, entry: Entry, ts: float) -> int:
-    """Update and insert (upsert) title entries into the db
+
+def http_logger(conn: Connection):
+    """Function to get the logger
 
     Args:
-        conn (Connection): SQL Connection
-        entry (Entry): Entry to upsert
+        conn (Connection): SQL db connection
+
+    Returns:
+        function: log function
+    """
+
+    def log(row: dict):
+        sql = "INSERT INTO http_log (ts, path, attempt, status, outcome, error, elapsed_ms, bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        params = (
+            row["ts"],
+            row["path"],
+            row["attempt"],
+            row["status"],
+            row["outcome"],
+            row["error"],
+            row["elapsed_ms"],
+            row["bytes"],
+        )
+        conn.execute(sql, params)
+        conn.commit()
+
+    return log
+
+
+
+def load_known(conn: Connection, known_file: str, ts: float) -> list[int]:
+    """Load and upsert the eval set in known.txt
+
+    Args:
+        conn (Connection): Sql db connection
+        known_file (str): Path to known.txt file holding the eval set
         ts (float): Timestamp
 
     Returns:
-        int: row id
+        list[int]: List of page ids
     """
-    sql_insert = """
-    INSERT INTO titles (title, slug, source, crowd_only, added_at)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(slug) DO NOTHING
+    ids = []
+    for line in Path(known_file).read_text(encoding="utf-8").splitlines():
+        path = line.strip()
+        if not path or path.startswith("#"):
+            continue
+        page_id = upsert_page(conn, path, ts, held_out=True)
+        ids.append(page_id)
+    return ids
+
+
+
+def held_out_paths(conn: Connection) -> list[str]:
+    """Fetch list of held_out page paths
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        list[str]: List of paths
     """
-    params_insert = (entry.title, entry.slug, entry.source, int(entry.crowd_only), ts)
-    conn.execute(sql_insert, params_insert)
-    sql_select = "SELECT id FROM titles WHERE slug = ?"
-    params_select = (entry.slug,)
-    row = conn.execute(sql_select, params_select).fetchone()
-    title_id = row["id"]
-    conn.commit()
-    return title_id
+    sql = "SELECT path FROM pages WHERE held_out = 1 ORDER BY id"
+    rows = conn.execute(sql).fetchall()
+    return [row["path"] for row in rows]
