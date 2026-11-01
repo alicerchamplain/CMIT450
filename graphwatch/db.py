@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS http_log (
     bytes       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS http_log_ts ON http_log (ts);
+
+CREATE TABLE IF NOT EXISTS crowd (
+    id          INTEGER PRIMARY KEY,
+    slug        TEXT    NOT NULL,
+    month       INTEGER NOT NULL,
+    day         INTEGER NOT NULL,
+    highest     INTEGER NOT NULL,
+    requests    INTEGER NOT NULL,
+    failures    INTEGER NOT NULL,
+    checked_at  REAL    NOT NULL,
+    UNIQUE (slug COLLATE NOCASE, month, day)
+);
 """
 
 
