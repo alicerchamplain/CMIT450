@@ -137,6 +137,28 @@ def test_highest_is_capped_by_max_n():
     assert result.requests < 60
 
 
+def test_gap_window_cannot_look_past_max_n():
+    # Seen on the droplet: Kristina 10-04 reported 4098 with max_n=4096. The
+    # page at the cap was missing but one inside the gap window existed, and
+    # alive() returned that later counter. The cap is a promise: no counter
+    # above it is ever confirmed, and no probe is spent above it either.
+    existing = set(range(1, 5000)) - {512}
+    result, probe = check(existing=existing, max_n=512)
+    assert result.highest <= 512
+    assert "Hello-10-24-513" not in probe.calls
+    assert "Hello-10-24-514" not in probe.calls
+
+
+def test_default_max_n_is_two_to_the_twenty():
+    # A probe that says FOUND to everything must still terminate, and must
+    # stop at the default cap. Doubling then bisecting means a cap of 2**20
+    # costs only a few dozen probes, so a large default is nearly free.
+    always_found = lambda path: Outcome.FOUND
+    result = count_day(always_found, "Hello", 10, 24)
+    assert result.highest == 2**20
+    assert result.requests < 50
+
+
 # --------------------------------------------------------------------------
 # count_day: how it probes
 # --------------------------------------------------------------------------

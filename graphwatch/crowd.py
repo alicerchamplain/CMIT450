@@ -41,7 +41,7 @@ def recent_days(today: date, n: int) -> list[tuple[int, int]]:
 
 
 def count_day(
-    probe, slug: str, month: int, day: int, gap: int = 2, max_n: int = 4096
+    probe, slug: str, month: int, day: int, gap: int = 2, max_n: int = 2**20
 ) -> DayCount:
     """Count one title's pages on one day with a doubling probe and bisection
 
@@ -54,7 +54,7 @@ def count_day(
         gap (int, optional): how many consecutive missing counters to
             tolerate before declaring the end. Defaults to 2.
         max_n (int, optional): never confirm a counter above this; caps the
-            cost of a pathological title. Defaults to 4096.
+            cost of a title. Defaults to 2**20 (~1M).
 
     Returns:
         DayCount: highest counter found, probes spent, failures, found paths
@@ -73,8 +73,8 @@ def count_day(
         return seen[n] is Outcome.FOUND
 
     def alive(n):
-        # Is there a page at n, or within the next `gap` counters after it?
-        for candidate in range(n, n + gap + 1):
+        # Is there a page at n, or within the next `gap` counters after it and within max_n?
+        for candidate in range(n, min(n + gap, max_n) + 1):
             if look(candidate):
                 # Stop at the first hit and say where it was.
                 return candidate
