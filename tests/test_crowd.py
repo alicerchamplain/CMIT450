@@ -12,10 +12,13 @@ import pytest
 from graphwatch.crowd import (
     DayCount,
     count_day,
+    count_only_slugs,
     crowd_check,
+    fit_window,
     load_done,
     recent_days,
     save_day_count,
+    sweep_cost,
 )
 from graphwatch.db import connect
 from graphwatch.telegraph import Outcome, build_path
@@ -393,3 +396,124 @@ def test_resume_end_to_end(conn):
         save_day_count(conn, dc, T0 + 1)
     assert load_done(conn) == {("Hello", 10, 23), ("Hello", 10, 24)}
     assert all("10-24" in p for p in probe.calls)
+
+
+# --------------------------------------------------------------------------
+# planning the sweep from the crowd table (issue #19)
+# --------------------------------------------------------------------------
+
+TODAY = date(2026, 11, 1)
+
+
+def seed(conn, rows):
+    """rows: (slug, month, day, highest). Requests and failures are irrelevant here."""
+    for slug, month, day, highest in rows:
+        save_day_count(conn, DayCount(slug, month, day, highest, 1, 0, []), 0.0)
+
+
+def test_count_only_slugs_sums_pages_across_days(conn):
+    seed(conn, [("Big", 10, 31, 6_000), ("Big", 11, 1, 4_000), ("Small", 11, 1, 9_999)])
+    assert count_only_slugs(conn, 10_000) == {"Big"}
+
+
+def test_count_only_slugs_threshold_is_inclusive(conn):
+    seed(conn, [("Exact", 11, 1, 10_000)])
+    assert count_only_slugs(conn, 10_000) == {"Exact"}
+
+
+def test_count_only_slugs_empty_table(conn):
+    assert count_only_slugs(conn, 1) == set()
+
+
+def test_count_only_slugs_zero_threshold_returns_everything(conn):
+    seed(conn, [("A", 11, 1, 0), ("B", 11, 1, 3)])
+    assert count_only_slugs(conn, 0) == {"A", "B"}
+
+
+def test_sweep_cost_is_pages_plus_gap_plus_one_per_title_day(conn):
+    seed(conn, [("A", 11, 1, 10), ("B", 11, 1, 0)])
+    # A: 10 + 2 + 1 = 13; B: an empty day still costs the gap probes, 0 + 2 + 1 = 3
+    assert sweep_cost(conn, [(11, 1)], 2, set()) == 16
+
+
+def test_sweep_cost_gap_changes_the_overhead(conn):
+    seed(conn, [("A", 11, 1, 10)])
+    assert sweep_cost(conn, [(11, 1)], 0, set()) == 11
+    assert sweep_cost(conn, [(11, 1)], 5, set()) == 16
+
+
+def test_sweep_cost_only_counts_days_in_the_window(conn):
+    seed(conn, [("A", 10, 31, 100), ("A", 11, 1, 10)])
+    assert sweep_cost(conn, [(11, 1)], 2, set()) == 13
+    assert sweep_cost(conn, [(10, 31), (11, 1)], 2, set()) == 116
+
+
+def test_sweep_cost_excludes_count_only_slugs(conn):
+    seed(conn, [("Links", 11, 1, 100_000), ("A", 11, 1, 10)])
+    assert sweep_cost(conn, [(11, 1)], 2, {"Links"}) == 13
+
+
+def test_sweep_cost_cap_bounds_each_title_day(conn):
+    seed(conn, [("Spike", 11, 1, 88_651), ("A", 11, 1, 10)])
+    assert sweep_cost(conn, [(11, 1)], 2, set(), cap=500) == 503 + 13
+
+
+def test_sweep_cost_cap_does_not_raise_small_days(conn):
+    seed(conn, [("A", 11, 1, 10)])
+    assert sweep_cost(conn, [(11, 1)], 2, set(), cap=500) == 13
+
+
+def test_sweep_cost_empty_window_is_zero(conn):
+    seed(conn, [("A", 11, 1, 10)])
+    assert sweep_cost(conn, [], 2, set()) == 0
+
+
+def test_sweep_cost_accepts_the_recent_days_output(conn):
+    seed(conn, [("A", 10, 31, 1), ("A", 11, 1, 1)])
+    assert sweep_cost(conn, recent_days(TODAY, 2), 2, set()) == 8
+
+
+def test_fit_window_returns_the_largest_window_within_budget(conn):
+    # Each day costs 13 (10 pages + gap 2 + 1). Budget 40 fits 3 days, not 4.
+    seed(conn, [("A", 10, d, 10) for d in range(25, 32)] + [("A", 11, 1, 10)])
+    assert fit_window(conn, TODAY, 40, 2, set()) == 3
+
+
+def test_fit_window_exact_budget_fits(conn):
+    seed(conn, [("A", 10, d, 10) for d in range(25, 32)] + [("A", 11, 1, 10)])
+    assert fit_window(conn, TODAY, 39, 2, set()) == 3
+
+
+def test_fit_window_zero_when_one_day_does_not_fit(conn):
+    seed(conn, [("A", 11, 1, 1_000)])
+    assert fit_window(conn, TODAY, 100, 2, set()) == 0
+
+
+def test_fit_window_caps_at_max_days(conn):
+    seed(conn, [("A", 11, 1, 1)])
+    assert fit_window(conn, TODAY, 10**9, 2, set()) == 30
+    assert fit_window(conn, TODAY, 10**9, 2, set(), max_days=7) == 7
+
+
+def test_fit_window_counts_the_newest_days_first(conn):
+    # Oct 31 is expensive, Nov 1 is cheap. Budget 20 fits Nov 1 alone (13),
+    # not Nov 1 + Oct 31 (13 + 1003).
+    seed(conn, [("A", 10, 31, 1_000), ("A", 11, 1, 10)])
+    assert fit_window(conn, TODAY, 20, 2, set()) == 1
+
+
+def test_fit_window_respects_exclusions_and_cap(conn):
+    seed(conn, [("Links", 11, 1, 100_000), ("Spike", 11, 1, 5_000), ("A", 11, 1, 10)])
+    # Uncapped, Spike alone (5,003) breaks a 1,000 budget: nothing fits.
+    assert fit_window(conn, TODAY, 1_000, 2, {"Links"}) == 0
+    # Capped at 500, the day costs 503 + 13 = 516 and fits; days absent from
+    # the table cost nothing, so the window runs to max_days.
+    assert fit_window(conn, TODAY, 1_000, 2, {"Links"}, cap=500, max_days=1) == 1
+
+
+def test_fit_window_crosses_the_year_boundary(conn):
+    # recent_days handles Dec -> Jan; the window must price Dec 31 when today is Jan 1.
+    seed(conn, [("A", 12, 31, 10), ("A", 1, 1, 10)])
+    jan1 = date(2027, 1, 1)
+    assert fit_window(conn, jan1, 13, 2, set(), max_days=2) == 1  # Jan 1 only
+    assert fit_window(conn, jan1, 26, 2, set(), max_days=2) == 2  # Dec 31 priced too

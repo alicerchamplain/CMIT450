@@ -194,3 +194,81 @@ def load_done(conn: Connection) -> set[tuple[str, int, int]]:
     sql = "SELECT slug, month, day FROM crowd"
     rows = conn.execute(sql).fetchall()
     return {(row["slug"], row["month"], row["day"]) for row in rows}
+
+
+def count_only_slugs(conn: Connection, threshold: int) -> set[str]:
+    """Function to find slugs at or above a threshold
+
+    Args:
+        conn (Connection): SQL db connection
+        threshold (int): The threshold to search by
+
+    Returns:
+        set[str]: A set of slugs at or above the threshold
+    """
+    sql = "SELECT slug FROM crowd GROUP by slug HAVING SUM(highest) >= ?"
+    rows = conn.execute(sql, (threshold,)).fetchall()
+    return {row["slug"] for row in rows}
+
+
+def sweep_cost(
+    conn: Connection,
+    days: list[tuple[int, int]],
+    gap: int,
+    exclude: set[str],
+    cap: int | None = None,
+) -> int:
+    """Function to calculate how many requests a given sweep would cost
+
+    Args:
+        conn (Connection): SQL db connection
+        days (list[tuple[int, int]]): List of days in month, day format to sweep
+        gap (int): gap in counters
+        exclude (set[str]): set of slugs to exclude
+        cap (int | None, optional): Maximum requests per slug. Defaults to None.
+
+    Returns:
+        int: The number of requests a given sweep would cost
+    """
+    sql = "SELECT slug, month, day, highest FROM crowd"
+    rows = conn.execute(sql).fetchall()
+    cost = 0
+    window = set(days)
+    for row in rows:
+        if row["slug"] in exclude:
+            continue
+        if (row["month"], row["day"]) not in window:
+            continue
+        pages = row["highest"] if cap is None else min(row["highest"], cap)
+        cost += pages + gap + 1
+    return cost
+
+
+def fit_window(
+    conn: Connection,
+    today: date,
+    budget: int,
+    gap: int,
+    exclude: set[str],
+    cap: int | None = None,
+    max_days: int = 30,
+) -> int:
+    """Function to find how many days (the window) can be swept while staying within budget
+
+    Args:
+        conn (Connection): SQL Db Connection
+        today (date): Todays date
+        budget (int): Request budget
+        gap (int): gap in counters
+        exclude (set[str]): Set of slugs to exclude
+        cap (int | None, optional): Maximum requests per slug. Defaults to None.
+        max_days (int, optional): How many days to try and fit into the window. Defaults to 30.
+
+    Returns:
+        int: The maximum number of days in the window. Returns 0 if no days fit.
+    """
+    for n in range(1, max_days + 1):
+        days = recent_days(today, n)
+        if sweep_cost(conn, days, gap, exclude, cap) > budget:
+            return n - 1
+    return max_days
