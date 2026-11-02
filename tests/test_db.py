@@ -31,6 +31,7 @@ FIXTURES = ROOT / "plan" / "fixtures"
 KNOWN = ROOT / "known.txt"
 
 T0 = 1_700_000_000.0  # a fixed "now" so timestamps are predictable
+KEY = b"test-key"  # any fixed HMAC key; redaction output only has to be stable
 
 
 def fixture_page(name: str) -> dict:
@@ -250,7 +251,7 @@ def test_upsert_page_rejects_a_malformed_path(conn):
 def test_add_snapshot_stores_the_page_fields(conn):
     page = fixture_page("Vizit-12-28")
     pid = upsert_page(conn, page["path"], T0)
-    sid, changed = add_snapshot(conn, pid, page, T0)
+    sid, changed = add_snapshot(conn, pid, page, T0, KEY)
     row = conn.execute("SELECT * FROM snapshots WHERE id = ?", (sid,)).fetchone()
     assert row["page_id"] == pid
     assert row["fetched_at"] == T0
@@ -265,7 +266,7 @@ def test_add_snapshot_stores_the_page_fields(conn):
 def test_add_snapshot_first_snapshot_is_not_a_change(conn):
     page = fixture_page("Vizit-12-28")
     pid = upsert_page(conn, page["path"], T0)
-    _, changed = add_snapshot(conn, pid, page, T0)
+    _, changed = add_snapshot(conn, pid, page, T0, KEY)
     assert changed is False
     assert conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'content_changed'").fetchone()[0] == 0
 
@@ -273,9 +274,9 @@ def test_add_snapshot_first_snapshot_is_not_a_change(conn):
 def test_add_snapshot_identical_content_is_not_a_change(conn):
     page = fixture_page("Vizit-12-28")
     pid = upsert_page(conn, page["path"], T0)
-    add_snapshot(conn, pid, page, T0)
+    add_snapshot(conn, pid, page, T0, KEY)
     again = dict(page, views=page["views"] + 1000)  # views alone do not count
-    sid2, changed = add_snapshot(conn, pid, again, T0 + 3600)
+    sid2, changed = add_snapshot(conn, pid, again, T0 + 3600, KEY)
     assert changed is False
     assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 2
 
@@ -283,9 +284,9 @@ def test_add_snapshot_identical_content_is_not_a_change(conn):
 def test_add_snapshot_changed_content_writes_an_event(conn):
     page = fixture_page("Vizit-12-28")
     pid = upsert_page(conn, page["path"], T0)
-    add_snapshot(conn, pid, page, T0)
+    add_snapshot(conn, pid, page, T0, KEY)
     rotated = dict(page, content=[{"tag": "p", "children": ["new pointer"]}])
-    _, changed = add_snapshot(conn, pid, rotated, T0 + 3600)
+    _, changed = add_snapshot(conn, pid, rotated, T0 + 3600, KEY)
     assert changed is True
     rows = conn.execute(
         "SELECT kind, ts FROM events WHERE page_id = ? AND kind = 'content_changed'", (pid,)
@@ -298,16 +299,16 @@ def test_add_snapshot_title_change_counts_as_a_change(conn):
     # lives in the title, so a title change is a content change.
     page = fixture_page("Hello-10-17-154")
     pid = upsert_page(conn, page["path"], T0)
-    add_snapshot(conn, pid, page, T0)
-    _, changed = add_snapshot(conn, pid, dict(page, title="TMP"), T0 + 1)
+    add_snapshot(conn, pid, page, T0, KEY)
+    _, changed = add_snapshot(conn, pid, dict(page, title="TMP"), T0 + 1, KEY)
     assert changed is True
 
 
 def test_add_snapshot_hash_is_the_same_for_the_same_content(conn):
     page = fixture_page("ki06-05-02")
     pid = upsert_page(conn, page["path"], T0)
-    add_snapshot(conn, pid, page, T0)
-    add_snapshot(conn, pid, json.loads(json.dumps(page)), T0 + 1)  # a fresh copy
+    add_snapshot(conn, pid, page, T0, KEY)
+    add_snapshot(conn, pid, json.loads(json.dumps(page)), T0 + 1, KEY)  # a fresh copy
     hashes = [r[0] for r in conn.execute("SELECT sha256 FROM snapshots").fetchall()]
     assert hashes[0] == hashes[1]
 
@@ -316,15 +317,15 @@ def test_add_snapshot_compares_against_the_latest_snapshot_not_the_first(conn):
     page = fixture_page("Vizit-12-28")
     pid = upsert_page(conn, page["path"], T0)
     other = dict(page, content=[{"tag": "p", "children": ["b"]}])
-    add_snapshot(conn, pid, page, T0)
-    add_snapshot(conn, pid, other, T0 + 1)  # changed
-    _, changed = add_snapshot(conn, pid, other, T0 + 2)  # same as latest
+    add_snapshot(conn, pid, page, T0, KEY)
+    add_snapshot(conn, pid, other, T0 + 1, KEY)  # changed
+    _, changed = add_snapshot(conn, pid, other, T0 + 2, KEY)  # same as latest
     assert changed is False
 
 
 def test_add_snapshot_tolerates_missing_optional_fields(conn):
     pid = upsert_page(conn, "x-01-01", T0)
-    sid, _ = add_snapshot(conn, pid, {"path": "x-01-01", "content": []}, T0)
+    sid, _ = add_snapshot(conn, pid, {"path": "x-01-01", "content": []}, T0, KEY)
     row = conn.execute("SELECT title, description, views FROM snapshots WHERE id = ?", (sid,)).fetchone()
     assert (row["title"], row["description"], row["views"]) == (None, None, None)
 
@@ -407,7 +408,7 @@ def make_fetch(name: str) -> Fetch:
 
 
 def test_store_fetch_found_upserts_page_and_adds_snapshot(conn):
-    pid = store_fetch(conn, make_fetch("Vizit-12-28"), T0)
+    pid = store_fetch(conn, make_fetch("Vizit-12-28"), T0, KEY)
     assert pid is not None
     assert conn.execute("SELECT path FROM pages WHERE id = ?", (pid,)).fetchone()[0] == "Vizit-12-28"
     assert conn.execute("SELECT COUNT(*) FROM snapshots WHERE page_id = ?", (pid,)).fetchone()[0] == 1
@@ -416,30 +417,30 @@ def test_store_fetch_found_upserts_page_and_adds_snapshot(conn):
 def test_store_fetch_uses_the_api_path_not_the_requested_one(conn):
     page = fixture_page("Vizit-12-28")
     fetch = Fetch("VIZIT-12-28", Outcome.FOUND, page, None, 200, 12)  # requested in caps
-    pid = store_fetch(conn, fetch, T0)
+    pid = store_fetch(conn, fetch, T0, KEY)
     assert conn.execute("SELECT path FROM pages WHERE id = ?", (pid,)).fetchone()[0] == "Vizit-12-28"
 
 
 def test_store_fetch_not_found_stores_nothing(conn):
     fetch = Fetch("Nope-01-01", Outcome.NOT_FOUND, None, "PAGE_NOT_FOUND", 200, 5)
-    assert store_fetch(conn, fetch, T0) is None
+    assert store_fetch(conn, fetch, T0, KEY) is None
     assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 0
 
 
 def test_store_fetch_failed_stores_nothing(conn):
     fetch = Fetch("Vizit-12-28", Outcome.FAILED, None, "request error: down", None, 5)
-    assert store_fetch(conn, fetch, T0) is None
+    assert store_fetch(conn, fetch, T0, KEY) is None
     assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 0
 
 
 def test_store_fetch_passes_held_out_through(conn):
-    pid = store_fetch(conn, make_fetch("ki06-05-02"), T0, held_out=True)
+    pid = store_fetch(conn, make_fetch("ki06-05-02"), T0, KEY, held_out=True)
     assert conn.execute("SELECT held_out FROM pages WHERE id = ?", (pid,)).fetchone()[0] == 1
 
 
 def test_store_fetch_twice_is_one_page_two_snapshots(conn):
-    a = store_fetch(conn, make_fetch("Vizit-12-28"), T0)
-    b = store_fetch(conn, make_fetch("Vizit-12-28"), T0 + 1)
+    a = store_fetch(conn, make_fetch("Vizit-12-28"), T0, KEY)
+    b = store_fetch(conn, make_fetch("Vizit-12-28"), T0 + 1, KEY)
     assert a == b
     assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 2
@@ -448,7 +449,7 @@ def test_store_fetch_twice_is_one_page_two_snapshots(conn):
 def test_store_fetch_commits(tmp_path):
     db = tmp_path / "g.sqlite"
     c1 = connect(db)
-    store_fetch(c1, make_fetch("Vizit-12-28"), T0)
+    store_fetch(c1, make_fetch("Vizit-12-28"), T0, KEY)
     c2 = connect(db)
     assert c2.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 1
     c1.close()
@@ -493,3 +494,50 @@ def test_held_out_paths_is_in_insertion_order(conn):
     for p in ("b-01-01", "a-01-01", "c-01-01"):
         upsert_page(conn, p, T0, held_out=True)
     assert held_out_paths(conn) == ["b-01-01", "a-01-01", "c-01-01"]
+
+
+# --- redaction happens at ingest ---------------------------------------------
+
+RAW_KEY_1 = "VzQ3NktFUDh0Tm5qdHZSdw=="
+RAW_KEY_2 = "T0lpc01IOHdHdGhzNjltOWJBR2Z3MTVNcU14NjdsdTJnNW1Oa3RiaA=="
+RAW_HELLO_TITLE = f"198.13.32.106?rakuten.ne.jp@opportunizz.pro/!{RAW_KEY_1}?{RAW_KEY_2}?dGViaQ==?eWVsNA=="
+
+
+def test_add_snapshot_stores_redacted_title_text_and_content(conn):
+    # Issue #18: no sweep may store a page before redaction. Every stored
+    # column that carries page text must hold tokens, never the raw keys.
+    page = {
+        "path": "Hello-10-17-154",
+        "title": RAW_HELLO_TITLE,
+        "description": "password: hunter2",
+        "content": [{"tag": "p", "children": ["card 4111 1111 1111 1111"]}],
+    }
+    pid = upsert_page(conn, page["path"], T0)
+    add_snapshot(conn, pid, page, T0, KEY)
+    row = conn.execute("SELECT title, description, content, text FROM snapshots").fetchone()
+    stored = "\n".join([row["title"], row["description"], row["content"], row["text"]])
+    for raw in (RAW_KEY_1, RAW_KEY_2, "hunter2", "4111"):
+        assert raw not in stored
+    assert stored.count("SECRET{") >= 4  # two keys, once each in title and text, plus two more
+    assert "198.13.32.106" in row["title"]  # the pointer survives
+    assert "dGViaQ==" in row["title"]  # the labels survive
+
+
+def test_add_snapshot_fingerprint_is_of_the_redacted_page(conn):
+    # A raw fetch and its already-redacted twin must fingerprint the same,
+    # or every re-fetch after a key rotation of ours would look like a change.
+    from graphwatch.redact import redact_page
+
+    page = {"path": "x-01-01", "title": "password: hunter2", "content": []}
+    pid = upsert_page(conn, page["path"], T0)
+    add_snapshot(conn, pid, page, T0, KEY)
+    _, changed = add_snapshot(conn, pid, redact_page(page, KEY), T0 + 1, KEY)
+    assert changed is False
+
+
+def test_add_snapshot_does_not_mutate_the_page_it_is_given(conn):
+    page = {"path": "x-01-01", "title": "password: hunter2", "content": []}
+    before = json.loads(json.dumps(page))
+    pid = upsert_page(conn, page["path"], T0)
+    add_snapshot(conn, pid, page, T0, KEY)
+    assert page == before

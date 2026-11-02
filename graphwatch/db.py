@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from sqlite3 import Connection
 
+from graphwatch.redact import redact_page
 from graphwatch.slugify import Entry
 from graphwatch.telegraph import Fetch, Outcome, page_text
 
@@ -107,7 +108,6 @@ def connect(path: str | Path):
     return conn
 
 
-
 def parse_path(path: str) -> tuple[str, int, int, int | None]:
     """Parses a Telegraph path into its 3-4 parts
 
@@ -129,7 +129,6 @@ def parse_path(path: str) -> tuple[str, int, int, int | None]:
         int(m.group(3)),
         int(m.group(4)) if m.group(4) is not None else None,
     )
-
 
 
 def add_event(
@@ -159,7 +158,6 @@ def add_event(
     return newrowid
 
 
-
 def upsert_title(conn: Connection, entry: Entry, ts: float) -> int:
     """Update and insert (upsert) title entries into the db
 
@@ -184,7 +182,6 @@ def upsert_title(conn: Connection, entry: Entry, ts: float) -> int:
     title_id = row["id"]
     conn.commit()
     return title_id
-
 
 
 def upsert_page(conn: Connection, path: str, ts: float, held_out: bool = False) -> int:
@@ -226,9 +223,8 @@ def upsert_page(conn: Connection, path: str, ts: float, held_out: bool = False) 
     return page_id
 
 
-
 def add_snapshot(
-    conn: Connection, page_id: int, page: dict, ts: float
+    conn: Connection, page_id: int, page: dict, ts: float, key: bytes
 ) -> tuple[int, bool]:
     """Function to add page snapshots, hash them, and see if they updated
 
@@ -237,10 +233,12 @@ def add_snapshot(
         page_id (int): Page id
         page (dict): Page content
         ts (float): Timestamp
+        key (bytes): The hmac key for redactions
 
     Returns:
         tuple[int, bool]: Returns the lastrowid and a bool to say if the page hash changed
     """
+    page = redact_page(page, key)
     title = page.get("title")
     description = page.get("description")
     views = page.get("views")
@@ -256,7 +254,6 @@ def add_snapshot(
     changed = previous is not None and previous["sha256"] != sha
     if changed:
         add_event(conn, page_id, "content_changed", ts)
-    # Redaction (issue #18) should go in here
     snapshot_insert = """
     INSERT INTO snapshots (page_id, fetched_at, title, description, views, content, text, sha256)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -276,9 +273,12 @@ def add_snapshot(
     return cur.lastrowid, changed
 
 
-
 def store_fetch(
-    conn: Connection, fetch: Fetch, ts: float, held_out: bool = False
+    conn: Connection,
+    fetch: Fetch,
+    ts: float,
+    key: bytes,
+    held_out: bool = False,
 ) -> int | None:
     """The glue between the client and the database for storing fetch results in the db
 
@@ -286,7 +286,9 @@ def store_fetch(
         conn (Connection): SQL db connection
         fetch (Fetch): The fetch to store
         ts (float): Timestamp
+        key (bytes): the hmac key for redaction
         held_out (bool, optional): If the fetch is part of the eval set. Defaults to False.
+
 
     Returns:
         int|None: Page id or none if no outcome
@@ -294,9 +296,8 @@ def store_fetch(
     if fetch.outcome is not Outcome.FOUND:
         return None
     page_id = upsert_page(conn, fetch.page["path"], ts, held_out=held_out)
-    add_snapshot(conn, page_id, fetch.page, ts)
+    add_snapshot(conn, page_id, fetch.page, ts, key)
     return page_id
-
 
 
 def http_logger(conn: Connection):
@@ -327,7 +328,6 @@ def http_logger(conn: Connection):
     return log
 
 
-
 def load_known(conn: Connection, known_file: str, ts: float) -> list[int]:
     """Load and upsert the eval set in known.txt
 
@@ -347,7 +347,6 @@ def load_known(conn: Connection, known_file: str, ts: float) -> list[int]:
         page_id = upsert_page(conn, path, ts, held_out=True)
         ids.append(page_id)
     return ids
-
 
 
 def held_out_paths(conn: Connection) -> list[str]:

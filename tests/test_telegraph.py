@@ -208,7 +208,7 @@ def test_page_text_without_content_key_does_not_crash():
 
 def test_page_text_hello_pointer_is_in_the_title():
     text = page_text(fixture_page("Hello-10-17-154"))
-    assert text.startswith("208.76.222.152")
+    assert text.startswith("198.13.32.106")
     assert text.count("\n") == 3  # title, description, one paragraph
 
 
