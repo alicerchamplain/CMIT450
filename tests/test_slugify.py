@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from graphwatch.slugify import CROWD_ONLY, TABLE, Entry, load_wordlists, slugify
+from graphwatch.slugify import (
+    CROWD_ONLY,
+    TABLE,
+    Entry,
+    load_wordlists,
+    normalize_slug,
+    slugify,
+)
 
 WORDLISTS = Path(__file__).resolve().parents[1] / "wordlists"
 
@@ -306,3 +313,49 @@ def test_load_the_real_wordlists():
     assert "hello" in slugs
     assert "povіstka" in slugs  # Cyrillic і
     assert not any(e.crowd_only for e in entries)  # no pending.txt yet
+
+
+# --------------------------------------------------------------------------
+# normalize_slug: the database key for a slug
+#
+# Telegraph matches paths case-insensitively with full Unicode rules and
+# answers with its own spelling. The first sweep asked for Hi-10-30-261 and
+# got back Hİ-10-30-261 (Turkish dotted capital I). SQLite's NOCASE only folds
+# ASCII, so every slug column must hold one normalized key instead.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ("Hi", "hi"),
+        ("Hİ", "Hi"),  # U+0130 folds to i + combining dot; the dot must go too
+        (
+            "MOBІLІZACІYA",
+            "Mobіlіzacіya",
+        ),  # Cyrillic capital І (U+0406) vs small і (U+0456)
+        ("TEST", "test"),
+        ("Привет", "привет"),
+    ],
+)
+def test_normalize_slug_folds_unicode_case(a, b):
+    assert normalize_slug(a) == normalize_slug(b)
+
+
+def test_normalize_slug_turkish_dotted_i_becomes_plain_i():
+    assert normalize_slug("Hİ") == "hi"
+
+
+def test_normalize_slug_is_idempotent():
+    for s in ["Hİ", "Mobіlіzacіya", "Hello-World", "Привет"]:
+        assert normalize_slug(normalize_slug(s)) == normalize_slug(s)
+
+
+def test_normalize_slug_keeps_hyphens_and_digits():
+    assert normalize_slug("Mobile-Proxy-2024") == "mobile-proxy-2024"
+
+
+def test_normalize_slug_keeps_ukrainian_i_as_cyrillic():
+    # Folding must not transliterate: Cyrillic і stays Cyrillic, just lowercase.
+    assert normalize_slug("Povіstka") == "povіstka"
+    assert "і" in normalize_slug("POVІSTKA")

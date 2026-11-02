@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from sqlite3 import Connection
 
+from graphwatch.slugify import normalize_slug
 from graphwatch.telegraph import Outcome, build_path
 
 
@@ -155,7 +156,7 @@ def crowd_check(
     """
     for slug in slugs:
         for month, day in days:
-            if (slug, month, day) in done:
+            if (normalize_slug(slug), month, day) in done:
                 continue
             yield count_day(probe, slug, month, day, gap=gap)
 
@@ -177,7 +178,15 @@ def save_day_count(conn: Connection, dc: DayCount, ts: float):
     failures   = excluded.failures,
     checked_at = excluded.checked_at
     """
-    params = (dc.slug, dc.month, dc.day, dc.highest, dc.requests, dc.failures, ts)
+    params = (
+        normalize_slug(dc.slug),
+        dc.month,
+        dc.day,
+        dc.highest,
+        dc.requests,
+        dc.failures,
+        ts,
+    )
     conn.execute(sql, params)
     conn.commit()
 

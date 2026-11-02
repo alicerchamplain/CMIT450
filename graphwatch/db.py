@@ -8,7 +8,7 @@ from pathlib import Path
 from sqlite3 import Connection
 
 from graphwatch.redact import redact_page
-from graphwatch.slugify import Entry
+from graphwatch.slugify import Entry, normalize_slug
 from graphwatch.telegraph import Fetch, Outcome, page_text
 
 SCHEMA = """
@@ -187,10 +187,16 @@ def upsert_title(conn: Connection, entry: Entry, ts: float) -> int:
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(slug) DO NOTHING
     """
-    params_insert = (entry.title, entry.slug, entry.source, int(entry.crowd_only), ts)
+    params_insert = (
+        entry.title,
+        normalize_slug(entry.slug),
+        entry.source,
+        int(entry.crowd_only),
+        ts,
+    )
     conn.execute(sql_insert, params_insert)
     sql_select = "SELECT id FROM titles WHERE slug = ?"
-    params_select = (entry.slug,)
+    params_select = (normalize_slug(entry.slug),)
     row = conn.execute(sql_select, params_select).fetchone()
     title_id = row["id"]
     conn.commit()
@@ -214,7 +220,7 @@ def upsert_page(conn: Connection, path: str, ts: float, held_out: bool = False) 
     page_params = (path,)
     existing = conn.execute(page_select, page_params).fetchone()
     title_select = "SELECT id FROM titles WHERE slug = ? COLLATE NOCASE"
-    title_params = (slug,)
+    title_params = (normalize_slug(slug),)
     title_row = conn.execute(title_select, title_params).fetchone()
     title_id = title_row["id"] if title_row is not None else None
     upsert_sql = """
@@ -224,7 +230,17 @@ def upsert_page(conn: Connection, path: str, ts: float, held_out: bool = False) 
     last_seen = excluded.last_seen,
     held_out  = MAX(held_out, excluded.held_out)
     """
-    upsert_params = (path, slug, month, day, counter, title_id, int(held_out), ts, ts)
+    upsert_params = (
+        path,
+        normalize_slug(slug),
+        month,
+        day,
+        counter,
+        title_id,
+        int(held_out),
+        ts,
+        ts,
+    )
     cur = conn.execute(upsert_sql, upsert_params)
     if existing is not None:
         page_id = existing["id"]
@@ -395,7 +411,7 @@ def load_progress(
     WHERE slug = ? COLLATE NOCASE AND month = ? AND day = ?
     """
     params = (
-        slug,
+        normalize_slug(slug),
         month,
         day,
     )
@@ -441,7 +457,7 @@ def save_progress(
         updated_at = excluded.updated_at
         """
     params = (
-        slug,
+        normalize_slug(slug),
         month,
         day,
         next_n,

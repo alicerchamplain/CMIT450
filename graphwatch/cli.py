@@ -27,7 +27,7 @@ from graphwatch.db import (
     store_fetch,
     upsert_title,
 )
-from graphwatch.slugify import Entry, load_wordlists
+from graphwatch.slugify import Entry, load_wordlists, normalize_slug
 from graphwatch.sweep import sweep_day
 from graphwatch.telegraph import BudgetExceeded, Fetch, TelegraphClient
 
@@ -140,17 +140,19 @@ def run_sweep(
 
     for entry in entries:
         upsert_title(conn, entry, time.time())
-    slugs = [entry.slug for entry in entries]
     expected = load_expected(conn)
     fetch = make_fetch(client)
     stored = 0
     requests = 0
     try:
-        for slug in slugs:
-            if slug in exclude:
+        for entry in entries:
+            # The database speaks normalized keys; the network speaks the raw slug.
+            slug = entry.slug
+            slug_key = normalize_slug(slug)
+            if slug_key in exclude:
                 continue
             for month, day in days:
-                next_n, done = load_progress(conn, slug, month, day)
+                next_n, done = load_progress(conn, slug_key, month, day)
                 if done:
                     continue
                 gen = sweep_day(
@@ -159,7 +161,7 @@ def run_sweep(
                     month,
                     day,
                     next_n,
-                    expected.get((slug, month, day), 0),
+                    expected.get((slug_key, month, day), 0),
                     gap,
                     cap,
                 )
@@ -173,11 +175,19 @@ def run_sweep(
                     stored += 1
                     counter = parse_path(f.page["path"])[3] or 1
                     save_progress(
-                        conn, slug, month, day, counter + 1, False, 0, 0, time.time()
+                        conn,
+                        slug_key,
+                        month,
+                        day,
+                        counter + 1,
+                        False,
+                        0,
+                        0,
+                        time.time(),
                     )
                 save_progress(
                     conn,
-                    slug,
+                    slug_key,
                     month,
                     day,
                     summary.next_n,

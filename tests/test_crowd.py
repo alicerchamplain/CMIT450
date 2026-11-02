@@ -16,6 +16,7 @@ from graphwatch.crowd import (
     crowd_check,
     fit_window,
     load_done,
+    load_expected,
     recent_days,
     save_day_count,
     sweep_cost,
@@ -311,7 +312,8 @@ def test_crowd_check_is_lazy():
 
 def test_crowd_check_skips_done_pairs():
     probe = MultiProbe({("Hello", 10, 24): [1]})
-    done = {("Hello", 10, 23)}
+    # done holds normalized keys, as load_done returns them
+    done = {("hello", 10, 23)}
     results = list(crowd_check(probe, ["Hello"], [(10, 23), (10, 24)], done=done))
     assert [(r.month, r.day) for r in results] == [(10, 24)]
     assert not any("10-23" in p for p in probe.calls)
@@ -351,13 +353,13 @@ def test_schema_has_a_crowd_table(conn):
 def test_save_and_load_roundtrip(conn):
     save_day_count(conn, DayCount("Hello", 10, 24, 3, 7, 0, []), T0)
     save_day_count(conn, DayCount("Test", 10, 23, 0, 3, 1, []), T0)
-    assert load_done(conn) == {("Hello", 10, 24), ("Test", 10, 23)}
+    assert load_done(conn) == {("hello", 10, 24), ("test", 10, 23)}
 
 
 def test_save_stores_the_numbers(conn):
     save_day_count(conn, DayCount("Hello", 10, 24, 3, 7, 1, []), T0)
     row = conn.execute("SELECT * FROM crowd").fetchone()
-    assert (row["slug"], row["month"], row["day"]) == ("Hello", 10, 24)
+    assert (row["slug"], row["month"], row["day"]) == ("hello", 10, 24)
     assert (row["highest"], row["requests"], row["failures"], row["checked_at"]) == (
         3,
         7,
@@ -379,7 +381,7 @@ def test_save_commits(tmp_path):
     c1 = connect(db)
     save_day_count(c1, DayCount("Hello", 10, 24, 1, 1, 0, []), T0)
     c2 = connect(db)
-    assert load_done(c2) == {("Hello", 10, 24)}
+    assert load_done(c2) == {("hello", 10, 24)}
     c1.close()
     c2.close()
 
@@ -394,7 +396,7 @@ def test_resume_end_to_end(conn):
     probe = MultiProbe({("Hello", 10, 24): [1]})
     for dc in crowd_check(probe, ["Hello"], [(10, 23), (10, 24)], done=load_done(conn)):
         save_day_count(conn, dc, T0 + 1)
-    assert load_done(conn) == {("Hello", 10, 23), ("Hello", 10, 24)}
+    assert load_done(conn) == {("hello", 10, 23), ("hello", 10, 24)}
     assert all("10-24" in p for p in probe.calls)
 
 
@@ -413,12 +415,12 @@ def seed(conn, rows):
 
 def test_count_only_slugs_sums_pages_across_days(conn):
     seed(conn, [("Big", 10, 31, 6_000), ("Big", 11, 1, 4_000), ("Small", 11, 1, 9_999)])
-    assert count_only_slugs(conn, 10_000) == {"Big"}
+    assert count_only_slugs(conn, 10_000) == {"big"}
 
 
 def test_count_only_slugs_threshold_is_inclusive(conn):
     seed(conn, [("Exact", 11, 1, 10_000)])
-    assert count_only_slugs(conn, 10_000) == {"Exact"}
+    assert count_only_slugs(conn, 10_000) == {"exact"}
 
 
 def test_count_only_slugs_empty_table(conn):
@@ -427,7 +429,7 @@ def test_count_only_slugs_empty_table(conn):
 
 def test_count_only_slugs_zero_threshold_returns_everything(conn):
     seed(conn, [("A", 11, 1, 0), ("B", 11, 1, 3)])
-    assert count_only_slugs(conn, 0) == {"A", "B"}
+    assert count_only_slugs(conn, 0) == {"a", "b"}
 
 
 def test_sweep_cost_is_pages_plus_gap_plus_one_per_title_day(conn):
@@ -450,7 +452,7 @@ def test_sweep_cost_only_counts_days_in_the_window(conn):
 
 def test_sweep_cost_excludes_count_only_slugs(conn):
     seed(conn, [("Links", 11, 1, 100_000), ("A", 11, 1, 10)])
-    assert sweep_cost(conn, [(11, 1)], 2, {"Links"}) == 13
+    assert sweep_cost(conn, [(11, 1)], 2, {"links"}) == 13
 
 
 def test_sweep_cost_cap_bounds_each_title_day(conn):
@@ -505,10 +507,10 @@ def test_fit_window_counts_the_newest_days_first(conn):
 def test_fit_window_respects_exclusions_and_cap(conn):
     seed(conn, [("Links", 11, 1, 100_000), ("Spike", 11, 1, 5_000), ("A", 11, 1, 10)])
     # Uncapped, Spike alone (5,003) breaks a 1,000 budget: nothing fits.
-    assert fit_window(conn, TODAY, 1_000, 2, {"Links"}) == 0
+    assert fit_window(conn, TODAY, 1_000, 2, {"links"}) == 0
     # Capped at 500, the day costs 503 + 13 = 516 and fits; days absent from
     # the table cost nothing, so the window runs to max_days.
-    assert fit_window(conn, TODAY, 1_000, 2, {"Links"}, cap=500, max_days=1) == 1
+    assert fit_window(conn, TODAY, 1_000, 2, {"links"}, cap=500, max_days=1) == 1
 
 
 def test_fit_window_crosses_the_year_boundary(conn):
@@ -517,3 +519,23 @@ def test_fit_window_crosses_the_year_boundary(conn):
     jan1 = date(2027, 1, 1)
     assert fit_window(conn, jan1, 13, 2, set(), max_days=2) == 1  # Jan 1 only
     assert fit_window(conn, jan1, 26, 2, set(), max_days=2) == 2  # Dec 31 priced too
+
+
+def test_crowd_check_done_set_matches_across_unicode_case():
+    # load_done returns normalized keys; the raw wordlist slug still skips.
+    probe = MultiProbe({("Mobіlіzacіya", 10, 24): [1]})
+    done = {("mobіlіzacіya", 10, 23)}
+    results = list(
+        crowd_check(probe, ["Mobіlіzacіya"], [(10, 23), (10, 24)], done=done)
+    )
+    assert [(r.month, r.day) for r in results] == [(10, 24)]
+
+
+def test_load_expected_keys_are_normalized(conn):
+    save_day_count(conn, DayCount("MOBІLІZACІYA", 10, 19, 4, 1, 0, []), T0)
+    assert load_expected(conn) == {("mobіlіzacіya", 10, 19): 4}
+
+
+def test_sweep_cost_exclusion_matches_across_unicode_case(conn):
+    seed(conn, [("Hİ", 11, 1, 100_000), ("A", 11, 1, 10)])
+    assert sweep_cost(conn, [(11, 1)], 2, {"hi"}) == 13

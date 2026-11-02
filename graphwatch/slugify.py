@@ -49,6 +49,21 @@ for _cyr, _lat in _LOWER.items():
     TABLE[_cyr.upper()] = _lat.capitalize()
 
 
+def normalize_slug(slug: str) -> str:
+    """Function to do proper slug normalization
+
+    Args:
+        slug (str): slug to normalize
+
+    Returns:
+        str: normalized slug
+    """
+    folded = unicodedata.normalize("NFKC", slug).casefold()
+    decomposed = unicodedata.normalize("NFKD", folded)
+    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+    return unicodedata.normalize("NFC", stripped)
+
+
 def slugify(title: str) -> str:
     """Function to properly convert strings into proper Telegraph slugs
 

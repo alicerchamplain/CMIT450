@@ -65,7 +65,13 @@ def conn():
 
 def test_connect_creates_the_planned_tables(conn):
     assert {
-        "titles", "pages", "snapshots", "events", "http_log", "crowd", "sweep_progress"
+        "titles",
+        "pages",
+        "snapshots",
+        "events",
+        "http_log",
+        "crowd",
+        "sweep_progress",
     } <= tables(conn)
 
 
@@ -192,7 +198,17 @@ def test_parse_path_slug_with_digits_is_not_mistaken_for_a_date():
 
 @pytest.mark.parametrize(
     "bad",
-    ["Vizit", "Vizit-12", "Vizit-1-28", "-12-28", "Vizit-12-28-", "", "Vizit-13-01", "Vizit-12-32", "Vizit-00-10"],
+    [
+        "Vizit",
+        "Vizit-12",
+        "Vizit-1-28",
+        "-12-28",
+        "Vizit-12-28-",
+        "",
+        "Vizit-13-01",
+        "Vizit-12-32",
+        "Vizit-00-10",
+    ],
 )
 def test_parse_path_rejects_malformed_paths(bad):
     with pytest.raises(ValueError):
@@ -208,7 +224,7 @@ def test_upsert_title_inserts_and_returns_an_id(conn):
     tid = upsert_title(conn, Entry("Повістка", "Povіstka", "lures", False), T0)
     row = conn.execute("SELECT * FROM titles WHERE id = ?", (tid,)).fetchone()
     assert row["title"] == "Повістка"
-    assert row["slug"] == "Povіstka"
+    assert row["slug"] == "povіstka"
     assert row["source"] == "lures"
     assert row["crowd_only"] == 0
     assert row["added_at"] == T0
@@ -246,7 +262,7 @@ def test_upsert_page_inserts_parsed_fields(conn):
     row = conn.execute("SELECT * FROM pages WHERE id = ?", (pid,)).fetchone()
     assert row["path"] == "Hello-01-23-161"
     assert (row["slug"], row["month"], row["day"], row["counter"]) == (
-        "Hello",
+        "hello",
         1,
         23,
         161,
@@ -682,7 +698,14 @@ def test_add_snapshot_does_not_mutate_the_page_it_is_given(conn):
 
 def test_sweep_progress_has_the_planned_columns(conn):
     assert columns(conn, "sweep_progress") >= {
-        "slug", "month", "day", "next_n", "done", "requests", "failures", "updated_at"
+        "slug",
+        "month",
+        "day",
+        "next_n",
+        "done",
+        "requests",
+        "failures",
+        "updated_at",
     }
 
 
@@ -736,3 +759,43 @@ def test_save_progress_commits(tmp_path):
     assert load_progress(c2, "Hello", 10, 17) == (5, False)
     c1.close()
     c2.close()
+
+
+# --------------------------------------------------------------------------
+# Unicode case folding across tables (found after the first full sweep)
+# --------------------------------------------------------------------------
+
+
+def test_upsert_page_links_to_a_title_across_unicode_case(conn):
+    # Telegraph answered a request for Hi-10-30-261 with the path Hİ-10-30-261.
+    tid = upsert_title(conn, Entry("Hi", "Hi", "greetings", False), T0)
+    pid = upsert_page(conn, "Hİ-10-30-261", T0)
+    row = conn.execute(
+        "SELECT slug, title_id FROM pages WHERE id = ?", (pid,)
+    ).fetchone()
+    assert row["title_id"] == tid
+    assert row["slug"] == "hi"
+
+
+def test_upsert_page_links_cyrillic_capital_i_to_its_title(conn):
+    tid = upsert_title(conn, Entry("Мобілізація", "Mobіlіzacіya", "lures", False), T0)
+    pid = upsert_page(conn, "MOBІLІZACІYA-10-19", T0)
+    row = conn.execute(
+        "SELECT slug, title_id FROM pages WHERE id = ?", (pid,)
+    ).fetchone()
+    assert row["title_id"] == tid
+    assert row["slug"] == "mobіlіzacіya"
+
+
+def test_upsert_title_unicode_case_variants_are_one_row(conn):
+    a = upsert_title(conn, Entry("Hi", "Hi", "a", False), T0)
+    b = upsert_title(conn, Entry("HI", "Hİ", "b", False), T0)
+    assert a == b
+    assert conn.execute("SELECT COUNT(*) FROM titles").fetchone()[0] == 1
+
+
+def test_progress_round_trips_across_unicode_case(conn):
+    save_progress(conn, "Mobіlіzacіya", 10, 19, 7, True, 9, 0, T0)
+    assert load_progress(conn, "MOBІLІZACІYA", 10, 19) == (7, True)
+    assert load_progress(conn, "mobіlіzacіya", 10, 19) == (7, True)
+    assert conn.execute("SELECT COUNT(*) FROM sweep_progress").fetchone()[0] == 1

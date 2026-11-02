@@ -12,7 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from graphwatch.cli import main, make_fetch, make_probe, parse_args, require_key, run_crowd, run_sweep
+from graphwatch.cli import (
+    main,
+    make_fetch,
+    make_probe,
+    parse_args,
+    require_key,
+    run_crowd,
+    run_sweep,
+)
 from graphwatch.config import CONFIG
 from graphwatch.crowd import save_day_count, DayCount
 from graphwatch.db import connect, load_progress
@@ -96,10 +104,10 @@ def test_run_crowd_saves_one_row_per_slug_per_day(conn):
         "SELECT slug, month, day, highest FROM crowd ORDER BY slug, month, day"
     ).fetchall()
     assert [tuple(r) for r in rows] == [
-        ("Hello", 10, 23, 0),
-        ("Hello", 10, 24, 2),
-        ("Povіstka", 10, 23, 1),
-        ("Povіstka", 10, 24, 0),
+        ("hello", 10, 23, 0),
+        ("hello", 10, 24, 2),
+        ("povіstka", 10, 23, 1),
+        ("povіstka", 10, 24, 0),
     ]
 
 
@@ -108,8 +116,8 @@ def test_run_crowd_registers_the_titles(conn):
     run_crowd(conn, client, ENTRIES, DAYS, log=lambda s: None)
     rows = conn.execute("SELECT title, slug, source FROM titles ORDER BY id").fetchall()
     assert [tuple(r) for r in rows] == [
-        ("Hello", "Hello", "greetings"),
-        ("Повістка", "Povіstka", "lures"),
+        ("Hello", "hello", "greetings"),
+        ("Повістка", "povіstka", "lures"),
     ]
 
 
@@ -137,7 +145,7 @@ def test_run_crowd_stops_cleanly_when_the_budget_runs_out(conn):
     checked = run_crowd(conn, client, ENTRIES, DAYS, gap=0, log=lambda s: None)
     assert checked == 2
     rows = conn.execute("SELECT slug FROM crowd").fetchall()
-    assert {r[0] for r in rows} == {"Hello"}
+    assert {r[0] for r in rows} == {"hello"}
 
 
 def test_run_crowd_uses_the_gap(conn):
@@ -292,7 +300,9 @@ def test_make_fetch_returns_the_whole_fetch_with_content():
 
 def test_run_sweep_stores_every_page_of_every_day(conn):
     client, _ = make_sweep_client({"Hello-10-24", "Hello-10-24-2", "Povіstka-10-23"})
-    stored, requests = run_sweep(conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None)
+    stored, requests = run_sweep(
+        conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None
+    )
     assert stored == 3
     assert stored_paths(conn) == ["Hello-10-24", "Hello-10-24-2", "Povіstka-10-23"]
     assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 3
@@ -307,7 +317,7 @@ def test_run_sweep_registers_titles_and_links_pages_to_them(conn):
     row = conn.execute(
         "SELECT t.slug FROM pages p JOIN titles t ON p.title_id = t.id"
     ).fetchone()
-    assert row["slug"] == "Hello"
+    assert row["slug"] == "hello"
 
 
 def test_run_sweep_stores_redacted_content(conn):
@@ -336,14 +346,16 @@ def test_run_sweep_records_progress_per_day(conn):
     assert load_progress(conn, "Hello", 10, 24) == (5, True)  # 1, 2 found; 3, 4 miss
     assert load_progress(conn, "Hello", 10, 23) == (3, True)  # 1, 2 miss
     row = conn.execute(
-        "SELECT requests, failures FROM sweep_progress WHERE slug = 'Hello' AND day = 24"
+        "SELECT requests, failures FROM sweep_progress WHERE slug = 'hello' AND day = 24"
     ).fetchone()
     assert (row["requests"], row["failures"]) == (4, 0)
 
 
 def test_run_sweep_skips_excluded_slugs_entirely(conn):
     client, session = make_sweep_client({"Hello-10-24", "Povіstka-10-23"})
-    stored, _ = run_sweep(conn, client, ENTRIES, DAYS, KEY, 0, None, {"Hello"}, log=lambda s: None)
+    stored, _ = run_sweep(
+        conn, client, ENTRIES, DAYS, KEY, 0, None, {"hello"}, log=lambda s: None
+    )
     assert stored == 1
     assert not any(p.startswith("Hello") for p in session.paths)
     assert load_progress(conn, "Hello", 10, 24) == (1, False)
@@ -353,7 +365,9 @@ def test_run_sweep_skips_days_already_done(conn):
     client1, _ = make_sweep_client({"Hello-10-24"})
     run_sweep(conn, client1, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None)
     client2, session2 = make_sweep_client({"Hello-10-24"})
-    stored, requests = run_sweep(conn, client2, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None)
+    stored, requests = run_sweep(
+        conn, client2, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None
+    )
     assert (stored, requests) == (0, 0)
     assert session2.paths == []
 
@@ -362,22 +376,33 @@ def test_run_sweep_resumes_a_day_cut_off_by_the_budget(conn):
     existing = {"Hello-10-23", "Hello-10-23-2", "Hello-10-23-3", "Hello-10-23-4"}
     # Night one: budget allows 1, 2 and the request for 3 is refused.
     client1, session1 = make_sweep_client(existing, budget=2)
-    stored, _ = run_sweep(conn, client1, ENTRIES[:1], [(10, 23)], KEY, 0, None, set(), log=lambda s: None)
+    stored, _ = run_sweep(
+        conn, client1, ENTRIES[:1], [(10, 23)], KEY, 0, None, set(), log=lambda s: None
+    )
     assert stored == 2
     assert load_progress(conn, "Hello", 10, 23) == (3, False)
     # Night two: picks up at 3, never re-fetches 1 or 2.
     client2, session2 = make_sweep_client(existing)
-    stored, _ = run_sweep(conn, client2, ENTRIES[:1], [(10, 23)], KEY, 0, None, set(), log=lambda s: None)
+    stored, _ = run_sweep(
+        conn, client2, ENTRIES[:1], [(10, 23)], KEY, 0, None, set(), log=lambda s: None
+    )
     assert stored == 2
     assert session2.paths == ["Hello-10-23-3", "Hello-10-23-4", "Hello-10-23-5"]
     assert load_progress(conn, "Hello", 10, 23) == (6, True)
-    assert stored_paths(conn) == ["Hello-10-23", "Hello-10-23-2", "Hello-10-23-3", "Hello-10-23-4"]
+    assert stored_paths(conn) == [
+        "Hello-10-23",
+        "Hello-10-23-2",
+        "Hello-10-23-3",
+        "Hello-10-23-4",
+    ]
 
 
 def test_run_sweep_budget_exceeded_is_logged_not_raised(conn):
     client, _ = make_sweep_client({"Hello-10-23", "Hello-10-23-2"}, budget=1)
     lines = []
-    stored, _ = run_sweep(conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lines.append)
+    stored, _ = run_sweep(
+        conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lines.append
+    )
     assert stored == 1
     assert any("budget" in line for line in lines)
 
@@ -386,7 +411,9 @@ def test_run_sweep_uses_expected_from_the_crowd_table(conn):
     # Pages at 1 and 5; crowd says the day reaches 5. gap 0 would otherwise stop at 2.
     seed_crowd(conn, [("Hello", 10, 23, 5)])
     client, session = make_sweep_client({"Hello-10-23", "Hello-10-23-5"})
-    stored, _ = run_sweep(conn, client, ENTRIES, [(10, 23)], KEY, 0, None, set(), log=lambda s: None)
+    stored, _ = run_sweep(
+        conn, client, ENTRIES, [(10, 23)], KEY, 0, None, set(), log=lambda s: None
+    )
     assert stored == 2
     assert "Hello-10-23-5" in session.paths
 
@@ -395,13 +422,17 @@ def test_run_sweep_cap_truncates_a_day(conn):
     existing = {f"Hello-10-23-{n}" for n in range(2, 10)} | {"Hello-10-23"}
     seed_crowd(conn, [("Hello", 10, 23, 9)])
     client, session = make_sweep_client(existing)
-    stored, _ = run_sweep(conn, client, ENTRIES, [(10, 23)], KEY, 2, 3, set(), log=lambda s: None)
+    stored, _ = run_sweep(
+        conn, client, ENTRIES, [(10, 23)], KEY, 2, 3, set(), log=lambda s: None
+    )
     assert stored == 3
     assert load_progress(conn, "Hello", 10, 23) == (4, True)
 
 
 def test_run_sweep_failed_tail_leaves_the_day_for_retry(conn):
-    client, _ = make_sweep_client({"Hello-10-23"}, failing={"Hello-10-23-2", "Hello-10-23-3"})
+    client, _ = make_sweep_client(
+        {"Hello-10-23"}, failing={"Hello-10-23-2", "Hello-10-23-3"}
+    )
     lines = []
     run_sweep(conn, client, ENTRIES, [(10, 23)], KEY, 1, None, set(), log=lines.append)
     next_n, done = load_progress(conn, "Hello", 10, 23)
@@ -423,7 +454,10 @@ def test_run_sweep_logs_every_request(conn):
     client, _ = make_sweep_client({"Hello-10-24"})
     client.log = __import__("graphwatch.db", fromlist=["http_logger"]).http_logger(conn)
     run_sweep(conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None)
-    assert conn.execute("SELECT COUNT(*) FROM http_log").fetchone()[0] == client.requests_made
+    assert (
+        conn.execute("SELECT COUNT(*) FROM http_log").fetchone()[0]
+        == client.requests_made
+    )
 
 
 def test_run_sweep_stores_the_api_path_not_the_requested_one(conn):
@@ -436,7 +470,9 @@ def test_run_sweep_stores_the_api_path_not_the_requested_one(conn):
         return r
 
     session.get = get
-    run_sweep(conn, client, ENTRIES, [(10, 24)], KEY, 0, None, set(), log=lambda s: None)
+    run_sweep(
+        conn, client, ENTRIES, [(10, 24)], KEY, 0, None, set(), log=lambda s: None
+    )
     assert stored_paths(conn) == ["hello-10-24"]
     # progress is keyed by the slug we swept, case-insensitively
     assert load_progress(conn, "Hello", 10, 24)[1] is True
@@ -457,7 +493,14 @@ def workdir(tmp_path):
 
 
 def common(workdir):
-    return ["--db", str(workdir / "g.sqlite"), "--wordlists", str(workdir / "wordlists"), "--budget", "0"]
+    return [
+        "--db",
+        str(workdir / "g.sqlite"),
+        "--wordlists",
+        str(workdir / "wordlists"),
+        "--budget",
+        "0",
+    ]
 
 
 def test_main_sweep_without_a_config_file_exits_before_touching_the_db(workdir, capsys):
@@ -476,14 +519,34 @@ def test_main_sweep_without_the_key_exits(workdir):
 
 
 def test_main_crowd_does_not_need_the_config(workdir, capsys):
-    main(["--config", str(workdir / "nope.env"), "crowd", *common(workdir), "--days", "1"])
+    main(
+        [
+            "--config",
+            str(workdir / "nope.env"),
+            "crowd",
+            *common(workdir),
+            "--days",
+            "1",
+        ]
+    )
     out = capsys.readouterr().out
     assert "budget exceeded" in out
     assert "checked 0 title-days" in out
 
 
 def test_main_sweep_prints_the_plan_then_stops_on_the_budget(workdir, capsys):
-    main(["--config", str(workdir / "config.env"), "sweep", *common(workdir), "--days", "2", "--today", "2026-11-01"])
+    main(
+        [
+            "--config",
+            str(workdir / "config.env"),
+            "sweep",
+            *common(workdir),
+            "--days",
+            "2",
+            "--today",
+            "2026-11-01",
+        ]
+    )
     out = capsys.readouterr().out
     assert "2" in out.splitlines()[0]  # the window size is on the planning line
     assert "10-31" in out.splitlines()[0]  # first day of a 2-day window ending Nov 1
@@ -498,7 +561,16 @@ def test_main_sweep_refuses_when_no_window_fits(workdir, capsys):
     save_day_count(c, DayCount("Hello", 11, 1, 10, 1, 0, []), 0.0)
     c.close()
     with pytest.raises(SystemExit) as exc:
-        main(["--config", str(workdir / "config.env"), "sweep", *common(workdir), "--today", "2026-11-01"])
+        main(
+            [
+                "--config",
+                str(workdir / "config.env"),
+                "sweep",
+                *common(workdir),
+                "--today",
+                "2026-11-01",
+            ]
+        )
     assert "window" in str(exc.value)
 
 
@@ -510,7 +582,12 @@ def test_main_sweep_lets_the_crowd_table_choose_the_window(workdir, capsys):
         save_day_count(c, DayCount("Hello", 10, d, 10, 1, 0, []), 0.0)
     save_day_count(c, DayCount("Hello", 11, 1, 10, 1, 0, []), 0.0)
     c.close()
-    args = ["--db", str(workdir / "g.sqlite"), "--wordlists", str(workdir / "wordlists")]
+    args = [
+        "--db",
+        str(workdir / "g.sqlite"),
+        "--wordlists",
+        str(workdir / "wordlists"),
+    ]
     import graphwatch.cli as cli
 
     captured = {}
@@ -522,7 +599,18 @@ def test_main_sweep_lets_the_crowd_table_choose_the_window(workdir, capsys):
 
     cli.run_sweep = fake_run_sweep
     try:
-        main(["--config", str(workdir / "config.env"), "sweep", *args, "--budget", "26", "--today", "2026-11-01"])
+        main(
+            [
+                "--config",
+                str(workdir / "config.env"),
+                "sweep",
+                *args,
+                "--budget",
+                "26",
+                "--today",
+                "2026-11-01",
+            ]
+        )
     finally:
         cli.run_sweep = real
     assert captured["days"] == [(10, 31), (11, 1)]
@@ -543,7 +631,18 @@ def test_main_sweep_excludes_titles_above_the_count_only_threshold(workdir):
 
     cli.run_sweep = fake_run_sweep
     try:
-        main(["--config", str(workdir / "config.env"), "sweep", *common(workdir), "--days", "1", "--today", "2026-11-01"])
+        main(
+            [
+                "--config",
+                str(workdir / "config.env"),
+                "sweep",
+                *common(workdir),
+                "--days",
+                "1",
+                "--today",
+                "2026-11-01",
+            ]
+        )
     finally:
         cli.run_sweep = real
-    assert captured["exclude"] == {"Hello"}
+    assert captured["exclude"] == {"hello"}
