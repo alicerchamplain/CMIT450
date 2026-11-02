@@ -196,6 +196,20 @@ def load_done(conn: Connection) -> set[tuple[str, int, int]]:
     return {(row["slug"], row["month"], row["day"]) for row in rows}
 
 
+def load_expected(conn: Connection) -> dict[tuple[str, int, int], int]:
+    """Load each counted (slug, month, day) with its highest confirmed counter"
+
+    Args:
+        conn (Connection): database connection from db.connect
+
+    Returns:
+        dict[tuple[str, int, int], int]: highest counter per recorded (slug, month, day)
+    """
+    sql = "SELECT slug, month, day, highest FROM crowd"
+    rows = conn.execute(sql).fetchall()
+    return {(row["slug"], row["month"], row["day"]): row["highest"] for row in rows}
+
+
 def count_only_slugs(conn: Connection, threshold: int) -> set[str]:
     """Function to find slugs at or above a threshold
 
