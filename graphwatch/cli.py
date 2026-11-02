@@ -7,10 +7,32 @@ from datetime import date
 from pathlib import Path
 from sqlite3 import Connection
 
+from graphwatch.config import CONFIG, hmac_key, load_config
 from graphwatch.crowd import crowd_check, load_done, recent_days, save_day_count
 from graphwatch.db import connect, http_logger, upsert_title
 from graphwatch.slugify import Entry, load_wordlists
 from graphwatch.telegraph import BudgetExceeded, TelegraphClient
+
+
+def require_key(path: Path) -> bytes:
+    """Helper function to load the hmac key
+
+    Args:
+        path (Path): Path to config.env
+
+    Raises:
+        SystemExit: Exit if config file not found
+        SystemExit: Exit if HMAC_KEY is not set in the config file
+
+    Returns:
+        bytes: The bytes of the HMAC_KEY
+    """
+    try:
+        return hmac_key(load_config(path))
+    except FileNotFoundError:
+        raise SystemExit(f"Config file not found: {path}")
+    except KeyError:
+        raise SystemExit(f"HMAC_KEY not set in {path}")
 
 
 def make_probe(client: TelegraphClient):
@@ -87,6 +109,7 @@ def parse_args(argv: list[str]):
     sub = parser.add_subparsers(dest="command", required=True)
     crowd = sub.add_parser("crowd", help="count pages per title per day")
     crowd.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
+    crowd.add_argument("--config", type=Path, default=CONFIG)
     crowd.add_argument("--wordlists", type=Path, default=Path("wordlists"))
     crowd.add_argument("--days", type=int, default=14)
     crowd.add_argument("--gap", type=int, default=2)
@@ -95,7 +118,7 @@ def parse_args(argv: list[str]):
     return parser.parse_args(argv)
 
 
-def main(argv:list[str]| None=None):
+def main(argv: list[str] | None = None):
     """Entry point: build the real objects and run the chosen command
 
     Args:

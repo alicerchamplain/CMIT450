@@ -190,7 +190,7 @@ class TelegraphClient:
         log=None,
         user_agent: str = "graphwatch",
         retries: int = 2,
-        backoff_s: float = 1.0
+        backoff_s: float = 1.0,
     ):
         """Stores the client settings and creates a requests.Session if none was given
 
@@ -300,7 +300,6 @@ class TelegraphClient:
             )
         return fetch
 
-
     def get_page(self, path: str, content: bool = True) -> Fetch:
         """Fetches one Telegraph page by path and returns the outcome as a Fetch
 
@@ -328,10 +327,9 @@ class TelegraphClient:
         url = f"{BASE_URL}/getPage/{urllib.parse.quote(path, safe='')}?return_content={'true' if content else 'false'}"
         self._check_host(url)
         for attempt in range(1, self.retries + 2):
-            fetch =  self._attempt(path, url, attempt)
+            fetch = self._attempt(path, url, attempt)
             if fetch.outcome is not Outcome.FAILED:
                 return fetch
             if attempt <= self.retries:
                 self.sleep(self.backoff_s * 2 ** (attempt - 1))
         return fetch
-

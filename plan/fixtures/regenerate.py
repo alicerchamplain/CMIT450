@@ -8,40 +8,17 @@ import json
 import sys
 from pathlib import Path
 
+from graphwatch.config import hmac_key, load_config
 from graphwatch.redact import redact_page
 
 HERE = Path(__file__).resolve().parent
-CONFIG = Path.home() / ".config" / "graphwatch" / "config.env"
-
-
-def load_key(config: Path = CONFIG) -> bytes:
-    """Loads HMAC Key from config
-
-    Args:
-        config (Path, optional): Path to the config file. Defaults to CONFIG.
-
-    Raises:
-        SystemExit: Exit if the hmac key isn't found
-
-    Returns:
-        bytes: HMAC key bytes
-    """
-    for line in config.read_text(encoding="utf-8").splitlines():
-        name, sep, value = line.strip().partition("=")
-        if sep and name.strip() == "HMAC_KEY":
-            value = value.strip().strip("'\"")
-            try:
-                return bytes.fromhex(value)
-            except ValueError:
-                return value.encode("utf-8")
-    raise SystemExit(f"HMAC_KEY not found in {config}")
 
 
 def main(argv: list[str]) -> None:
-    """Uses the API client to regenerate the fixtures of the eval set
+    """Redacts every raw response in RAW_DIR and writes it as a fixture
 
     Args:
-        argv (list[str]): Path to fixtures directory
+        argv (list[str]): the directory of raw responses
 
     Raises:
         SystemExit: Exit if no args passed
@@ -49,7 +26,10 @@ def main(argv: list[str]) -> None:
     if len(argv) != 1:
         raise SystemExit(__doc__)
     raw_dir = Path(argv[0])
-    key = load_key()
+    try:
+        key = hmac_key(load_config())
+    except (FileNotFoundError, KeyError) as e:
+        raise SystemExit(f"HMAC_KEY not available: {e}")
     for raw_file in sorted(raw_dir.glob("*.json")):
         page = json.loads(raw_file.read_text(encoding="utf-8"))
         envelope = {"ok": True, "result": redact_page(page, key)}
