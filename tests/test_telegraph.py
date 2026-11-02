@@ -198,7 +198,11 @@ def test_node_links_unknown_shape_contributes_nothing():
 
 
 def test_page_text_starts_with_title_then_description_then_body():
-    page = {"title": "T", "description": "D", "content": [{"tag": "p", "children": ["B"]}]}
+    page = {
+        "title": "T",
+        "description": "D",
+        "content": [{"tag": "p", "children": ["B"]}],
+    }
     assert page_text(page) == "T\nD\nB\n"
 
 
@@ -226,7 +230,10 @@ def test_page_links_collects_from_content_only():
     page = {
         "title": "https://not-a-link-in-the-title.test",
         "content": [
-            {"tag": "p", "children": [{"tag": "a", "attrs": {"href": "https://x.test/y"}}]}
+            {
+                "tag": "p",
+                "children": [{"tag": "a", "attrs": {"href": "https://x.test/y"}}],
+            }
         ],
     }
     assert page_links(page) == ["https://x.test/y"]
@@ -311,7 +318,9 @@ def test_wait_turn_sleeps_only_when_the_slot_is_not_open():
 
 
 def test_get_page_found():
-    client, session, rows = make_client([FakeResponse(200, fixture_bytes("Vizit-12-28"))])
+    client, session, rows = make_client(
+        [FakeResponse(200, fixture_bytes("Vizit-12-28"))]
+    )
     fetch = client.get_page("Vizit-12-28")
     assert isinstance(fetch, Fetch)
     assert fetch.outcome is Outcome.FOUND
@@ -377,7 +386,14 @@ def test_get_page_logs_one_row_per_request_with_expected_keys():
     client.get_page("Vizit-12-28")
     assert len(rows) == 1
     assert set(rows[0]) == {
-        "ts", "path", "attempt", "status", "outcome", "error", "elapsed_ms", "bytes"
+        "ts",
+        "path",
+        "attempt",
+        "status",
+        "outcome",
+        "error",
+        "elapsed_ms",
+        "bytes",
     }
     assert rows[0]["outcome"] == "FOUND"
     assert rows[0]["attempt"] == 1
@@ -421,9 +437,13 @@ def backoff_sleeps(slept):
 
 def test_get_page_retries_a_failed_attempt_and_returns_the_success():
     slept = []
-    session = FakeSession([requests.Timeout("slow"), FakeResponse(200, fixture_bytes("Vizit-12-28"))])
+    session = FakeSession(
+        [requests.Timeout("slow"), FakeResponse(200, fixture_bytes("Vizit-12-28"))]
+    )
     rows = []
-    client = TelegraphClient(session=session, sleep=slept.append, log=rows.append, retries=2)
+    client = TelegraphClient(
+        session=session, sleep=slept.append, log=rows.append, retries=2
+    )
     fetch = client.get_page("Vizit-12-28")
     assert fetch.outcome is Outcome.FOUND
     assert len(session.calls) == 2
@@ -433,21 +453,32 @@ def test_get_page_retries_a_failed_attempt_and_returns_the_success():
 
 def test_get_page_gives_up_after_retries_and_returns_the_last_failure():
     slept = []
-    session = FakeSession([requests.Timeout("a"), requests.Timeout("b"), requests.Timeout("c")])
+    session = FakeSession(
+        [requests.Timeout("a"), requests.Timeout("b"), requests.Timeout("c")]
+    )
     rows = []
-    client = TelegraphClient(session=session, sleep=slept.append, log=rows.append, retries=2)
+    client = TelegraphClient(
+        session=session, sleep=slept.append, log=rows.append, retries=2
+    )
     fetch = client.get_page("Vizit-12-28")
     assert fetch.outcome is Outcome.FAILED
     assert "c" in fetch.error  # the last attempt's error, not the first
     assert len(session.calls) == 3  # one try plus two retries, never four
     assert [r["attempt"] for r in rows] == [1, 2, 3]
-    assert backoff_sleeps(slept) == [1.0, 2.0]  # doubling, and no sleep after the last attempt
+    assert backoff_sleeps(slept) == [
+        1.0,
+        2.0,
+    ]  # doubling, and no sleep after the last attempt
 
 
 def test_get_page_backoff_scales_with_backoff_s():
     slept = []
-    session = FakeSession([requests.Timeout("a"), requests.Timeout("b"), requests.Timeout("c")])
-    client = TelegraphClient(session=session, sleep=slept.append, retries=2, backoff_s=5.0)
+    session = FakeSession(
+        [requests.Timeout("a"), requests.Timeout("b"), requests.Timeout("c")]
+    )
+    client = TelegraphClient(
+        session=session, sleep=slept.append, retries=2, backoff_s=5.0
+    )
     client.get_page("Vizit-12-28")
     assert backoff_sleeps(slept) == [5.0, 10.0]
 
@@ -465,7 +496,10 @@ def test_get_page_does_not_retry_not_found():
 def test_get_page_retries_a_server_error_body_too():
     # A 502 HTML body is FAILED, so it is retried like a network error.
     session = FakeSession(
-        [FakeResponse(502, b"<html>Bad Gateway</html>"), FakeResponse(200, fixture_bytes("Vizit-12-28"))]
+        [
+            FakeResponse(502, b"<html>Bad Gateway</html>"),
+            FakeResponse(200, fixture_bytes("Vizit-12-28")),
+        ]
     )
     client = TelegraphClient(session=session, sleep=lambda s: None, retries=1)
     assert client.get_page("Vizit-12-28").outcome is Outcome.FOUND
@@ -473,7 +507,9 @@ def test_get_page_retries_a_server_error_body_too():
 
 
 def test_get_page_retries_zero_means_a_single_attempt():
-    session = FakeSession([requests.Timeout("a"), FakeResponse(200, fixture_bytes("Vizit-12-28"))])
+    session = FakeSession(
+        [requests.Timeout("a"), FakeResponse(200, fixture_bytes("Vizit-12-28"))]
+    )
     client = TelegraphClient(session=session, sleep=lambda s: None, retries=0)
     assert client.get_page("Vizit-12-28").outcome is Outcome.FAILED
     assert len(session.calls) == 1
@@ -481,7 +517,9 @@ def test_get_page_retries_zero_means_a_single_attempt():
 
 def test_get_page_budget_is_enforced_per_attempt():
     # Budget of 2 with a client that would retry twice: the third attempt is refused.
-    session = FakeSession([requests.Timeout("a"), requests.Timeout("b"), requests.Timeout("c")])
+    session = FakeSession(
+        [requests.Timeout("a"), requests.Timeout("b"), requests.Timeout("c")]
+    )
     client = TelegraphClient(session=session, sleep=lambda s: None, retries=2, budget=2)
     with pytest.raises(BudgetExceeded):
         client.get_page("Vizit-12-28")
@@ -491,7 +529,10 @@ def test_get_page_budget_is_enforced_per_attempt():
 
 def test_get_page_counts_requests_including_failures():
     client, _, _ = make_client(
-        [FakeResponse(200, fixture_bytes("not-found")), requests.ConnectionError("down")]
+        [
+            FakeResponse(200, fixture_bytes("not-found")),
+            requests.ConnectionError("down"),
+        ]
     )
     client.get_page("a-01-01")
     client.get_page("b-01-01")
@@ -499,7 +540,9 @@ def test_get_page_counts_requests_including_failures():
 
 
 def test_get_page_budget_raises_before_sending():
-    client, session, _ = make_client([FakeResponse(200, fixture_bytes("Vizit-12-28"))], budget=1)
+    client, session, _ = make_client(
+        [FakeResponse(200, fixture_bytes("Vizit-12-28"))], budget=1
+    )
     client.get_page("Vizit-12-28")
     with pytest.raises(BudgetExceeded):
         client.get_page("Vizit-12-28")

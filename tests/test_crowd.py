@@ -58,7 +58,9 @@ def check(existing, gap=2, failing=(), **kw):
 
 
 def test_daycount_fields():
-    dc = DayCount("Hello", 10, 24, 3, 5, 0, ["Hello-10-24", "Hello-10-24-2", "Hello-10-24-3"])
+    dc = DayCount(
+        "Hello", 10, 24, 3, 5, 0, ["Hello-10-24", "Hello-10-24-2", "Hello-10-24-3"]
+    )
     assert (dc.slug, dc.month, dc.day) == ("Hello", 10, 24)
     assert dc.highest == 3
     assert dc.requests == 5
@@ -203,7 +205,9 @@ def test_empty_day_with_gap_zero_is_one_probe():
 
 def test_probes_go_up_by_doubling_before_bisecting():
     _, probe = check(existing=range(1, 100), gap=0)
-    counters = [1 if p == "Hello-10-24" else int(p.rsplit("-", 1)[1]) for p in probe.calls]
+    counters = [
+        1 if p == "Hello-10-24" else int(p.rsplit("-", 1)[1]) for p in probe.calls
+    ]
     assert counters[:7] == [1, 2, 4, 8, 16, 32, 64]
     assert 128 in counters  # first miss
     assert all(64 < c < 128 for c in counters[8:])  # bisection stays in the bracket
@@ -330,7 +334,15 @@ def conn():
 
 def test_schema_has_a_crowd_table(conn):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(crowd)").fetchall()}
-    assert {"slug", "month", "day", "highest", "requests", "failures", "checked_at"} <= cols
+    assert {
+        "slug",
+        "month",
+        "day",
+        "highest",
+        "requests",
+        "failures",
+        "checked_at",
+    } <= cols
 
 
 def test_save_and_load_roundtrip(conn):
@@ -343,7 +355,12 @@ def test_save_stores_the_numbers(conn):
     save_day_count(conn, DayCount("Hello", 10, 24, 3, 7, 1, []), T0)
     row = conn.execute("SELECT * FROM crowd").fetchone()
     assert (row["slug"], row["month"], row["day"]) == ("Hello", 10, 24)
-    assert (row["highest"], row["requests"], row["failures"], row["checked_at"]) == (3, 7, 1, T0)
+    assert (row["highest"], row["requests"], row["failures"], row["checked_at"]) == (
+        3,
+        7,
+        1,
+        T0,
+    )
 
 
 def test_save_same_day_again_replaces_not_duplicates(conn):

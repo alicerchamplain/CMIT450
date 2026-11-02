@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from graphwatch.cli import make_probe, parse_args, run_crowd
+from graphwatch.cli import make_probe, parse_args, require_key, run_crowd
+from graphwatch.config import CONFIG
 from graphwatch.db import connect
 from graphwatch.slugify import Entry
 from graphwatch.telegraph import BudgetExceeded, Outcome, TelegraphClient
@@ -89,7 +90,9 @@ def test_run_crowd_saves_one_row_per_slug_per_day(conn):
     client, _ = make_client({"Hello-10-24", "Hello-10-24-2", "Povіstka-10-23"})
     checked = run_crowd(conn, client, ENTRIES, DAYS, gap=0, log=lambda s: None)
     assert checked == 4
-    rows = conn.execute("SELECT slug, month, day, highest FROM crowd ORDER BY slug, month, day").fetchall()
+    rows = conn.execute(
+        "SELECT slug, month, day, highest FROM crowd ORDER BY slug, month, day"
+    ).fetchall()
     assert [tuple(r) for r in rows] == [
         ("Hello", 10, 23, 0),
         ("Hello", 10, 24, 2),
@@ -102,7 +105,10 @@ def test_run_crowd_registers_the_titles(conn):
     client, _ = make_client(set())
     run_crowd(conn, client, ENTRIES, DAYS, log=lambda s: None)
     rows = conn.execute("SELECT title, slug, source FROM titles ORDER BY id").fetchall()
-    assert [tuple(r) for r in rows] == [("Hello", "Hello", "greetings"), ("Повістка", "Povіstka", "lures")]
+    assert [tuple(r) for r in rows] == [
+        ("Hello", "Hello", "greetings"),
+        ("Повістка", "Povіstka", "lures"),
+    ]
 
 
 def test_run_crowd_resumes_and_spends_nothing_on_done_days(conn):
@@ -155,7 +161,21 @@ def test_parse_args_crowd_defaults():
 
 
 def test_parse_args_crowd_overrides():
-    args = parse_args(["crowd", "--days", "3", "--gap", "1", "--rate", "4", "--budget", "500", "--db", "x.sqlite"])
+    args = parse_args(
+        [
+            "crowd",
+            "--days",
+            "3",
+            "--gap",
+            "1",
+            "--rate",
+            "4",
+            "--budget",
+            "500",
+            "--db",
+            "x.sqlite",
+        ]
+    )
     assert (args.days, args.gap, args.rate, args.budget) == (3, 1, 4.0, 500)
     assert str(args.db) == "x.sqlite"
 
@@ -163,3 +183,50 @@ def test_parse_args_crowd_overrides():
 def test_parse_args_requires_a_command():
     with pytest.raises(SystemExit):
         parse_args([])
+
+
+def test_parse_args_config_defaults_to_the_user_config_file():
+    assert parse_args(["crowd"]).config == CONFIG
+
+
+def test_parse_args_config_is_a_top_level_option():
+    # Shared by every command, so it is typed before the command name.
+    args = parse_args(["--config", "/tmp/x.env", "crowd"])
+    assert str(args.config) == "/tmp/x.env"
+    assert args.command == "crowd"
+
+
+# --------------------------------------------------------------------------
+# require_key
+# --------------------------------------------------------------------------
+
+
+def test_require_key_returns_the_key_bytes(tmp_path):
+    cfg = tmp_path / "config.env"
+    cfg.write_text("HMAC_KEY=00ff\n", encoding="utf-8")
+    assert require_key(cfg) == b"\x00\xff"
+
+
+def test_require_key_missing_file_exits_naming_the_path(tmp_path):
+    cfg = tmp_path / "nope.env"
+    with pytest.raises(SystemExit) as exc:
+        require_key(cfg)
+    assert str(cfg) in str(exc.value)
+    assert exc.value.code != 0
+
+
+def test_require_key_missing_variable_exits_naming_it(tmp_path):
+    cfg = tmp_path / "config.env"
+    cfg.write_text("OTHER=1\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        require_key(cfg)
+    assert "HMAC_KEY" in str(exc.value)
+    assert str(cfg) in str(exc.value)
+
+
+def test_require_key_never_prints_the_key(tmp_path, capsys):
+    cfg = tmp_path / "config.env"
+    cfg.write_text("HMAC_KEY=sensitive-passphrase\n", encoding="utf-8")
+    require_key(cfg)
+    out, err = capsys.readouterr()
+    assert "sensitive" not in out + err

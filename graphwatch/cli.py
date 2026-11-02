@@ -106,10 +106,10 @@ def parse_args(argv: list[str]):
         SystemExit: on no command, an unknown command, or --help
     """
     parser = argparse.ArgumentParser(prog="graphwatch")
+    parser.add_argument("--config", type=Path, default=CONFIG)
     sub = parser.add_subparsers(dest="command", required=True)
     crowd = sub.add_parser("crowd", help="count pages per title per day")
     crowd.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
-    crowd.add_argument("--config", type=Path, default=CONFIG)
     crowd.add_argument("--wordlists", type=Path, default=Path("wordlists"))
     crowd.add_argument("--days", type=int, default=14)
     crowd.add_argument("--gap", type=int, default=2)

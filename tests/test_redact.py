@@ -117,7 +117,14 @@ def test_storage_keys_hashes_the_first_two_fields_only():
 
 def test_storage_keys_pointer_parts_survive():
     out = redact_text(RAW_HELLO_TITLE, KEY)
-    for part in ("198.13.32.106", "rakuten.ne.jp", "opportunizz.pro", "/!", "dGViaQ==", "eWVsNA=="):
+    for part in (
+        "198.13.32.106",
+        "rakuten.ne.jp",
+        "opportunizz.pro",
+        "/!",
+        "dGViaQ==",
+        "eWVsNA==",
+    ):
         assert part in out
 
 
@@ -319,7 +326,9 @@ def test_redact_page_does_not_mutate_its_input():
         "path": "x-01-01",
         "title": "password: a",
         "description": None,
-        "content": [{"tag": "p", "children": [{"tag": "b", "children": ["password: c"]}]}],
+        "content": [
+            {"tag": "p", "children": [{"tag": "b", "children": ["password: c"]}]}
+        ],
     }
     before = copy.deepcopy(page)
     redact_page(page, KEY)
@@ -341,7 +350,11 @@ def test_redact_page_recurses_into_nested_children():
                 "tag": "p",
                 "children": [
                     "plain ",
-                    {"tag": "a", "attrs": {"href": "u"}, "children": ["password: deep"]},
+                    {
+                        "tag": "a",
+                        "attrs": {"href": "u"},
+                        "children": ["password: deep"],
+                    },
                 ],
             }
         ]
@@ -370,14 +383,24 @@ def test_redact_page_tolerates_missing_or_null_title_and_description():
 
 
 def test_redact_page_keeps_other_fields():
-    page = {"path": "x-01-01", "url": "u", "views": 7, "author_name": "n", "content": []}
+    page = {
+        "path": "x-01-01",
+        "url": "u",
+        "views": 7,
+        "author_name": "n",
+        "content": [],
+    }
     out = redact_page(page, KEY)
     for k in ("path", "url", "views", "author_name"):
         assert out[k] == page[k]
 
 
 def test_redact_page_text_has_no_raw_keys():
-    page = {"title": RAW_HELLO_TITLE, "description": "Hello,+world!", "content": [{"tag": "p", "children": ["Hello,+world!"]}]}
+    page = {
+        "title": RAW_HELLO_TITLE,
+        "description": "Hello,+world!",
+        "content": [{"tag": "p", "children": ["Hello,+world!"]}],
+    }
     text = page_text(redact_page(page, KEY))
     assert "VzQ3NktFUDh0Tm5qdHZSdw==" not in text
     assert "T0lpc01IOHdHdGhzNjltOWJBR2Z3MTVNcU14NjdsdTJnNW1Oa3RiaA==" not in text
