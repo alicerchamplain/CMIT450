@@ -81,15 +81,28 @@ CREATE TABLE IF NOT EXISTS crowd (
     checked_at  REAL    NOT NULL,
     UNIQUE (slug COLLATE NOCASE, month, day)
 );
+
+CREATE TABLE IF NOT EXISTS sweep_progress (
+    id          INTEGER PRIMARY KEY,
+    slug        TEXT    NOT NULL,
+    month       INTEGER NOT NULL,
+    day         INTEGER NOT NULL,
+    next_n      INTEGER NOT NULL,
+    done        INTEGER NOT NULL DEFAULT 0,
+    requests    INTEGER NOT NULL DEFAULT 0,
+    failures    INTEGER NOT NULL DEFAULT 0,
+    updated_at  REAL    NOT NULL,
+    UNIQUE (slug COLLATE NOCASE, month, day)
+);
 """
 
 
-# ^ and $	anchors: match the whole string, not a fragment inside it
-# (.+)             : group 1, the slug: one or more of any character
-# -(\d{2})	       : hyphen then group 2, exactly two digits: the month
-# -(\d{2})	       : hyphen then group 3, two digits: the day
-# (?:-(\d+))?	   : optional: a hyphen then group 4, one or more digits, the counter
-PATTERN = re.compile(r"^(.+)-(\d{2})-(\d{2})(?:-(\d+))?$")
+# ^ and $ anchors        : match the whole string, not a fragment inside it
+# (.+?)                  : group 1, the slug: one or more of any character, non-greedy
+# -(0[1-9]|1[0-2])       : hyphen then group 2, exactly two digits: 01-12 the month
+# -(0[1-9]|[12]\d|3[01]) : hyphen then group 3, two digits: 01-31 the day
+# (?:-(\d+))?	         : optional: a hyphen then group 4, one or more digits, the counter
+PATTERN = re.compile(r"^(.+?)-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:-(\d+))?$")
 
 
 def connect(path: str | Path):
@@ -361,3 +374,81 @@ def held_out_paths(conn: Connection) -> list[str]:
     sql = "SELECT path FROM pages WHERE held_out = 1 ORDER BY id"
     rows = conn.execute(sql).fetchall()
     return [row["path"] for row in rows]
+
+
+def load_progress(
+    conn: Connection, slug: str, month: int, day: int
+) -> tuple[int, bool]:
+    """Check sweep progress, return 1, false if a given day hasn't been swept
+
+    Args:
+        conn (Connection): SQL db connection
+        slug (str): Slug to check progress of
+        month (int): Month to check progress of
+        day (int): Day to check progress of
+
+    Returns:
+        tuple[int, bool]: Next counter to start at and if sweep is done
+    """
+    sql = """
+    SELECT next_n, done FROM sweep_progress
+    WHERE slug = ? COLLATE NOCASE AND month = ? AND day = ?
+    """
+    params = (
+        slug,
+        month,
+        day,
+    )
+    row = conn.execute(sql, params).fetchone()
+    if row:
+        return (row["next_n"], bool(row["done"]))
+    else:
+        return (1, False)
+
+
+def save_progress(
+    conn: Connection,
+    slug: str,
+    month: int,
+    day: int,
+    next_n: int,
+    done: bool,
+    requests: int,
+    failures: int,
+    ts: float,
+) -> None:
+    """Function to save sweep progress to the db
+
+    Args:
+        conn (Connection): SQL db connection
+        slug (str): Slug to save progress of
+        month (int): Month to save progress of
+        day (int): Day to save progress of
+        next_n (int): The next counter to sweep
+        done (bool): If the sweep is done
+        requests (int): The running number of requests
+        failures (int): The running number of failures
+        ts (float): Timestamp
+    """
+    sql = """
+        INSERT INTO sweep_progress (slug, month, day, next_n, done, requests, failures, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(slug, month, day) DO UPDATE SET
+        next_n     = excluded.next_n,
+        done       = excluded.done,
+        requests   = excluded.requests,
+        failures   = excluded.failures,
+        updated_at = excluded.updated_at
+        """
+    params = (
+        slug,
+        month,
+        day,
+        next_n,
+        int(done),
+        requests,
+        failures,
+        ts,
+    )
+    conn.execute(sql, params)
+    conn.commit()

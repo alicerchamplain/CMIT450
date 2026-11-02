@@ -19,6 +19,8 @@ from graphwatch.db import (
     http_logger,
     load_known,
     parse_path,
+    load_progress,
+    save_progress,
     store_fetch,
     upsert_page,
     upsert_title,
@@ -61,8 +63,10 @@ def conn():
 # --------------------------------------------------------------------------
 
 
-def test_connect_creates_the_five_tables(conn):
-    assert {"titles", "pages", "snapshots", "events", "http_log"} <= tables(conn)
+def test_connect_creates_the_planned_tables(conn):
+    assert {
+        "titles", "pages", "snapshots", "events", "http_log", "crowd", "sweep_progress"
+    } <= tables(conn)
 
 
 def test_connect_is_idempotent_on_an_existing_file(tmp_path):
@@ -166,6 +170,15 @@ def test_tables_have_the_planned_columns(conn, table, expected):
         ("do-Penthouse---Grati-11-17", ("do-Penthouse---Grati", 11, 17, None)),
         ("Povіstka-10-25", ("Povіstka", 10, 25, None)),  # Cyrillic і
         ("video-10-17", ("video", 10, 17, None)),
+        # Two-digit counters: the greedy regex used to read these as a slug
+        # ending in the month and a date shifted right by one field.
+        ("Hello-10-17-15", ("Hello", 10, 17, 15)),
+        ("Hello-10-17-10", ("Hello", 10, 17, 10)),
+        ("T-11-01-10", ("T", 11, 1, 10)),
+        ("Test-10-11-12", ("Test", 10, 11, 12)),  # ambiguous; the counter reading wins
+        # A slug that itself ends in a date, posted on another day.
+        ("Test-10-16-10-17", ("Test-10-16", 10, 17, None)),
+        ("Test-10-16-10-17-3", ("Test-10-16", 10, 17, 3)),
     ],
 )
 def test_parse_path_splits_slug_month_day_counter(path, expected):
@@ -178,7 +191,8 @@ def test_parse_path_slug_with_digits_is_not_mistaken_for_a_date():
 
 
 @pytest.mark.parametrize(
-    "bad", ["Vizit", "Vizit-12", "Vizit-1-28", "-12-28", "Vizit-12-28-", ""]
+    "bad",
+    ["Vizit", "Vizit-12", "Vizit-1-28", "-12-28", "Vizit-12-28-", "", "Vizit-13-01", "Vizit-12-32", "Vizit-00-10"],
 )
 def test_parse_path_rejects_malformed_paths(bad):
     with pytest.raises(ValueError):
@@ -661,3 +675,64 @@ def test_add_snapshot_does_not_mutate_the_page_it_is_given(conn):
     pid = upsert_page(conn, page["path"], T0)
     add_snapshot(conn, pid, page, T0, KEY)
     assert page == before
+
+
+# --- sweep_progress (issue #20) -----------------------------------------------
+
+
+def test_sweep_progress_has_the_planned_columns(conn):
+    assert columns(conn, "sweep_progress") >= {
+        "slug", "month", "day", "next_n", "done", "requests", "failures", "updated_at"
+    }
+
+
+def test_load_progress_unswept_day_starts_at_one_and_is_not_done(conn):
+    assert load_progress(conn, "Hello", 10, 17) == (1, False)
+
+
+def test_save_progress_then_load_round_trips(conn):
+    save_progress(conn, "Hello", 10, 17, 42, False, 50, 3, T0)
+    assert load_progress(conn, "Hello", 10, 17) == (42, False)
+
+
+def test_load_progress_done_is_a_bool(conn):
+    save_progress(conn, "Hello", 10, 17, 155, True, 160, 0, T0)
+    next_n, done = load_progress(conn, "Hello", 10, 17)
+    assert next_n == 155
+    assert done is True
+
+
+def test_save_progress_second_save_updates_in_place(conn):
+    save_progress(conn, "Hello", 10, 17, 5, False, 7, 1, T0)
+    save_progress(conn, "Hello", 10, 17, 9, True, 12, 1, T0 + 60)
+    assert load_progress(conn, "Hello", 10, 17) == (9, True)
+    row = conn.execute("SELECT * FROM sweep_progress").fetchone()
+    assert (row["requests"], row["failures"], row["updated_at"]) == (12, 1, T0 + 60)
+    assert conn.execute("SELECT COUNT(*) FROM sweep_progress").fetchone()[0] == 1
+
+
+def test_save_progress_slug_is_case_insensitive(conn):
+    save_progress(conn, "Hello", 10, 17, 5, False, 7, 0, T0)
+    save_progress(conn, "hello", 10, 17, 6, False, 8, 0, T0 + 1)
+    assert conn.execute("SELECT COUNT(*) FROM sweep_progress").fetchone()[0] == 1
+    assert load_progress(conn, "HELLO", 10, 17) == (6, False)
+
+
+def test_save_progress_days_are_independent(conn):
+    save_progress(conn, "Hello", 10, 17, 5, True, 7, 0, T0)
+    save_progress(conn, "Hello", 10, 18, 2, False, 3, 1, T0)
+    save_progress(conn, "Test", 10, 17, 9, False, 9, 0, T0)
+    assert load_progress(conn, "Hello", 10, 17) == (5, True)
+    assert load_progress(conn, "Hello", 10, 18) == (2, False)
+    assert load_progress(conn, "Test", 10, 17) == (9, False)
+    assert load_progress(conn, "Test", 10, 18) == (1, False)
+
+
+def test_save_progress_commits(tmp_path):
+    path = tmp_path / "p.sqlite"
+    c1 = connect(path)
+    save_progress(c1, "Hello", 10, 17, 5, False, 7, 0, T0)
+    c2 = connect(path)
+    assert load_progress(c2, "Hello", 10, 17) == (5, False)
+    c1.close()
+    c2.close()
