@@ -6,6 +6,7 @@ the disk or the network. Pages come from plan/fixtures.
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -20,8 +21,10 @@ from graphwatch.db import (
     load_known,
     parse_path,
     load_progress,
+    stale_pages,
     save_progress,
     store_fetch,
+    store_meta,
     upsert_page,
     upsert_title,
 )
@@ -123,6 +126,11 @@ def test_schema_is_plain_sql_text():
                 "held_out",
                 "first_seen",
                 "last_seen",
+                "published_at",
+                "modified_at",
+                "meta_seen_at",
+                "author_name",
+                "author_url",
             },
         ),
         (
@@ -799,3 +807,285 @@ def test_progress_round_trips_across_unicode_case(conn):
     assert load_progress(conn, "MOBІLІZACІYA", 10, 19) == (7, True)
     assert load_progress(conn, "mobіlіzacіya", 10, 19) == (7, True)
     assert conn.execute("SELECT COUNT(*) FROM sweep_progress").fetchone()[0] == 1
+
+
+# --------------------------------------------------------------------------
+# page metadata (plan/page-meta-plan-2026-11-04.md)
+# --------------------------------------------------------------------------
+
+META_COLUMNS = {"published_at", "modified_at", "meta_seen_at", "author_name", "author_url"}
+
+
+
+def iso_ts(s: str) -> float:
+    # Telegraph writes "+0000"; fromisoformat accepts that on Python 3.11+.
+    return datetime.fromisoformat(s).timestamp()
+
+
+PUB = iso_ts("2026-10-19T03:00:08+0000")
+MOD1 = iso_ts("2026-11-04T15:06:39+0000")
+MOD2 = iso_ts("2026-11-05T09:00:00+0000")
+
+
+def meta(published_at=PUB, modified_at=MOD1) -> dict:
+    return {"published_at": published_at, "modified_at": modified_at}
+
+
+def meta_row(conn, pid):
+    return conn.execute(
+        "SELECT published_at, modified_at, meta_seen_at FROM pages WHERE id = ?",
+        (pid,),
+    ).fetchone()
+
+
+def change_events(conn, pid):
+    return conn.execute(
+        "SELECT * FROM events WHERE page_id = ? AND kind = 'modified_at_changed' ORDER BY id",
+        (pid,),
+    ).fetchall()
+
+
+# schema
+
+
+
+
+def test_fresh_database_has_the_meta_columns(conn):
+    assert META_COLUMNS <= columns(conn, "pages")
+
+
+
+
+
+
+def test_schema_text_also_has_the_meta_columns():
+    # New databases should not depend on the migration step.
+    for col in META_COLUMNS:
+        assert col in SCHEMA
+
+
+# author fields from the API
+
+
+def test_add_snapshot_stores_author_on_the_page_row(conn):
+    page = {
+        "path": "x-01-01",
+        "content": [],
+        "author_name": "Nadia",
+        "author_url": "https://t.me/nadia",
+    }
+    pid = upsert_page(conn, "x-01-01", T0)
+    add_snapshot(conn, pid, page, T0, KEY)
+    row = conn.execute(
+        "SELECT author_name, author_url FROM pages WHERE id = ?", (pid,)
+    ).fetchone()
+    assert (row["author_name"], row["author_url"]) == ("Nadia", "https://t.me/nadia")
+
+
+def test_add_snapshot_later_author_overwrites_the_earlier_one(conn):
+    pid = upsert_page(conn, "x-01-01", T0)
+    add_snapshot(conn, pid, {"path": "x-01-01", "content": [], "author_name": "a"}, T0, KEY)
+    add_snapshot(conn, pid, {"path": "x-01-01", "content": [], "author_name": "b"}, T0 + 1, KEY)
+    row = conn.execute("SELECT author_name FROM pages WHERE id = ?", (pid,)).fetchone()
+    assert row["author_name"] == "b"
+
+
+def test_add_snapshot_missing_author_leaves_null(conn):
+    pid = upsert_page(conn, "x-01-01", T0)
+    add_snapshot(conn, pid, {"path": "x-01-01", "content": []}, T0, KEY)
+    row = conn.execute(
+        "SELECT author_name, author_url FROM pages WHERE id = ?", (pid,)
+    ).fetchone()
+    assert (row["author_name"], row["author_url"]) == (None, None)
+
+
+def test_add_snapshot_author_does_not_count_as_a_content_change(conn):
+    pid = upsert_page(conn, "x-01-01", T0)
+    add_snapshot(conn, pid, {"path": "x-01-01", "content": [], "author_name": "a"}, T0, KEY)
+    _, changed = add_snapshot(
+        conn, pid, {"path": "x-01-01", "content": [], "author_name": "b"}, T0 + 1, KEY
+    )
+    assert changed is False
+
+
+def test_store_fetch_stores_author_fields(conn):
+    page = {**fixture_page("Vizit-12-28"), "author_name": "n", "author_url": "u"}
+    fetch = Fetch(page["path"], Outcome.FOUND, page, None, 200, 1)
+    pid = store_fetch(conn, fetch, T0, KEY)
+    row = conn.execute(
+        "SELECT author_name, author_url FROM pages WHERE id = ?", (pid,)
+    ).fetchone()
+    assert (row["author_name"], row["author_url"]) == ("n", "u")
+
+
+def test_store_fetch_commits_author_fields(tmp_path):
+    db = tmp_path / "a.db"
+    c1 = connect(db)
+    page = {"path": "x-01-01", "content": [], "author_name": "n"}
+    store_fetch(c1, Fetch("x-01-01", Outcome.FOUND, page, None, 200, 1), T0, KEY)
+    c2 = connect(db)
+    assert c2.execute("SELECT author_name FROM pages").fetchone()[0] == "n"
+    c1.close()
+    c2.close()
+
+
+# store_meta
+
+
+def test_store_meta_first_store_fills_all_three_and_is_not_a_change(conn):
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    assert store_meta(conn, pid, meta(), T0) is False
+    row = meta_row(conn, pid)
+    assert (row["published_at"], row["modified_at"], row["meta_seen_at"]) == (
+        PUB,
+        MOD1,
+        T0,
+    )
+    assert change_events(conn, pid) == []
+
+
+def test_store_meta_timestamps_are_unix_seconds(conn):
+    # Same unit as first_seen and fetched_at: REAL seconds, not ISO text.
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(), T0)
+    row = meta_row(conn, pid)
+    assert isinstance(row["published_at"], float)
+    assert isinstance(row["modified_at"], float)
+    assert row["published_at"] == 1792378808.0  # 2026-10-19T03:00:08Z
+
+
+def test_store_meta_same_modified_at_writes_no_event(conn):
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(), T0)
+    assert store_meta(conn, pid, meta(), T0 + 60) is False
+    assert change_events(conn, pid) == []
+
+
+def test_store_meta_changed_modified_at_writes_one_event_with_both_values(conn):
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(modified_at=MOD1), T0)
+    assert store_meta(conn, pid, meta(modified_at=MOD2), T0 + 60) is True
+
+    events = change_events(conn, pid)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["ts"] == T0 + 60
+    detail = ev["detail"]
+    assert " -> " in detail
+    old, new = detail.split(" -> ")
+    assert old.startswith("2026-11-04T15:06:39")
+    assert new.startswith("2026-11-05T09:00:00")
+
+    assert meta_row(conn, pid)["modified_at"] == MOD2
+
+
+def test_store_meta_event_detail_is_utc(conn):
+    # Whatever the machine's local zone, the detail must read as UTC.
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(modified_at=MOD1), T0)
+    store_meta(conn, pid, meta(modified_at=MOD2), T0 + 1)
+    detail = change_events(conn, pid)[0]["detail"]
+    expected_new = datetime.fromtimestamp(MOD2, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    assert expected_new in detail
+
+
+def test_store_meta_change_back_and_forth_is_two_events(conn):
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(modified_at=MOD1), T0)
+    store_meta(conn, pid, meta(modified_at=MOD2), T0 + 1)
+    store_meta(conn, pid, meta(modified_at=MOD1), T0 + 2)
+    assert len(change_events(conn, pid)) == 2
+
+
+def test_store_meta_never_overwrites_published_at(conn):
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(published_at=PUB), T0)
+    store_meta(conn, pid, meta(published_at=PUB + 5), T0 + 1)
+    assert meta_row(conn, pid)["published_at"] == PUB
+
+
+def test_store_meta_updates_meta_seen_at_every_time(conn):
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(), T0)
+    store_meta(conn, pid, meta(), T0 + 99)
+    assert meta_row(conn, pid)["meta_seen_at"] == T0 + 99
+
+
+def test_store_meta_does_not_write_content_changed(conn):
+    pid = upsert_page(conn, "Hello-10-19-130", T0)
+    store_meta(conn, pid, meta(modified_at=MOD1), T0)
+    store_meta(conn, pid, meta(modified_at=MOD2), T0 + 1)
+    kinds = {r["kind"] for r in conn.execute("SELECT kind FROM events WHERE page_id = ?", (pid,))}
+    assert kinds == {"discovered", "modified_at_changed"}
+
+
+def test_store_meta_commits(tmp_path):
+    db = tmp_path / "m.db"
+    c1 = connect(db)
+    pid = upsert_page(c1, "Hello-10-19-130", T0)
+    store_meta(c1, pid, meta(), T0)
+    c2 = connect(db)
+    assert meta_row(c2, pid)["modified_at"] == MOD1
+    c1.close()
+    c2.close()
+
+
+# page selector for the meta command
+
+
+
+def id_paths(rows):
+    return [(r["id"], r["path"]) for r in rows]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_pages_stale_returns_never_seen_pages_first_then_oldest(conn):
+    never = upsert_page(conn, "a-01-01", T0)
+    old = upsert_page(conn, "b-01-01", T0)
+    fresh = upsert_page(conn, "c-01-01", T0)
+    now = T0 + 100 * 3600
+    store_meta(conn, old, meta(), now - 48 * 3600)
+    store_meta(conn, fresh, meta(), now - 1 * 3600)
+    rows = stale_pages(conn, 24, now, 10)
+    assert id_paths(rows) == [(never, "a-01-01"), (old, "b-01-01")]
+
+
+def test_pages_stale_boundary_is_strictly_older(conn):
+    pid = upsert_page(conn, "a-01-01", T0)
+    now = T0 + 100 * 3600
+    store_meta(conn, pid, meta(), now - 24 * 3600)  # exactly 24 h: not stale yet
+    assert stale_pages(conn, 24, now, 10) == []
+    assert id_paths(stale_pages(conn, 24, now + 1, 10)) == [(pid, "a-01-01")]
+
+
+def test_pages_stale_respects_the_limit(conn):
+    for i in range(5):
+        upsert_page(conn, f"p{i}-01-01", T0)
+    assert len(stale_pages(conn, 24, T0, 3)) == 3
+
+
+def test_pages_stale_zero_hours_means_everything_seen_before_now(conn):
+    pid = upsert_page(conn, "a-01-01", T0)
+    store_meta(conn, pid, meta(), T0)
+    assert id_paths(stale_pages(conn, 0, T0 + 1, 10)) == [(pid, "a-01-01")]

@@ -3,7 +3,7 @@
 import argparse
 import sys
 import time
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from sqlite3 import Connection
 
@@ -24,12 +24,14 @@ from graphwatch.db import (
     load_progress,
     parse_path,
     save_progress,
+    stale_pages,
     store_fetch,
+    store_meta,
     upsert_title,
 )
 from graphwatch.slugify import Entry, load_wordlists, normalize_slug
 from graphwatch.sweep import sweep_day
-from graphwatch.telegraph import BudgetExceeded, Fetch, TelegraphClient
+from graphwatch.telegraph import BudgetExceeded, Fetch, Outcome, TelegraphClient
 
 
 def require_key(path: Path) -> bytes:
@@ -137,6 +139,22 @@ def run_sweep(
     exclude: set[str],
     log=print,
 ) -> tuple[int, int]:
+    """Function to manage running sweeps
+
+    Args:
+        conn (Connection): _description_
+        client (TelegraphClient): _description_
+        entries (list[Entry]): _description_
+        days (list[tuple[int, int]]): _description_
+        key (bytes): _description_
+        gap (int): _description_
+        cap (int | None): _description_
+        exclude (set[str]): _description_
+        log (_type_, optional): _description_. Defaults to print.
+
+    Returns:
+        tuple[int, int]: _description_
+    """
 
     for entry in entries:
         upsert_title(conn, entry, time.time())
@@ -206,6 +224,41 @@ def run_sweep(
     return stored, requests
 
 
+def run_meta(conn: Connection, client: TelegraphClient, pages: list, log=print) -> dict:
+    """Function to orchestrate store_meta
+
+    Args:
+        conn (Connection): Sql db connection
+        client (TelegraphClient): Telegraph client
+        pages (list): List of pages
+        log (_type_, optional): Log. Defaults to print.
+
+    Returns:
+        dict: dictionary of counts
+    """
+    counts = {"fetched": 0, "changed": 0, "not_found": 0, "failed": 0}
+    try:
+        for row in pages:
+            fetch = client.get_html(row["path"])
+            if fetch.outcome is Outcome.FOUND:
+                changed = store_meta(conn, row["id"], fetch.page, time.time())
+                counts["fetched"] += 1
+                if changed:
+                    counts["changed"] += 1
+                    iso = datetime.fromtimestamp(
+                        fetch.page["modified_at"], UTC
+                    ).isoformat()
+                    log(f"{row['path']}: modified_at changed to {iso}")
+            elif fetch.outcome is Outcome.NOT_FOUND:
+                counts["not_found"] += 1
+            else:
+                counts["failed"] += 1
+                log(f"{row['path']}: {fetch.error}")
+    except BudgetExceeded:
+        log("budget exceeded")
+    return counts
+
+
 def parse_args(argv: list[str]):
     """Parse the command line
 
@@ -239,6 +292,12 @@ def parse_args(argv: list[str]):
     sweep.add_argument("--cap", type=int, default=None)
     sweep.add_argument("--count-only-above", type=int, default=10000)
     sweep.add_argument("--today", type=date.fromisoformat, default=None)
+    meta = sub.add_parser("meta", help="fetch page timestamps")
+    meta.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
+    meta.add_argument("--rate", type=float, default=8.0)
+    meta.add_argument("--budget", type=int, default=230000)
+    meta.add_argument("--limit", type=int, default=5000)
+    meta.add_argument("--stale", type=float, required=True, help="hours")
 
     return parser.parse_args(argv)
 
@@ -257,9 +316,8 @@ def main(argv: list[str] | None = None):
     client = TelegraphClient(
         rate_per_s=args.rate, budget=args.budget, log=http_logger(conn)
     )
-    entries = load_wordlists(args.wordlists)
-
     if args.command == "crowd":
+        entries = load_wordlists(args.wordlists)
         days = recent_days(date.today(), args.days)
         started = time.time()
         checked = run_crowd(
@@ -275,6 +333,7 @@ def main(argv: list[str] | None = None):
             flush=True,
         )
     elif args.command == "sweep":
+        entries = load_wordlists(args.wordlists)
         exclude = count_only_slugs(conn, args.count_only_above)
         today = args.today or date.today()
         if args.days is None:
@@ -305,6 +364,20 @@ def main(argv: list[str] | None = None):
         elapsed = time.time() - started
         print(
             f"Stored {stored:,} pages, {client.requests_made:,} requests, "
+            f"{client.requests_made / max(elapsed, 1):.1f}/s, {elapsed:.0f}s",
+            flush=True,
+        )
+    elif args.command == "meta":
+        pages = stale_pages(conn, args.stale, time.time(), args.limit)
+        print(
+            f"{len(pages)} selected",
+            flush=True,
+        )
+        started = time.time()
+        elapsed = time.time() - started
+        counts = run_meta(conn, client, pages, log=lambda s: print(s, flush=True))
+        print(
+            f"Fetched {counts['fetched']}, changed {counts['changed']}, not found {counts['not_found']}, failed {counts['failed']}, {client.requests_made:,} requests, "
             f"{client.requests_made / max(elapsed, 1):.1f}/s, {elapsed:.0f}s",
             flush=True,
         )

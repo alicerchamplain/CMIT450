@@ -1,17 +1,32 @@
 """Read-only client for the Telegraph API (api.telegra.ph)."""
 
 import json
+import re
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 
 import requests
 
 BASE_URL = "https://api.telegra.ph"
-ALLOWED_HOSTS = frozenset(["api.telegra.ph"])
+ALLOWED_HOSTS = frozenset(["api.telegra.ph", "telegra.ph"])
 BLOCK_TAGS = frozenset(
     ["p", "br", "li", "h3", "h4", "blockquote", "pre", "figcaption", "hr"]
+)
+
+# <meta\s+                     : the opening tag, then at least one whitespace char
+# property="article:published_time" : the attribute that identifies the tag
+# \s+                          : one or more whitespace chars (the modified tag has two spaces)
+# content="([^"]+)"            : group 1, the timestamp: one or more chars that are not a quote
+PUBLISHED_TIME_PATTERN = re.compile(
+    r'<meta\s+property="article:published_time"\s+content="([^"]+)"'
+)
+
+# Same shape as PUBLISHED_TIME_PATTERN for the modified_time tag
+MODIFIED_TIME_PATTERN = re.compile(
+    r'<meta\s+property="article:modified_time"\s+content="([^"]+)"'
 )
 
 
@@ -85,6 +100,50 @@ def parse_envelope(status: int, body: bytes) -> tuple[Outcome, dict | None, str 
         Outcome.FAILED,
         None,
         data.get("error") or f"Unexpected response envelope. Status: {status}",
+    )
+
+
+def parse_html_meta(
+    status: int, body: bytes
+) -> tuple[Outcome, dict | None, str | None]:
+    """Parser to collect published_time and modified_time from telegraph pages
+
+    Args:
+        status (int): HTTP status code
+        body (bytes): HTTP response body
+
+    Returns:
+        tuple[Outcome, dict | None, str | None]: Tuple with outcome result
+    """
+
+    if status == 404:
+        return Outcome.NOT_FOUND, None, "PAGE_NOT_FOUND"
+    elif status != 200:
+        return Outcome.FAILED, None, f"FAILED: {status}"
+
+    try:
+        html = body.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return Outcome.FAILED, None, f"{status}: {e}"
+
+    published_time = PUBLISHED_TIME_PATTERN.search(html)
+    modified_time = MODIFIED_TIME_PATTERN.search(html)
+
+    if published_time is None or modified_time is None:
+        return Outcome.FAILED, None, "published time or modified time not found"
+    else:
+        published_time = published_time.group(1)
+        modified_time = modified_time.group(1)
+    try:
+        published_time = datetime.fromisoformat(published_time).timestamp()
+        modified_time = datetime.fromisoformat(modified_time).timestamp()
+    except ValueError as e:
+        return Outcome.FAILED, None, f"{status}: {e}"
+
+    return (
+        Outcome.FOUND,
+        {"published_at": published_time, "modified_at": modified_time},
+        None,
     )
 
 
@@ -241,7 +300,14 @@ class TelegraphClient:
         if host not in ALLOWED_HOSTS:
             raise ValueError(f"Host {host} not in allowed hosts")
 
-    def _attempt(self, path: str, url: str, attempt: int) -> Fetch:
+    def _attempt(
+        self,
+        path: str,
+        url: str,
+        attempt: int,
+        parse=parse_envelope,
+        log_path: str | None = None,
+    ) -> Fetch:
         """Makes one request for an already-built URL and returns it as a Fetch
 
         Counts against the budget, waits for the pacer, performs the GET,
@@ -252,6 +318,8 @@ class TelegraphClient:
             path (str): the Telegraph path, for the Fetch and the log row
             url (str): the full URL, already percent-encoded and host-checked
             attempt (int): 1 for the first try, counting up on retries; logged
+            parse (func): parser function to use
+            log_path (str): log path to use if non-default
 
         Returns:
             Fetch: the result of this single attempt
@@ -276,7 +344,7 @@ class TelegraphClient:
             )
             status = resp.status_code
             body = resp.content
-            outcome, page, error = parse_envelope(status, body)
+            outcome, page, error = parse(status, body)
         except requests.RequestException as e:
             status = None
             body = b""
@@ -289,7 +357,7 @@ class TelegraphClient:
             self.log(
                 {
                     "ts": time.time(),
-                    "path": path,
+                    "path": log_path if log_path is not None else path,
                     "attempt": attempt,
                     "status": status,
                     "outcome": outcome.name,
@@ -328,6 +396,32 @@ class TelegraphClient:
         self._check_host(url)
         for attempt in range(1, self.retries + 2):
             fetch = self._attempt(path, url, attempt)
+            if fetch.outcome is not Outcome.FAILED:
+                return fetch
+            if attempt <= self.retries:
+                self.sleep(self.backoff_s * 2 ** (attempt - 1))
+        return fetch
+
+    def get_html(self, path: str) -> Fetch:
+        """Fetches one Telegraph page's html by path and returns the outcome as a Fetch
+
+        Args:
+            path (str): Telegraph path such as Vizit-12-28, not percent-encoded
+
+        Returns:
+            Fetch: record of the request with outcome, page, error, status and timing
+
+        Raises:
+            BudgetExceeded: if the budget is reached before any attempt, or
+                between retries; the refused attempt is never sent
+            ValueError: if the built URL is not on an allowed host
+        """
+        url = f"https://telegra.ph/{urllib.parse.quote(path, safe='')}"
+        self._check_host(url)
+        for attempt in range(1, self.retries + 2):
+            fetch = self._attempt(
+                path, url, attempt, parse=parse_html_meta, log_path=f"html:{path}"
+            )
             if fetch.outcome is not Outcome.FAILED:
                 return fetch
             if attempt <= self.retries:

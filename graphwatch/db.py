@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from datetime import datetime, UTC
 from pathlib import Path
 from sqlite3 import Connection
 
@@ -344,6 +345,47 @@ def store_fetch(
     return page_id
 
 
+def store_meta(conn: Connection, page_id: int, meta: dict, ts: float) -> bool:
+    """The glue between the client and the database for storing http_meta results in the db
+
+    Args:
+        conn (Connection): SQL db connection
+        page_id (int): The page id to store
+        meta (dict): The meta dictionary
+        ts (float): timestamp
+
+    Returns:
+        bool: Whether the modified_at changed
+    """
+    sql = " SELECT modified_at FROM pages WHERE id = ?"
+    row = conn.execute(sql, (page_id,)).fetchone()
+    previous = row["modified_at"]
+    modified_at = meta["modified_at"]
+
+    changed = previous is not None and previous != modified_at
+    meta_update = "UPDATE pages SET published_at = COALESCE(published_at, ?), modified_at = ?, meta_seen_at = ? WHERE id = ?"
+    meta_update_params = (
+        meta["published_at"],
+        modified_at,
+        ts,
+        page_id,
+    )
+    conn.execute(meta_update, meta_update_params)
+
+    if changed:
+        new_iso = datetime.fromtimestamp(modified_at, UTC).isoformat()
+        old_iso = datetime.fromtimestamp(previous, UTC).isoformat()
+        add_event(
+            conn,
+            page_id,
+            "modified_at_changed",
+            ts,
+            detail=f"{old_iso} -> {new_iso}",
+        )
+    conn.commit()
+    return changed
+
+
 def http_logger(conn: Connection):
     """Function to get the logger
 
@@ -405,6 +447,26 @@ def held_out_paths(conn: Connection) -> list[str]:
     sql = "SELECT path FROM pages WHERE held_out = 1 ORDER BY id"
     rows = conn.execute(sql).fetchall()
     return [row["path"] for row in rows]
+
+def stale_pages(conn: Connection, hours: float, now: float, limit: int) -> list[sqlite3.Row]:
+    """Fetch list of stale pages not checked in the past $hours
+
+    Args:
+        conn (Connection): SQL db connection
+        hours (float): past hours to consider something stale
+        now (float): current time
+        limit (int): query limit
+    Returns:
+        list[sqlite3.Row]: List of paths
+    """
+    cutoff = now - hours * 3600
+    sql = """
+    SELECT id, path FROM pages
+    WHERE meta_seen_at IS NULL OR meta_seen_at < ?
+    ORDER BY meta_seen_at IS NOT NULL, meta_seen_at, id
+    LIMIT ?
+    """
+    return conn.execute(sql, (cutoff, limit)).fetchall()
 
 
 def load_progress(

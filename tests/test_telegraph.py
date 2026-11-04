@@ -24,6 +24,7 @@ from graphwatch.telegraph import (
     page_links,
     page_text,
     parse_envelope,
+    parse_html_meta,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "plan" / "fixtures"
@@ -289,8 +290,8 @@ def make_client(responses, **kwargs):
     return client, session, rows
 
 
-def test_allowed_hosts_is_only_the_api_host():
-    assert ALLOWED_HOSTS == frozenset({"api.telegra.ph"})
+def test_allowed_hosts_is_the_api_and_the_page_host():
+    assert ALLOWED_HOSTS == frozenset({"api.telegra.ph", "telegra.ph"})
 
 
 def test_check_host_accepts_api_and_refuses_others():
@@ -298,8 +299,11 @@ def test_check_host_accepts_api_and_refuses_others():
     client._check_host("https://api.telegra.ph/getPage/x")
     with pytest.raises(ValueError):
         client._check_host("https://evil.test/x")
+    client._check_host("https://telegra.ph/x")  # the page host, for get_html
     with pytest.raises(ValueError):
-        client._check_host("https://telegra.ph/x")  # the page host, not the API
+        client._check_host("https://telegra.ph.evil.test/x")  # suffix is not enough
+    with pytest.raises(ValueError):
+        client._check_host("https://www.telegra.ph/x")
 
 
 def test_wait_turn_sleeps_only_when_the_slot_is_not_open():
@@ -560,3 +564,188 @@ def test_get_page_paces_requests():
         client.get_page("x-01-01")
     # The first request goes immediately; each later one waits a 0.25 s slot.
     assert slept == [0.25, 0.25]
+
+
+# --------------------------------------------------------------------------
+# HTML metadata: parse_html_meta and get_html (plan/page-meta-plan-2026-11-04.md)
+# --------------------------------------------------------------------------
+
+# Modeled on the head of a real telegra.ph page as fetched on 4 Nov 2026.
+# Note the double space before content= on the modified tag: the plan shows
+# it that way and the parser must not care.
+HTML_HEAD = (
+    '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Hello</title>'
+    '<meta property="og:type" content="article">'
+    '<meta property="og:title" content="Hello, world&#33;">'
+    '<meta property="og:site_name" content="Telegraph">'
+    '<meta property="article:published_time" content="2026-10-19T03:00:08+0000">'
+    '<meta property="article:modified_time"  content="2026-11-04T15:06:39+0000">'
+    '<meta property="article:author" content="">'
+    "</head><body><article>Hello, world!</article></body></html>"
+)
+HTML_BODY = HTML_HEAD.encode("utf-8")
+HTML_PUB = 1792378808.0  # 2026-10-19T03:00:08Z
+HTML_MOD = 1793804799.0  # 2026-11-04T15:06:39Z
+HTML_NOT_FOUND = b"<!DOCTYPE html><html><head><title>Telegraph</title></head><body></body></html>"
+
+
+def test_parse_html_meta_found():
+    outcome, page, error = parse_html_meta(200, HTML_BODY)
+    assert outcome is Outcome.FOUND
+    assert error is None
+    assert page == {"published_at": HTML_PUB, "modified_at": HTML_MOD}
+
+
+def test_parse_html_meta_values_are_floats():
+    _, page, _ = parse_html_meta(200, HTML_BODY)
+    assert isinstance(page["published_at"], float)
+    assert isinstance(page["modified_at"], float)
+
+
+def test_parse_html_meta_404_is_not_found():
+    # telegra.ph answers a missing page with a plain 404 (checked 4 Nov 2026).
+    outcome, page, error = parse_html_meta(404, HTML_NOT_FOUND)
+    assert outcome is Outcome.NOT_FOUND
+    assert page is None
+
+
+def test_parse_html_meta_200_without_tags_is_failed_not_a_crash():
+    outcome, page, error = parse_html_meta(200, HTML_NOT_FOUND)
+    assert outcome is Outcome.FAILED
+    assert page is None
+    assert error
+
+
+def test_parse_html_meta_one_tag_missing_is_failed():
+    body = HTML_HEAD.replace(
+        '<meta property="article:modified_time"  content="2026-11-04T15:06:39+0000">', ""
+    ).encode()
+    outcome, page, _ = parse_html_meta(200, body)
+    assert outcome is Outcome.FAILED
+    assert page is None
+
+
+def test_parse_html_meta_server_error_is_failed_and_names_the_status():
+    outcome, page, error = parse_html_meta(503, b"<html>busy</html>")
+    assert outcome is Outcome.FAILED
+    assert page is None
+    assert "503" in error
+
+
+def test_parse_html_meta_bad_timestamp_is_failed_not_a_crash():
+    body = HTML_HEAD.replace("2026-11-04T15:06:39+0000", "yesterday").encode()
+    outcome, page, error = parse_html_meta(200, body)
+    assert outcome is Outcome.FAILED
+    assert page is None
+    assert error
+
+
+def test_parse_html_meta_undecodable_body_is_failed():
+    outcome, page, error = parse_html_meta(200, b"\xff\xfe\xfa")
+    assert outcome is Outcome.FAILED
+    assert page is None
+
+
+def test_parse_html_meta_never_echoes_the_body():
+    # A FAILED reason may name the status or the missing tag, never page text,
+    # which can carry unredacted storage keys.
+    body = b"<html><head><title>SECRETKEYTEXT</title></head></html>"
+    _, _, error = parse_html_meta(200, body)
+    assert "SECRETKEYTEXT" not in error
+
+
+def test_get_html_builds_the_page_url():
+    client, session, _ = make_client([FakeResponse(200, HTML_BODY)])
+    client.get_html("Hello-10-19-130")
+    url, kwargs = session.calls[0]
+    assert url == "https://telegra.ph/Hello-10-19-130"
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["timeout"] is not None
+    assert "User-Agent" in kwargs["headers"]
+
+
+def test_get_html_percent_encodes_non_ascii_paths():
+    client, session, _ = make_client([FakeResponse(404, HTML_NOT_FOUND)])
+    client.get_html("Повістка-10-25")
+    url, _ = session.calls[0]
+    assert "Повістка" not in url
+    assert url.startswith("https://telegra.ph/")
+
+
+def test_get_html_found():
+    client, _, _ = make_client([FakeResponse(200, HTML_BODY)])
+    fetch = client.get_html("Hello-10-19-130")
+    assert isinstance(fetch, Fetch)
+    assert fetch.outcome is Outcome.FOUND
+    assert fetch.path == "Hello-10-19-130"  # the plain path, no prefix
+    assert fetch.page == {"published_at": HTML_PUB, "modified_at": HTML_MOD}
+    assert fetch.status == 200
+    assert fetch.error is None
+
+
+def test_get_html_not_found():
+    client, _, _ = make_client([FakeResponse(404, HTML_NOT_FOUND)])
+    fetch = client.get_html("zz-01-01-99999")
+    assert fetch.outcome is Outcome.NOT_FOUND
+    assert fetch.page is None
+    assert fetch.status == 404
+
+
+def test_get_html_logs_one_row_with_an_html_prefixed_path():
+    client, _, rows = make_client([FakeResponse(200, HTML_BODY)])
+    client.get_html("Hello-10-19-130")
+    assert len(rows) == 1
+    assert rows[0]["path"] == "html:Hello-10-19-130"
+    assert rows[0]["outcome"] == "FOUND"
+    assert rows[0]["status"] == 200
+    assert rows[0]["bytes"] == len(HTML_BODY)
+    assert set(rows[0]) == {
+        "ts", "path", "attempt", "status", "outcome", "error", "elapsed_ms", "bytes",
+    }
+
+
+def test_get_html_charges_the_budget_exactly_once():
+    client, _, _ = make_client([FakeResponse(200, HTML_BODY)] * 2, budget=1)
+    client.get_html("Hello-10-19-130")
+    assert client.requests_made == 1
+    with pytest.raises(BudgetExceeded):
+        client.get_html("Hello-10-19-131")
+    assert client.requests_made == 1
+
+
+def test_get_html_shares_the_pacer_with_get_page():
+    slept = []
+    times = iter([0.0] * 20)
+    session = FakeSession(
+        [FakeResponse(200, fixture_bytes("not-found")), FakeResponse(200, HTML_BODY)]
+    )
+    client = TelegraphClient(
+        rate_per_s=4.0, session=session, clock=lambda: next(times), sleep=slept.append
+    )
+    client.get_page("x-01-01")
+    client.get_html("x-01-01")
+    assert slept == [0.25]
+
+
+def test_get_html_retries_a_failed_attempt():
+    client, _, rows = make_client(
+        [FakeResponse(503, b"busy"), FakeResponse(200, HTML_BODY)], retries=1
+    )
+    fetch = client.get_html("Hello-10-19-130")
+    assert fetch.outcome is Outcome.FOUND
+    assert [r["attempt"] for r in rows] == [1, 2]
+
+
+def test_get_html_network_exception_is_failed():
+    client, _, _ = make_client([requests.ConnectionError("boom")])
+    fetch = client.get_html("Hello-10-19-130")
+    assert fetch.outcome is Outcome.FAILED
+    assert fetch.status is None
+    assert "request error" in fetch.error
+
+
+def test_get_page_still_parses_json_not_html():
+    # Adding an HTML parser must not change how the API path is read.
+    client, _, _ = make_client([FakeResponse(200, HTML_BODY)])
+    fetch = client.get_page("Hello-10-19-130")
+    assert fetch.outcome is Outcome.FAILED

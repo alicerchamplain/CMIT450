@@ -8,6 +8,7 @@ of existing paths.
 
 import json
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -19,11 +20,12 @@ from graphwatch.cli import (
     parse_args,
     require_key,
     run_crowd,
+    run_meta,
     run_sweep,
 )
 from graphwatch.config import CONFIG
 from graphwatch.crowd import save_day_count, DayCount
-from graphwatch.db import connect, load_progress
+from graphwatch.db import add_snapshot, connect, load_progress, upsert_page
 from graphwatch.slugify import Entry
 from graphwatch.telegraph import BudgetExceeded, Outcome, TelegraphClient
 
@@ -646,3 +648,262 @@ def test_main_sweep_excludes_titles_above_the_count_only_threshold(workdir):
     finally:
         cli.run_sweep = real
     assert captured["exclude"] == {"hello"}
+
+
+# --------------------------------------------------------------------------
+# meta: HTML metadata for selected pages (plan/page-meta-plan-2026-11-04.md)
+# --------------------------------------------------------------------------
+
+PUB_ISO = "2026-10-19T03:00:08+0000"
+MOD_ISO = "2026-11-04T15:06:39+0000"
+MOD2_ISO = "2026-11-05T09:00:00+0000"
+
+
+def iso_ts(s: str) -> float:
+    return datetime.fromisoformat(s).timestamp()
+
+
+def html_body(published: str, modified: str) -> bytes:
+    return (
+        "<!DOCTYPE html><html><head>"
+        f'<meta property="article:published_time" content="{published}">'
+        f'<meta property="article:modified_time" content="{modified}">'
+        "</head><body></body></html>"
+    ).encode("utf-8")
+
+
+class HtmlResp:
+    def __init__(self, status, body):
+        self.status_code = status
+        self.content = body
+
+
+class HtmlSession:
+    """Answers telegra.ph/<path> from `times` {path: (published, modified)};
+    404 for unknown paths, 503 for paths in `failing`. Records paths."""
+
+    def __init__(self, times, failing=()):
+        self.times = dict(times)
+        self.failing = set(failing)
+        self.paths = []
+
+    def get(self, url, **kwargs):
+        assert url.startswith("https://telegra.ph/"), url
+        path = urllib.parse.unquote(url.split("https://telegra.ph/", 1)[1])
+        self.paths.append(path)
+        if path in self.failing:
+            return HtmlResp(503, b"<html>busy</html>")
+        if path in self.times:
+            return HtmlResp(200, html_body(*self.times[path]))
+        return HtmlResp(404, b"<html><title>Telegraph</title></html>")
+
+
+def make_meta_client(times, failing=(), **kwargs):
+    session = HtmlSession(times, failing)
+    client = TelegraphClient(session=session, sleep=lambda s: None, retries=0, **kwargs)
+    return client, session
+
+
+def seed_pages(conn, paths):
+    rows = []
+    for path in paths:
+        pid = upsert_page(conn, path, 0.0)
+        add_snapshot(conn, pid, {"path": path, "content": []}, 0.0, KEY)
+        rows.append(conn.execute("SELECT id, path FROM pages WHERE id = ?", (pid,)).fetchone())
+    return rows
+
+
+def meta_row(conn, path):
+    return conn.execute(
+        "SELECT published_at, modified_at, meta_seen_at FROM pages WHERE path = ?",
+        (path,),
+    ).fetchone()
+
+
+def change_events(conn):
+    return conn.execute(
+        "SELECT page_id, detail FROM events WHERE kind = 'modified_at_changed' ORDER BY id"
+    ).fetchall()
+
+
+def test_run_meta_fetches_each_selected_page_once(conn):
+    pages = seed_pages(conn, ["Hello-10-19-130", "Hello-10-19-143"])
+    client, session = make_meta_client(
+        {"Hello-10-19-130": (PUB_ISO, MOD_ISO), "Hello-10-19-143": (PUB_ISO, MOD_ISO)}
+    )
+    counts = run_meta(conn, client, pages, log=lambda s: None)
+    assert session.paths == ["Hello-10-19-130", "Hello-10-19-143"]
+    assert client.requests_made == 2
+    assert counts["fetched"] == 2
+
+
+def test_run_meta_stores_the_timestamps(conn):
+    pages = seed_pages(conn, ["Hello-10-19-130"])
+    client, _ = make_meta_client({"Hello-10-19-130": (PUB_ISO, MOD_ISO)})
+    run_meta(conn, client, pages, log=lambda s: None)
+    row = meta_row(conn, "Hello-10-19-130")
+    assert row["published_at"] == iso_ts(PUB_ISO)
+    assert row["modified_at"] == iso_ts(MOD_ISO)
+    assert row["meta_seen_at"] is not None
+
+
+def test_run_meta_first_fetch_is_not_a_change(conn):
+    pages = seed_pages(conn, ["Hello-10-19-130"])
+    client, _ = make_meta_client({"Hello-10-19-130": (PUB_ISO, MOD_ISO)})
+    counts = run_meta(conn, client, pages, log=lambda s: None)
+    assert counts["changed"] == 0
+    assert change_events(conn) == []
+
+
+def test_run_meta_counts_and_logs_a_changed_page(conn):
+    pages = seed_pages(conn, ["Hello-10-19-130", "Hello-10-19-143"])
+    client, session = make_meta_client(
+        {"Hello-10-19-130": (PUB_ISO, MOD_ISO), "Hello-10-19-143": (PUB_ISO, MOD_ISO)}
+    )
+    run_meta(conn, client, pages, log=lambda s: None)
+    session.times["Hello-10-19-143"] = (PUB_ISO, MOD2_ISO)  # the actor edits one page
+    lines = []
+    counts = run_meta(conn, client, pages, log=lines.append)
+    assert counts == {"fetched": 2, "changed": 1, "not_found": 0, "failed": 0}
+    assert len(change_events(conn)) == 1
+    assert change_events(conn)[0]["page_id"] == pages[1]["id"]
+    assert len(lines) == 1
+    assert "Hello-10-19-143" in lines[0]
+    assert "2026-11-05T09:00:00" in lines[0]
+    assert "Hello-10-19-130" not in lines[0]
+
+
+def test_run_meta_not_found_is_counted_and_stores_nothing(conn):
+    pages = seed_pages(conn, ["Hello-10-19-130", "zz-01-01-99999"])
+    client, _ = make_meta_client({"Hello-10-19-130": (PUB_ISO, MOD_ISO)})
+    counts = run_meta(conn, client, pages, log=lambda s: None)
+    assert counts["fetched"] == 1
+    assert counts["not_found"] == 1
+    assert meta_row(conn, "zz-01-01-99999")["meta_seen_at"] is None
+
+
+def test_run_meta_failed_is_counted_logged_and_does_not_stop_the_run(conn):
+    pages = seed_pages(conn, ["Hello-10-19-130", "Hello-10-19-143"])
+    client, _ = make_meta_client(
+        {"Hello-10-19-143": (PUB_ISO, MOD_ISO)}, failing={"Hello-10-19-130"}
+    )
+    lines = []
+    counts = run_meta(conn, client, pages, log=lines.append)
+    assert counts["failed"] == 1
+    assert counts["fetched"] == 1
+    assert meta_row(conn, "Hello-10-19-143")["modified_at"] == iso_ts(MOD_ISO)
+    assert any("Hello-10-19-130" in line for line in lines)
+
+
+def test_run_meta_budget_exceeded_is_logged_not_raised(conn):
+    pages = seed_pages(conn, ["a-01-01", "b-01-01", "c-01-01"])
+    client, session = make_meta_client(
+        {p["path"]: (PUB_ISO, MOD_ISO) for p in pages}, budget=2
+    )
+    lines = []
+    counts = run_meta(conn, client, pages, log=lines.append)
+    assert session.paths == ["a-01-01", "b-01-01"]
+    assert counts["fetched"] == 2
+    assert any("budget" in line for line in lines)
+
+
+def test_run_meta_empty_selection_makes_no_requests(conn):
+    client, session = make_meta_client({})
+    counts = run_meta(conn, client, [], log=lambda s: None)
+    assert session.paths == []
+    assert counts == {"fetched": 0, "changed": 0, "not_found": 0, "failed": 0}
+
+
+def test_run_meta_logs_html_requests_with_the_prefix(conn):
+    from graphwatch.db import http_logger
+
+    pages = seed_pages(conn, ["Hello-10-19-130"])
+    client, _ = make_meta_client(
+        {"Hello-10-19-130": (PUB_ISO, MOD_ISO)}, log=http_logger(conn)
+    )
+    run_meta(conn, client, pages, log=lambda s: None)
+    rows = conn.execute("SELECT path FROM http_log").fetchall()
+    assert [r["path"] for r in rows] == ["html:Hello-10-19-130"]
+
+
+# parse_args and main for meta
+
+
+def test_parse_args_meta_defaults():
+    args = parse_args(["meta", "--stale", "24"])
+    assert args.command == "meta"
+    assert args.stale == 24.0
+    assert args.limit == 5000
+    assert args.budget == 230000
+    assert args.rate == 8.0
+    assert args.db == Path("data/graphwatch.sqlite")
+
+
+def test_parse_args_meta_overrides():
+    args = parse_args(
+        ["meta", "--stale", "0", "--limit", "500", "--budget", "27", "--rate", "2"]
+    )
+    assert (args.stale, args.limit, args.budget, args.rate) == (0.0, 500, 27, 2.0)
+
+
+def test_parse_args_meta_requires_stale():
+    with pytest.raises(SystemExit):
+        parse_args(["meta"])
+
+
+def test_parse_args_meta_has_no_wordlists_option():
+    with pytest.raises(SystemExit):
+        parse_args(["meta", "--stale", "24", "--wordlists", "w"])
+
+
+def test_main_meta_does_not_need_the_config_or_wordlists(workdir, capsys):
+    # No redaction happens on the HTML path, so no key; and no titles are
+    # swept, so no wordlists. A budget of 0 keeps it off the network.
+    main(
+        [
+            "--config",
+            str(workdir / "nope.env"),
+            "meta",
+            "--db",
+            str(workdir / "g.sqlite"),
+            "--budget",
+            "0",
+            "--stale",
+            "0",
+        ]
+    )
+    out = capsys.readouterr().out.lower()
+    assert "0 fetched" in out or "fetched 0" in out
+
+
+def test_main_meta_stale_selects_from_the_database(workdir, capsys):
+    c = connect(workdir / "g.sqlite")
+    upsert_page(c, "Hello-10-19-130", 0.0)
+    upsert_page(c, "Hello-10-19-143", 0.0)
+    c.close()
+    main(["meta", "--db", str(workdir / "g.sqlite"), "--budget", "0", "--stale", "24"])
+    out = capsys.readouterr().out
+    assert "budget exceeded" in out
+    assert "2 selected" in out or "selected 2" in out
+
+
+def test_main_meta_limit_caps_the_selection(workdir, capsys):
+    c = connect(workdir / "g.sqlite")
+    for i in range(3):
+        upsert_page(c, f"p{i}-01-01", 0.0)
+    c.close()
+    main(
+        [
+            "meta",
+            "--db",
+            str(workdir / "g.sqlite"),
+            "--budget",
+            "0",
+            "--stale",
+            "24",
+            "--limit",
+            "2",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "2 selected" in out or "selected 2" in out
