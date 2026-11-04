@@ -31,8 +31,14 @@ CREATE TABLE IF NOT EXISTS pages (
     title_id    INTEGER REFERENCES titles(id),
     held_out    INTEGER NOT NULL DEFAULT 0,
     first_seen  REAL    NOT NULL,
-    last_seen   REAL    NOT NULL
+    last_seen   REAL    NOT NULL,
+    published_at  REAL,
+    modified_at   REAL,
+    meta_seen_at  REAL,
+    author_name   TEXT,
+    author_url    TEXT
 );
+
 CREATE INDEX IF NOT EXISTS pages_slug_day ON pages (slug COLLATE NOCASE, month, day);
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -273,6 +279,8 @@ def add_snapshot(
     views = page.get("views")
     content = page.get("content", [])
     fingerprint = {"title": title, "description": description, "content": content}
+    author_name = page.get("author_name")
+    author_url = page.get("author_url")
     canonical = json.dumps(
         fingerprint, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     )
@@ -298,6 +306,13 @@ def add_snapshot(
         sha,
     )
     cur = conn.execute(snapshot_insert, snapshot_params)
+    page_update = "UPDATE pages SET author_name = ?, author_url = ? WHERE id = ?"
+    page_update_params = (
+        author_name,
+        author_url,
+        page_id,
+    )
+    conn.execute(page_update, page_update_params)
     conn.commit()
     return cur.lastrowid, changed
 
