@@ -374,8 +374,8 @@ def main(argv: list[str] | None = None):
             flush=True,
         )
         started = time.time()
-        elapsed = time.time() - started
         counts = run_meta(conn, client, pages, log=lambda s: print(s, flush=True))
+        elapsed = time.time() - started
         print(
             f"Fetched {counts['fetched']}, changed {counts['changed']}, not found {counts['not_found']}, failed {counts['failed']}, {client.requests_made:,} requests, "
             f"{client.requests_made / max(elapsed, 1):.1f}/s, {elapsed:.0f}s",
