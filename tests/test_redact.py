@@ -221,6 +221,58 @@ def test_labelled_password_is_idempotent():
     assert redact_text(once, KEY) == once
 
 
+# --- credential shapes seen in the 2026-11-05 shape pass ------------------------
+#
+# Three shapes from plan/reports/shape-notes-2026-11-05.md got past redact_text.
+# Each test below pins the shape as it appeared on real pages. The guards at
+# the end already pass and are there so the fix does not grow into URLs,
+# times, or ordinary prose.
+
+
+def test_labelled_password_hyphen_separator_hashes_the_value():
+    # "пароль-Qwerty123" with a hyphen between label and value, no colon.
+    out = redact_text("логин: ivan пароль-Qwerty123 ok", KEY)
+    assert out == "логин: ivan пароль-" + hash_secret("Qwerty123", KEY) + " ok"
+
+
+def test_labelled_password_on_the_next_line_hashes_the_value():
+    # Label on one line, value on the next, no separator at all.
+    out = redact_text("ПАРОЛЬ\nQwerty123\nготово", KEY)
+    assert out == "ПАРОЛЬ\n" + hash_secret("Qwerty123", KEY) + "\nготово"
+
+
+def test_bare_login_password_hashes_the_password():
+    # "login:password" with no @ in the login.
+    out = redact_text("acc admin_01:P@ssw0rd! next", KEY)
+    assert out == "acc admin_01:" + hash_secret("P@ssw0rd!", KEY) + " next"
+
+
+@pytest.mark.parametrize(
+    "s",
+    [
+        "пароль-Qwerty123",
+        "ПАРОЛЬ\nQwerty123",
+        "admin_01:P@ssw0rd!",
+    ],
+)
+def test_new_credential_shapes_are_idempotent(s):
+    once = redact_text(s, KEY)
+    assert redact_text(once, KEY) == once
+
+
+@pytest.mark.parametrize(
+    "s",
+    [
+        "https://t.me/some_bot?start=abc",
+        "meet at 12:30 or 9:45",
+        "password-protected archive inside",
+        "Note: see below",
+    ],
+)
+def test_credential_shape_guards_leave_ordinary_text_alone(s):
+    assert redact_text(s, KEY) == s
+
+
 # --- card numbers -------------------------------------------------------------
 
 

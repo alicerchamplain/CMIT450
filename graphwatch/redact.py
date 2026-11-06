@@ -18,11 +18,45 @@ EMAIL_AND_PASSWORD_PATTERN = re.compile(r"\b([\w.+-]+@[\w-]+(?:\.[\w-]+)+):(\S+)
 
 # \b                                : word boundary, so it doesn't start mid-password
 # (password|passwd|pass|pwd|пароль) : group 1, the password label
-# (\s*[:=]\s*)                      : group 2, the : or = between the label and password
+# (\s*[:=]\s*)            B_PASSW          : group 2, the : or = between the label and password
 # (\S+)                             : group 3, the password after the splitter in group 2
 # re.IGNORECASE                     : tells the python regex to ignore upper vs lowercase
 LABELED_PASSWORD_PATTERN = re.compile(
     r"\b(password|passwd|pass|pwd|пароль)(\s*[:=]\s*)(\S+)", re.IGNORECASE
+)
+
+# \b            : word boundary, so it does not start mid-word
+# (пароль)      : group 1, the Cyrillic label only; English "password-protected"
+#                 is a common compound so it stays with the : and = rule
+# (-)           : group 2, the hyphen between the label and password
+# (\S+)         : group 3, the password up to the next whitespace
+# re.IGNORECASE : tells the python regex to ignore upper vs lowercase
+HYPHEN_PASSWORD_PATTERN = re.compile(r"\b(пароль)(-)(\S+)", re.IGNORECASE)
+
+# ^                                 : start of a line (re.MULTILINE), so the label must open its line
+# [ \t]*                            : leading spaces or tabs, never \s because that would swallow newlines
+# (password|passwd|pass|pwd|пароль) : group 1, the password label
+# ([ \t]*\n[ \t]*)                  : group 2, exactly one line break with optional spaces either side,
+#                                     kept in the output so the line structure survives
+# (\S+)                             : group 3, the password, the first token on the next line
+# re.IGNORECASE                     : tells the python regex to ignore upper vs lowercase
+# re.MULTILINE                      : makes ^ match at every line start, not just the string start
+NEWLINE_PASSWORD_PATTERN = re.compile(
+    r"^[ \t]*(password|passwd|pass|pwd|пароль)([ \t]*\n[ \t]*)(\S+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# (?<![\w@./:-])          : negative lookbehind, the login cannot start right after a word char,
+#                           @, dot, slash, colon or hyphen; this keeps it out of emails and URLs
+# ([\w.+-]*               : group 1 starts, any login chars before the letter
+#  [^\W\d_]               : at least one Unicode letter, so 12:30 and 9:45 do not match
+#  [\w.+-]*)              : group 1 ends, any login chars after the letter
+# (:)                     : group 2, the colon between login and password
+# (?!/)                   : negative lookahead, the password cannot start with /, which rejects https://
+# (?=[^\s:]*\D)           : positive lookahead, the password must contain a non-digit, which rejects host:8080
+# ([^\s:]+)               : group 3, the password up to the next whitespace or colon
+BARE_LOGIN_PASSWORD_PATTERN = re.compile(
+    r"(?<![\w@./:-])([\w.+-]*[^\W\d_][\w.+-]*)(:)(?!/)(?=[^\s:]*\D)([^\s:]+)"
 )
 
 # \b                                : word boundary, so it doesn't start mid-credit card
@@ -127,8 +161,11 @@ def redact_text(s: str, key: bytes) -> str:
     s = AWS_KEY_PATTERN.sub(_hash_whole, s)
     s = GITHUB_TOKEN_PATTERN.sub(_hash_whole, s)
     s = LABELED_PASSWORD_PATTERN.sub(_hash_labelled, s)
+    s = HYPHEN_PASSWORD_PATTERN.sub(_hash_labelled, s)
+    s = NEWLINE_PASSWORD_PATTERN.sub(_hash_labelled, s)
     s = EMAIL_AND_PASSWORD_PATTERN.sub(_hash_email_password, s)
     s = CREDIT_CARD_PATTERN.sub(_hash_card, s)
+    s = BARE_LOGIN_PASSWORD_PATTERN.sub(_hash_labelled, s)
 
     return s
 
