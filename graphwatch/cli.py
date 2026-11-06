@@ -29,7 +29,14 @@ from graphwatch.db import (
     store_meta,
     upsert_title,
 )
-from graphwatch.slugify import Entry, load_wordlists, normalize_slug
+from graphwatch.slugify import (
+    Entry,
+    WordlistsChanged,
+    load_wordlists,
+    normalize_slug,
+    read_sums,
+    write_sums,
+)
 from graphwatch.sweep import sweep_day
 from graphwatch.telegraph import BudgetExceeded, Fetch, Outcome, TelegraphClient
 
@@ -53,6 +60,39 @@ def require_key(path: Path) -> bytes:
         raise SystemExit(f"Config file not found: {path}")
     except KeyError:
         raise SystemExit(f"HMAC_KEY not set in {path}")
+
+
+def load_frozen(directory: Path, unfrozen: bool = False) -> list[Entry]:
+    """Glue function to load frozen wordlists and check if they have changed
+
+    Args:
+        directory (Path): Wordlist directory
+        unfrozen (bool, optional): Override bool. Defaults to False.
+
+    Raises:
+        SystemExit: Exits if the wordlists have changed
+
+    Returns:
+        list[Entry]: Unique list of sluggified strings from wordlists
+    """
+    try:
+        return load_wordlists(directory, verify=not unfrozen)
+    except WordlistsChanged as e:
+        raise SystemExit(
+            f"wordlists differ from {directory / 'SHA256SUMS'} "
+            f"run `freeze` to accept the changes or pass --unfrozen\n{e}"
+        )
+
+
+def run_freeze(directory: Path, log=print) -> Path:
+    entries = load_wordlists(directory)
+    out = write_sums(directory)
+    sums = read_sums(out)
+    for name, digest in sums.items():
+        titles = sum(1 for entry in entries if entry.source == Path(name).stem)
+        log(f"{name:24} {titles:5} titles  {digest}")
+    log(f"{len(entries)} titles in {len(sums)} lists, wrote {out}")
+    return out
 
 
 def make_probe(client: TelegraphClient):
@@ -282,6 +322,9 @@ def parse_args(argv: list[str]):
     crowd.add_argument("--gap", type=int, default=2)
     crowd.add_argument("--rate", type=float, default=8.0)
     crowd.add_argument("--budget", type=int, default=None)
+    crowd.add_argument(
+        "--unfrozen", action="store_true", help="skip the SHA256SUMS check"
+    )
     sweep = sub.add_parser("sweep", help="collect pages per title per day")
     sweep.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
     sweep.add_argument("--wordlists", type=Path, default=Path("wordlists"))
@@ -292,12 +335,17 @@ def parse_args(argv: list[str]):
     sweep.add_argument("--cap", type=int, default=None)
     sweep.add_argument("--count-only-above", type=int, default=10000)
     sweep.add_argument("--today", type=date.fromisoformat, default=None)
+    sweep.add_argument(
+        "--unfrozen", action="store_true", help="skip the SHA256SUMS check"
+    )
     meta = sub.add_parser("meta", help="fetch page timestamps")
     meta.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
     meta.add_argument("--rate", type=float, default=8.0)
     meta.add_argument("--budget", type=int, default=230000)
     meta.add_argument("--limit", type=int, default=5000)
     meta.add_argument("--stale", type=float, required=True, help="hours")
+    freeze = sub.add_parser("freeze", help="write wordlists/SHA256SUMS")
+    freeze.add_argument("--wordlists", type=Path, default=Path("wordlists"))
 
     return parser.parse_args(argv)
 
@@ -310,14 +358,18 @@ def main(argv: list[str] | None = None):
             to read sys.argv. Defaults to None.
     """
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.command == "freeze":
+        run_freeze(args.wordlists, log=lambda s: print(s, flush=True))
+        return
     if args.command == "sweep":
         key = require_key(args.config)
+    if args.command in ("crowd", "sweep"):
+        entries = load_frozen(args.wordlists, args.unfrozen)
     conn = connect(args.db)
     client = TelegraphClient(
         rate_per_s=args.rate, budget=args.budget, log=http_logger(conn)
     )
     if args.command == "crowd":
-        entries = load_wordlists(args.wordlists)
         days = recent_days(date.today(), args.days)
         started = time.time()
         checked = run_crowd(
@@ -333,7 +385,6 @@ def main(argv: list[str] | None = None):
             flush=True,
         )
     elif args.command == "sweep":
-        entries = load_wordlists(args.wordlists)
         exclude = count_only_slugs(conn, args.count_only_above)
         today = args.today or date.today()
         if args.days is None:

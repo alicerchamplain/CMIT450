@@ -6,6 +6,7 @@ does the work. Here run_crowd gets a client whose session answers from a set
 of existing paths.
 """
 
+import hashlib
 import json
 import urllib.parse
 from datetime import datetime
@@ -489,6 +490,10 @@ def test_run_sweep_stores_the_api_path_not_the_requested_one(conn):
 def workdir(tmp_path):
     (tmp_path / "wordlists").mkdir()
     (tmp_path / "wordlists" / "greetings.txt").write_text("Hello\n", encoding="utf-8")
+    # main() refuses word lists that do not match SHA256SUMS (issue #10), so
+    # freeze the one list by hand; sha256sum format is "digest  name".
+    digest = hashlib.sha256((tmp_path / "wordlists" / "greetings.txt").read_bytes()).hexdigest()
+    (tmp_path / "wordlists" / "SHA256SUMS").write_text(f"{digest}  greetings.txt\n", encoding="utf-8")
     cfg = tmp_path / "config.env"
     cfg.write_text("HMAC_KEY=00ff\n", encoding="utf-8")
     return tmp_path
