@@ -388,6 +388,51 @@ def test_apply_rules_fires_each_rule_at_most_once():
     assert names(hits).count("ip_literal") == 1
 
 
+def test_a_hit_counts_every_match_and_keeps_the_first_as_evidence():
+    text = "1.1.1.1 and 8.8.8.8 and 9.9.9.9"
+    hits = apply_rules("8.8.8.8 9.9.9.9", None, text)
+    by_name = {h.rule.name: h for h in hits}
+    assert (by_name["ip_in_title"].evidence, by_name["ip_in_title"].matches) == (
+        "8.8.8.8",
+        2,
+    )
+    assert (by_name["ip_literal"].evidence, by_name["ip_literal"].matches) == (
+        "1.1.1.1",
+        3,
+    )
+
+
+def test_matches_counts_only_what_the_check_accepted():
+    # Two private addresses and one public one: one match, and it is the evidence.
+    hits = apply_rules(None, None, "192.168.1.1 10.0.0.1 8.8.8.8")
+    assert [(h.rule.name, h.evidence, h.matches) for h in hits] == [
+        ("ip_literal", "8.8.8.8", 1)
+    ]
+
+
+def test_matches_counts_repeats_of_the_same_string():
+    link = "https://t.me/+YztOEovieQIzZjY8"
+    hits = apply_rules(None, None, f"{link} ads {link} {link}")
+    assert [(h.rule.name, h.matches) for h in hits] == [("telegram_link", 3)]
+
+
+def test_a_single_match_counts_one():
+    hits = apply_rules(SPOOF_TITLE, API_SAMPLE, SPOOF_TITLE + "\n" + API_SAMPLE)
+    assert [h.matches for h in hits] == [1, 1]
+
+
+def test_matches_does_not_change_the_score():
+    # A rule adds its weight once, however often it matched.
+    once = apply_rules(None, None, "8.8.8.8")
+    often = apply_rules(None, None, "8.8.8.8 9.9.9.9 1.1.1.1 4.4.4.4")
+    assert often[0].matches == 4
+    assert score(often) == score(once) == 1
+
+
+def test_a_hit_built_without_a_count_has_one_match():
+    assert Hit(rule("ip_literal"), "8.8.8.8").matches == 1
+
+
 def test_apply_rules_returns_hits_in_table_order():
     hits = hits_for(fixture_page("Hello-10-17-154"))
     order = [r.name for r in RULES]

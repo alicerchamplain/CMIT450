@@ -83,10 +83,16 @@ class Rule:
 
 @dataclass(frozen=True)
 class Hit:
-    """A rule match with the string it matched on"""
+    """A rule that fired on a page
+
+    evidence is the first string the rule matched. matches is how many
+    strings on the page it matched in all. The score counts a rule once
+    however often it matched; matches is recorded, not scored.
+    """
 
     rule: Rule
     evidence: str
+    matches: int = 1
 
 
 def is_public_ip(s: str) -> bool:
@@ -195,7 +201,8 @@ def apply_rules(
         rules (optional): the rules to apply. Defaults to RULES.
 
     Returns:
-        list[Hit]: at most one Hit per rule, in table order
+        list[Hit]: at most one Hit per rule, in table order, each carrying
+            its first match as evidence and the number of matches
     """
     fields = {
         "title": title or "",
@@ -206,11 +213,16 @@ def apply_rules(
     for rule in rules:
         if rule.pattern is None:
             continue
+        evidence = None
+        matches = 0
         for match in rule.pattern.finditer(fields[rule.where]):
-            evidence = match.group(0)
-            if rule.check is None or rule.check(evidence):
-                hits.append(Hit(rule, evidence))
-                break
+            candidate = match.group(0)
+            if rule.check is None or rule.check(candidate):
+                if evidence is None:
+                    evidence = candidate
+                matches += 1
+        if evidence is not None:
+            hits.append(Hit(rule, evidence, matches))
     return hits
 
 
