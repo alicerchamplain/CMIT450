@@ -3,10 +3,12 @@
 import argparse
 import sys
 import time
+from collections import Counter
 from datetime import UTC, date, datetime
 from pathlib import Path
 from sqlite3 import Connection
 
+from graphwatch.classify import body_hash, body_of, classify_page, templated_hashes
 from graphwatch.config import CONFIG, hmac_key, load_config
 from graphwatch.crowd import (
     count_only_slugs,
@@ -20,15 +22,19 @@ from graphwatch.crowd import (
 )
 from graphwatch.db import (
     connect,
+    explain_rows,
     http_logger,
+    latest_snapshots,
     load_progress,
     parse_path,
     save_progress,
+    save_score,
     stale_pages,
     store_fetch,
     store_meta,
     upsert_title,
 )
+from graphwatch.rules import THRESHOLD, score
 from graphwatch.slugify import (
     Entry,
     WordlistsChanged,
@@ -39,6 +45,8 @@ from graphwatch.slugify import (
 )
 from graphwatch.sweep import sweep_day
 from graphwatch.telegraph import BudgetExceeded, Fetch, Outcome, TelegraphClient
+
+CLASSIFY_BATCH = 1000
 
 
 def require_key(path: Path) -> bytes:
@@ -299,6 +307,117 @@ def run_meta(conn: Connection, client: TelegraphClient, pages: list, log=print) 
     return counts
 
 
+def run_classify(conn: Connection, threshold: int = THRESHOLD, log=print) -> dict:
+    """Function to score the newest snapshot of every page and store the result
+
+    Two passes over the snapshots. The first finds the templated bodies, which
+    needs every page; the second scores each page and saves its hits. Makes no
+    network requests.
+
+    Args:
+        conn (Connection): SQL db connection
+        threshold (int, optional): flag at this score or above. Defaults to
+            THRESHOLD.
+        log (optional): Logging function. Defaults to print.
+
+    Returns:
+        dict: pages, flagged and near_miss count the sweep's pages; held_out
+            and held_out_flagged count the evaluation set; scores is a Counter
+            of sweep pages per score
+    """
+
+    def digest_of(row) -> str | None:
+        return body_hash(body_of(row["title"], row["description"], row["text"]))
+
+    pairs = ((digest_of(row), row["title"]) for row in latest_snapshots(conn))
+    templated = templated_hashes(pairs)
+    counts = {
+        "pages": 0,
+        "flagged": 0,
+        "near_miss": 0,
+        "held_out": 0,
+        "held_out_flagged": 0,
+        "scores": Counter(),
+    }
+    ts = time.time()
+    # Reading snapshots while writing scores on one connection is safe because
+    # the query never reads the two tables being written.
+    for done, row in enumerate(latest_snapshots(conn), start=1):
+        digest = digest_of(row)
+        hits = classify_page(
+            row["title"],
+            row["description"],
+            row["text"],
+            digest if digest in templated else None,
+        )
+        total = score(hits)
+        flagged = total >= threshold
+        stored_hits = [
+            (hit.rule.name, hit.rule.weight, hit.evidence, hit.matches) for hit in hits
+        ]
+        save_score(
+            conn,
+            row["snapshot_id"],
+            row["page_id"],
+            total,
+            flagged,
+            digest,
+            stored_hits,
+            ts,
+        )
+        if row["held_out"]:
+            counts["held_out"] += 1
+            counts["held_out_flagged"] += flagged
+        else:
+            counts["pages"] += 1
+            counts["flagged"] += flagged
+            counts["near_miss"] += 0 < total < threshold
+            counts["scores"][total] += 1
+        if done % CLASSIFY_BATCH == 0:
+            conn.commit()
+    conn.commit()
+    log(
+        f"classified {counts['pages']:,} pages at threshold {threshold}: "
+        f"{counts['flagged']:,} flagged, {counts['near_miss']:,} near misses, "
+        f"{len(templated):,} templated bodies"
+    )
+    # Counts only: which held-out pages missed is never printed.
+    log(f"held-out: {counts['held_out_flagged']}/{counts['held_out']} flagged")
+    return counts
+
+
+def run_explain(conn: Connection, path: str, log=print) -> bool:
+    """Function to print why one page scored what it did, from the stored hits
+
+    A held-out page gets its score and nothing else: its evidence is what a
+    rule would be written from, and the evaluation set is never read for that.
+
+    Args:
+        conn (Connection): SQL db connection
+        path (str): The page path as Telegraph spells it, e.g. Hello-10-17-154
+        log (optional): Logging function. Defaults to print.
+
+    Returns:
+        bool: False if the page is unknown or has not been classified
+    """
+    row, hits = explain_rows(conn, path)
+    if row is None:
+        log(f"{path}: no score stored, run classify first")
+        return False
+    verdict = "flagged" if row["flagged"] else "not flagged"
+    if row["held_out"]:
+        log(f"{row['path']}: score {row['score']}, {verdict}")
+        log("held-out page: evidence withheld")
+        return True
+    log(f"{row['path']}: score {row['score']}, {verdict}")
+    log(f"  title: {row['title']}")
+    for hit in hits:
+        # A rule that matched more than once shows how often: "x3"
+        times = f" x{hit['matches']}" if hit["matches"] > 1 else ""
+        log(f"  {hit['weight']:+d} {hit['rule']:<20} {hit['evidence']}{times}")
+    return True
+
+
 def parse_args(argv: list[str]):
     """Parse the command line
 
@@ -346,6 +465,12 @@ def parse_args(argv: list[str]):
     meta.add_argument("--stale", type=float, required=True, help="hours")
     freeze = sub.add_parser("freeze", help="write wordlists/SHA256SUMS")
     freeze.add_argument("--wordlists", type=Path, default=Path("wordlists"))
+    classify = sub.add_parser("classify", help="score stored pages with the rules")
+    classify.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
+    classify.add_argument("--threshold", type=int, default=THRESHOLD)
+    classify.add_argument(
+        "--explain", metavar="PATH", help="show one page's stored score and hits"
+    )
 
     return parser.parse_args(argv)
 
@@ -360,6 +485,18 @@ def main(argv: list[str] | None = None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
     if args.command == "freeze":
         run_freeze(args.wordlists, log=lambda s: print(s, flush=True))
+        return
+    if args.command == "classify":
+        # No client is built: classifying never touches the network.
+        conn = connect(args.db)
+        if args.explain:
+            run_explain(conn, args.explain, log=lambda s: print(s, flush=True))
+            return
+        started = time.time()
+        counts = run_classify(conn, args.threshold, log=lambda s: print(s, flush=True))
+        for value, pages in sorted(counts["scores"].items()):
+            print(f"  score {value:+d}: {pages:,}", flush=True)
+        print(f"{time.time() - started:.0f}s", flush=True)
         return
     if args.command == "sweep":
         key = require_key(args.config)

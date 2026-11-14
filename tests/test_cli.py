@@ -20,13 +20,22 @@ from graphwatch.cli import (
     make_probe,
     parse_args,
     require_key,
+    run_classify,
     run_crowd,
+    run_explain,
     run_meta,
     run_sweep,
 )
 from graphwatch.config import CONFIG
 from graphwatch.crowd import save_day_count, DayCount
-from graphwatch.db import add_snapshot, connect, load_progress, upsert_page
+from graphwatch.db import (
+    add_snapshot,
+    connect,
+    latest_snapshots,
+    load_progress,
+    upsert_page,
+)
+from graphwatch.rules import apply_rules
 from graphwatch.slugify import Entry
 from graphwatch.telegraph import BudgetExceeded, Outcome, TelegraphClient
 
@@ -912,3 +921,367 @@ def test_main_meta_limit_caps_the_selection(workdir, capsys):
     )
     out = capsys.readouterr().out
     assert "2 selected" in out or "selected 2" in out
+
+
+# --------------------------------------------------------------------------
+# classify (issue #29): run_classify, run_explain, the command
+# --------------------------------------------------------------------------
+
+T0 = 1_700_000_000.0
+KEY = b"test-key"
+API_SAMPLE = "Hello,+world!"
+SPOOF_TITLE = "www.tenable.com@agfc.harper18.workers.dev/"
+SQUATTER_BODY = (
+    "https://t.me/+YztOEovieQIzZjY8 exploits, malware, RATs, steallers and other "
+    "stuff https://t.me/+YztOEovieQIzZjY8 https://t.me/+YztOEovieQIzZjY8"
+)
+
+
+def put(conn, path, title, description="", body="", held_out=False, ts=T0):
+    """Store one synthetic page; returns its page id."""
+    page_id = upsert_page(conn, path, ts, held_out=held_out)
+    page = {"title": title, "description": description, "content": [body]}
+    add_snapshot(conn, page_id, page, ts, KEY)
+    return page_id
+
+
+def put_fixture(conn, path, name, held_out=False):
+    page_id = upsert_page(conn, path, T0, held_out=held_out)
+    page = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+    add_snapshot(conn, page_id, page["result"], T0, KEY)
+    return page_id
+
+
+def quiet(_line):
+    pass
+
+
+def score_of(conn, path):
+    sql = """
+    SELECT sc.score, sc.flagged FROM scores sc JOIN pages p ON p.id = sc.page_id
+    WHERE p.path = ? ORDER BY sc.snapshot_id DESC LIMIT 1
+    """
+    return tuple(conn.execute(sql, (path,)).fetchone())
+
+
+def hit_names(conn, path):
+    sql = """
+    SELECT h.rule FROM hits h JOIN scores sc ON sc.snapshot_id = h.snapshot_id
+    JOIN pages p ON p.id = sc.page_id WHERE p.path = ? ORDER BY h.id
+    """
+    return [r["rule"] for r in conn.execute(sql, (path,))]
+
+
+@pytest.fixture
+def swept(conn):
+    """A small sweep: both actor shapes, benign pages, one squatter body."""
+    put_fixture(conn, "Hello-10-17-154", "Hello-10-17-154")
+    put(conn, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    put_fixture(conn, "Hello-10-17-5", "Hello-10-17-5")
+    put_fixture(conn, "Test-10-16", "Test-10-16")
+    put(conn, "Hello-10-17-7", "Hello", API_SAMPLE, API_SAMPLE)
+    for title in ("Cobalt-Strike", "Mimikatz", "Stealer"):
+        put(conn, f"{title}-10-17", title, "", SQUATTER_BODY)
+    return conn
+
+
+def test_run_classify_scores_every_page_once(swept):
+    counts = run_classify(swept, log=quiet)
+    assert counts["pages"] == 8
+    assert swept.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 8
+
+
+def test_run_classify_flags_both_actor_shapes(swept):
+    run_classify(swept, log=quiet)
+    assert score_of(swept, "Hello-10-17-154")[1] == 1
+    assert score_of(swept, "Hello-10-17-9") == (6, 1)
+
+
+def test_run_classify_does_not_flag_the_benign_pages(swept):
+    counts = run_classify(swept, log=quiet)
+    for path in ("Hello-10-17-5", "Test-10-16", "Hello-10-17-7"):
+        assert score_of(swept, path)[1] == 0, path
+    assert counts["flagged"] == 2
+
+
+def test_run_classify_counts_an_api_test_page_as_a_near_miss(swept):
+    counts = run_classify(swept, log=quiet)
+    assert score_of(swept, "Hello-10-17-7") == (1, 0)
+    assert counts["near_miss"] >= 1
+
+
+def test_run_classify_penalises_one_body_under_three_titles(swept):
+    run_classify(swept, log=quiet)
+    for title in ("Cobalt-Strike", "Mimikatz", "Stealer"):
+        assert hit_names(swept, f"{title}-10-17") == ["telegram_link", "templated_body"]
+        assert score_of(swept, f"{title}-10-17") == (-3, 0)
+
+
+def test_run_classify_does_not_penalise_a_body_under_two_titles(conn):
+    put(conn, "Alpha-10-17", "Alpha", "", SQUATTER_BODY)
+    put(conn, "Beta-10-17", "Beta", "", SQUATTER_BODY)
+    run_classify(conn, log=quiet)
+    assert hit_names(conn, "Alpha-10-17") == ["telegram_link"]
+
+
+def test_run_classify_does_not_penalise_the_actor_for_the_shared_sample_body(conn):
+    # "Hello,+world!" sits under many titles; it is too short to be a template.
+    put(conn, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    for title in ("Hello", "title", "Test"):
+        put(conn, f"{title}-10-17", title, API_SAMPLE, API_SAMPLE)
+    run_classify(conn, log=quiet)
+    assert "templated_body" not in hit_names(conn, "Hello-10-17-9")
+    assert score_of(conn, "Hello-10-17-9") == (6, 1)
+
+
+def test_run_classify_stores_the_body_hash_for_long_bodies_only(swept):
+    run_classify(swept, log=quiet)
+    sql = """
+    SELECT sc.body_sha256 FROM scores sc JOIN pages p ON p.id = sc.page_id
+    WHERE p.path = ?
+    """
+    squatter = swept.execute(sql, ("Mimikatz-10-17",)).fetchone()[0]
+    assert squatter == hashlib.sha256(SQUATTER_BODY.encode("utf-8")).hexdigest()
+    assert swept.execute(sql, ("Hello-10-17-7",)).fetchone()[0] is None
+
+
+def test_run_classify_stores_evidence_with_each_hit(swept):
+    run_classify(swept, log=quiet)
+    sql = """
+    SELECT h.rule, h.weight, h.evidence, h.matches FROM hits h
+    JOIN scores sc ON sc.snapshot_id = h.snapshot_id
+    JOIN pages p ON p.id = sc.page_id WHERE p.path = ? ORDER BY h.id
+    """
+    rows = [tuple(r) for r in swept.execute(sql, ("Hello-10-17-9",))]
+    assert rows == [
+        ("userinfo_spoof", 5, "www.tenable.com@agfc.harper18.workers.dev", 1),
+        ("api_sample_body", 1, API_SAMPLE, 1),
+    ]
+
+
+def test_run_classify_stores_how_often_each_rule_matched(swept):
+    # The squatter body carries the same t.me link three times.
+    run_classify(swept, log=quiet)
+    sql = """
+    SELECT h.rule, h.matches FROM hits h
+    JOIN scores sc ON sc.snapshot_id = h.snapshot_id
+    JOIN pages p ON p.id = sc.page_id WHERE p.path = ? ORDER BY h.id
+    """
+    rows = [tuple(r) for r in swept.execute(sql, ("Mimikatz-10-17",))]
+    assert rows == [("telegram_link", 3), ("templated_body", 1)]
+    assert score_of(swept, "Mimikatz-10-17") == (-3, 0)  # counted, not scored
+
+
+def test_run_classify_stores_a_hit_for_every_rule_that_fired(swept):
+    # Positive or negative, weak or decisive, flagged page or not: every rule
+    # that fired on a page has its row in hits.
+    run_classify(swept, log=quiet)
+    checked = 0
+    for row in latest_snapshots(swept).fetchall():
+        fired = apply_rules(row["title"], row["description"], row["text"])
+        stored = [n for n in hit_names(swept, row["path"]) if n != "templated_body"]
+        assert stored == [hit.rule.name for hit in fired], row["path"]
+        checked += len(fired)
+    assert checked >= 10
+    negative = swept.execute("SELECT COUNT(*) FROM hits WHERE weight < 0").fetchone()[0]
+    assert negative >= 6  # three squatter pages, two penalties each
+
+
+def test_run_classify_scores_are_the_sum_of_their_stored_hits(swept):
+    run_classify(swept, log=quiet)
+    sql = """
+    SELECT sc.score, COALESCE(SUM(h.weight), 0) AS total
+    FROM scores sc LEFT JOIN hits h ON h.snapshot_id = sc.snapshot_id
+    GROUP BY sc.snapshot_id
+    """
+    rows = swept.execute(sql).fetchall()
+    assert len(rows) == 8
+    assert all(row["score"] == row["total"] for row in rows)
+
+
+def test_run_classify_twice_replaces_rather_than_adds(swept):
+    run_classify(swept, log=quiet)
+    hits = swept.execute("SELECT COUNT(*) FROM hits").fetchone()[0]
+    run_classify(swept, log=quiet)
+    assert swept.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 8
+    assert swept.execute("SELECT COUNT(*) FROM hits").fetchone()[0] == hits
+
+
+def test_run_classify_threshold_is_an_argument(swept):
+    counts = run_classify(swept, threshold=1, log=quiet)
+    assert score_of(swept, "Hello-10-17-7") == (1, 1)
+    assert counts["flagged"] == 3
+    assert counts["near_miss"] == 0
+
+
+def test_run_classify_scores_the_newest_snapshot_of_an_edited_page(conn):
+    page_id = put(conn, "Hello-10-17-9", "Hello", "", "nothing here")
+    page = {"title": SPOOF_TITLE, "description": API_SAMPLE, "content": [API_SAMPLE]}
+    add_snapshot(conn, page_id, page, T0 + 60, KEY)
+    counts = run_classify(conn, log=quiet)
+    assert counts["pages"] == 1
+    assert score_of(conn, "Hello-10-17-9") == (6, 1)
+
+
+def test_run_classify_counts_held_out_pages_apart_from_the_sweep(swept):
+    # Held-out rows here are synthetic: real held-out content is never a test input.
+    put(swept, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
+    put(swept, "Known-01-03", "Hello", "", "nothing here", held_out=True)
+    counts = run_classify(swept, log=quiet)
+    assert (counts["held_out"], counts["held_out_flagged"]) == (2, 1)
+    assert counts["pages"] == 8
+    assert counts["flagged"] == 2
+    assert sum(counts["scores"].values()) == 8
+
+
+def test_run_classify_logs_recall_as_counts_and_never_names_a_held_out_page(swept):
+    put(swept, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
+    put(swept, "Known-01-03", "Hello", "", "nothing here", held_out=True)
+    lines = []
+    run_classify(swept, log=lines.append)
+    out = "\n".join(lines)
+    assert "held-out: 1/2 flagged" in out
+    assert "Known-01" not in out
+    assert "tenable" not in out
+
+
+def test_run_classify_logs_the_sweep_totals(swept):
+    lines = []
+    run_classify(swept, log=lines.append)
+    assert "classified 8 pages" in lines[0]
+    assert "2 flagged" in lines[0]
+
+
+def test_run_classify_scores_distribution_covers_the_sweep(swept):
+    counts = run_classify(swept, log=quiet)
+    assert counts["scores"][-3] == 3
+    assert counts["scores"][6] == 1
+
+
+def test_run_classify_on_an_empty_database(conn):
+    counts = run_classify(conn, log=quiet)
+    assert counts["pages"] == 0
+    assert counts["held_out"] == 0
+
+
+def test_run_classify_commits_everything_across_batches(tmp_path, monkeypatch):
+    monkeypatch.setattr("graphwatch.cli.CLASSIFY_BATCH", 2)
+    writer = connect(tmp_path / "g.sqlite")
+    for i in range(5):
+        put(writer, f"Hello-10-17-{i + 1}", "Hello", "", f"note {i}")
+    run_classify(writer, log=quiet)
+    reader = connect(tmp_path / "g.sqlite")  # a second connection sees commits only
+    assert reader.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 5
+    reader.close()
+    writer.close()
+
+
+def test_run_classify_writes_nothing_to_the_http_log(swept):
+    run_classify(swept, log=quiet)
+    assert swept.execute("SELECT COUNT(*) FROM http_log").fetchone()[0] == 0
+
+
+def test_run_explain_prints_the_score_and_one_line_per_hit(swept):
+    run_classify(swept, log=quiet)
+    lines = []
+    assert run_explain(swept, "Hello-10-17-9", log=lines.append) is True
+    assert lines[0] == "Hello-10-17-9: score 6, flagged"
+    assert SPOOF_TITLE in lines[1]
+    assert "+5 userinfo_spoof" in lines[2]
+    assert "www.tenable.com@agfc.harper18.workers.dev" in lines[2]
+    assert "+1 api_sample_body" in lines[3]
+
+
+def test_run_explain_shows_negative_weights_signed(swept):
+    run_classify(swept, log=quiet)
+    lines = []
+    run_explain(swept, "Mimikatz-10-17", log=lines.append)
+    assert lines[0] == "Mimikatz-10-17: score -3, not flagged"
+    assert any("-2 templated_body" in line for line in lines)
+
+
+def test_run_explain_shows_how_often_a_rule_matched(swept):
+    run_classify(swept, log=quiet)
+    lines = []
+    run_explain(swept, "Mimikatz-10-17", log=lines.append)
+    assert any(line.endswith("t.me/ x3") for line in lines)
+    assert not any(line.endswith("x1") for line in lines)
+
+
+def test_run_explain_withholds_evidence_for_a_held_out_page(swept):
+    put(swept, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
+    run_classify(swept, log=quiet)
+    lines = []
+    assert run_explain(swept, "Known-01-02", log=lines.append) is True
+    out = "\n".join(lines)
+    assert "Known-01-02: score 6, flagged" in out
+    assert "withheld" in out
+    assert "tenable" not in out
+    assert "userinfo_spoof" not in out
+
+
+def test_run_explain_says_so_when_there_is_no_score(swept):
+    lines = []
+    assert run_explain(swept, "Hello-10-17-9", log=lines.append) is False
+    assert "run classify first" in lines[0]
+    assert run_explain(swept, "Nope-01-01", log=lines.append) is False
+
+
+def test_parse_args_classify_defaults():
+    args = parse_args(["classify"])
+    assert args.command == "classify"
+    assert args.threshold == 4
+    assert args.explain is None
+    assert args.db == Path("data/graphwatch.sqlite")
+
+
+def test_parse_args_classify_options():
+    args = parse_args(["classify", "--threshold", "6", "--explain", "Hello-10-17-9"])
+    assert args.threshold == 6
+    assert args.explain == "Hello-10-17-9"
+
+
+@pytest.fixture
+def no_network(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("classify must not build a client")
+
+    monkeypatch.setattr("graphwatch.cli.TelegraphClient", refuse)
+
+
+def test_main_classify_needs_no_client_config_or_wordlists(tmp_path, capsys, no_network):
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    put(c, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    put(c, "Hello-10-17-7", "Hello", API_SAMPLE, API_SAMPLE)
+    c.close()
+    main(["--config", str(tmp_path / "missing.env"), "classify", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert "classified 2 pages" in out
+    assert "1 flagged" in out
+    assert "held-out: 0/0 flagged" in out
+    assert "score +6: 1" in out
+    assert "score +1: 1" in out
+
+
+def test_main_classify_threshold_option(tmp_path, capsys, no_network):
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    put(c, "Hello-10-17-7", "Hello", API_SAMPLE, API_SAMPLE)
+    c.close()
+    main(["classify", "--db", str(db), "--threshold", "1"])
+    assert "1 flagged" in capsys.readouterr().out
+
+
+def test_main_classify_explain_reads_the_stored_result(tmp_path, capsys, no_network):
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    put(c, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    c.close()
+    main(["classify", "--db", str(db)])
+    capsys.readouterr()
+    main(["classify", "--db", str(db), "--explain", "Hello-10-17-9"])
+    out = capsys.readouterr().out
+    assert "Hello-10-17-9: score 6, flagged" in out
+    assert "+5 userinfo_spoof" in out
+    assert "classified" not in out  # explain does not rescore
