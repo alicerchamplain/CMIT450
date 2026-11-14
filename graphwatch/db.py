@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from sqlite3 import Connection
 
