@@ -101,6 +101,27 @@ CREATE TABLE IF NOT EXISTS sweep_progress (
     updated_at  REAL    NOT NULL,
     UNIQUE (slug COLLATE NOCASE, month, day)
 );
+
+CREATE TABLE IF NOT EXISTS scores (
+    snapshot_id   INTEGER PRIMARY KEY REFERENCES snapshots(id),
+    page_id       INTEGER NOT NULL REFERENCES pages(id),
+    score         INTEGER NOT NULL,
+    flagged       INTEGER NOT NULL,
+    body_sha256   TEXT,
+    classified_at REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS scores_page ON scores (page_id);
+CREATE INDEX IF NOT EXISTS scores_score ON scores (score);
+
+CREATE TABLE IF NOT EXISTS hits (
+    id          INTEGER PRIMARY KEY,
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+    rule        TEXT    NOT NULL,
+    weight      INTEGER NOT NULL,
+    evidence    TEXT    NOT NULL,
+    matches     INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS hits_snapshot ON hits (snapshot_id);
 """
 
 
@@ -545,3 +566,104 @@ def save_progress(
     )
     conn.execute(sql, params)
     conn.commit()
+
+
+def latest_snapshots(conn: Connection) -> sqlite3.Cursor:
+    """Function to read the newest snapshot of every page, for the classifier
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        sqlite3.Cursor: one row per page, in page id order, with snapshot_id,
+            page_id, path, held_out, title, description and text
+    """
+    sql = """
+    SELECT s.id AS snapshot_id, p.id AS page_id, p.path, p.held_out,
+           s.title, s.description, s.text
+    FROM pages p
+    JOIN snapshots s ON s.id = (
+        SELECT id FROM snapshots WHERE page_id = p.id
+        ORDER BY fetched_at DESC, id DESC LIMIT 1
+    )
+    ORDER BY p.id
+    """
+    return conn.execute(sql)
+
+
+def save_score(
+    conn: Connection,
+    snapshot_id: int,
+    page_id: int,
+    score: int,
+    flagged: bool,
+    body_sha256: str | None,
+    hits: list[tuple[str, int, str, int]],
+    ts: float,
+) -> None:
+    """Function to store one snapshot's score and the rule hits behind it
+
+    A second call for the same snapshot replaces the first, so the classifier
+    can be rerun after a rule changes. Does not commit: the caller commits in
+    batches.
+
+    Args:
+        conn (Connection): SQL db connection
+        snapshot_id (int): The snapshot that was scored
+        page_id (int): The page the snapshot belongs to
+        score (int): Sum of the weights of the rules that fired
+        flagged (bool): True if the score reached the threshold
+        body_sha256 (str | None): Hash of the body text, None for short bodies
+        hits (list[tuple[str, int, str, int]]): one (rule name, weight,
+            evidence, matches) per rule that fired; matches is how many times
+            the rule matched on the page
+        ts (float): Timestamp of the classifier run
+    """
+    conn.execute("DELETE FROM hits WHERE snapshot_id = ?", (snapshot_id,))
+    conn.execute("DELETE FROM scores WHERE snapshot_id = ?", (snapshot_id,))
+    score_insert = """
+    INSERT INTO scores (snapshot_id, page_id, score, flagged, body_sha256, classified_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """
+    score_params = (snapshot_id, page_id, score, int(flagged), body_sha256, ts)
+    conn.execute(score_insert, score_params)
+    hit_insert = """
+    INSERT INTO hits (snapshot_id, rule, weight, evidence, matches)
+    VALUES (?, ?, ?, ?, ?)
+    """
+    hit_params = [(snapshot_id, *hit) for hit in hits]
+    conn.executemany(hit_insert, hit_params)
+
+
+def explain_rows(
+    conn: Connection, path: str
+) -> tuple[sqlite3.Row | None, list[sqlite3.Row]]:
+    """Function to load the newest score for one page and the hits behind it
+
+    Args:
+        conn (Connection): SQL db connection
+        path (str): The page path as Telegraph spells it, e.g. Hello-10-17-154
+
+    Returns:
+        tuple[sqlite3.Row | None, list[sqlite3.Row]]: The score row (path,
+            held_out, title, text, score, flagged) and its hits (rule, weight,
+            evidence, matches) in the order they were stored. (None, []) if the
+            page is unknown or has not been classified.
+    """
+    score_select = """
+    SELECT sc.snapshot_id, p.path, p.held_out, s.title, s.text, sc.score, sc.flagged
+    FROM pages p
+    JOIN scores sc ON sc.page_id = p.id
+    JOIN snapshots s ON s.id = sc.snapshot_id
+    WHERE p.path = ?
+    ORDER BY s.fetched_at DESC, s.id DESC LIMIT 1
+    """
+    row = conn.execute(score_select, (path,)).fetchone()
+    if row is None:
+        return None, []
+    hit_select = """
+    SELECT rule, weight, evidence, matches FROM hits
+    WHERE snapshot_id = ? ORDER BY id
+    """
+    hits = conn.execute(hit_select, (row["snapshot_id"],)).fetchall()
+    return row, hits

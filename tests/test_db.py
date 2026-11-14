@@ -16,13 +16,16 @@ from graphwatch.db import (
     add_event,
     add_snapshot,
     connect,
+    explain_rows,
     held_out_paths,
     http_logger,
+    latest_snapshots,
     load_known,
     parse_path,
     load_progress,
     stale_pages,
     save_progress,
+    save_score,
     store_fetch,
     store_meta,
     upsert_page,
@@ -75,6 +78,8 @@ def test_connect_creates_the_planned_tables(conn):
         "http_log",
         "crowd",
         "sweep_progress",
+        "scores",
+        "hits",
     } <= tables(conn)
 
 
@@ -1089,3 +1094,176 @@ def test_pages_stale_zero_hours_means_everything_seen_before_now(conn):
     pid = upsert_page(conn, "a-01-01", T0)
     store_meta(conn, pid, meta(), T0)
     assert id_paths(stale_pages(conn, 0, T0 + 1, 10)) == [(pid, "a-01-01")]
+
+
+# --------------------------------------------------------------------------
+# scores and hits (issue #29)
+# --------------------------------------------------------------------------
+
+# (rule, weight, evidence, matches)
+HITS = [
+    ("userinfo_spoof", 5, "a.com@b.pro", 1),
+    ("telegram_link", -1, "t.me/", 3),
+]
+
+
+def stored_page(conn, path: str, name: str = "Test-10-16", ts: float = T0, **kwargs):
+    """Store one fixture page under `path`; returns (page_id, snapshot_id)."""
+    page_id = upsert_page(conn, path, ts, **kwargs)
+    snapshot_id, _changed = add_snapshot(conn, page_id, fixture_page(name), ts, KEY)
+    return page_id, snapshot_id
+
+
+def test_latest_snapshots_yields_one_row_per_page_in_page_order(conn):
+    a, snap_a = stored_page(conn, "a-01-01")
+    b, snap_b = stored_page(conn, "b-01-01", "Hello-10-17-5")
+    rows = latest_snapshots(conn).fetchall()
+    assert [(r["page_id"], r["snapshot_id"], r["path"]) for r in rows] == [
+        (a, snap_a, "a-01-01"),
+        (b, snap_b, "b-01-01"),
+    ]
+
+
+def test_latest_snapshots_carries_the_fields_the_rules_read(conn):
+    stored_page(conn, "a-01-01", "Hello-10-17-5")
+    row = latest_snapshots(conn).fetchone()
+    page = fixture_page("Hello-10-17-5")
+    assert row["title"] == page["title"]
+    assert row["description"] == page["description"]
+    assert row["text"].startswith(page["title"] + "\n")
+    assert row["held_out"] == 0
+
+
+def test_latest_snapshots_picks_the_newest_snapshot_of_an_edited_page(conn):
+    page_id, first = stored_page(conn, "a-01-01", "Test-10-16", T0)
+    second, changed = add_snapshot(
+        conn, page_id, fixture_page("Hello-10-17-5"), T0 + 60, KEY
+    )
+    assert changed
+    rows = latest_snapshots(conn).fetchall()
+    assert [r["snapshot_id"] for r in rows] == [second]
+    assert rows[0]["title"] == fixture_page("Hello-10-17-5")["title"]
+
+
+def test_latest_snapshots_marks_held_out_pages(conn):
+    stored_page(conn, "a-01-01", held_out=True)
+    assert latest_snapshots(conn).fetchone()["held_out"] == 1
+
+
+def test_latest_snapshots_skips_pages_that_have_no_snapshot(conn):
+    upsert_page(conn, "a-01-01", T0)
+    assert latest_snapshots(conn).fetchall() == []
+
+
+def test_save_score_stores_the_score_row(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_score(conn, snap, page_id, 6, True, "ab" * 32, HITS, T0 + 5)
+    row = conn.execute("SELECT * FROM scores").fetchone()
+    assert dict(row) == {
+        "snapshot_id": snap,
+        "page_id": page_id,
+        "score": 6,
+        "flagged": 1,
+        "body_sha256": "ab" * 32,
+        "classified_at": T0 + 5,
+    }
+
+
+def test_save_score_stores_one_hit_row_per_hit_in_order(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_score(conn, snap, page_id, 6, True, None, HITS, T0)
+    rows = conn.execute(
+        "SELECT snapshot_id, rule, weight, evidence, matches FROM hits ORDER BY id"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [(snap, *hit) for hit in HITS]
+
+
+def test_save_score_stores_negative_weights_and_match_counts(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_score(conn, snap, page_id, 4, True, None, HITS, T0)
+    rows = conn.execute("SELECT rule, weight, matches FROM hits ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [("userinfo_spoof", 5, 1), ("telegram_link", -1, 3)]
+
+
+def test_hits_matches_column_defaults_to_one(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    conn.execute(
+        "INSERT INTO hits (snapshot_id, rule, weight, evidence) VALUES (?, 'x', 1, 'e')",
+        (snap,),
+    )
+    assert conn.execute("SELECT matches FROM hits").fetchone()[0] == 1
+
+
+def test_save_score_accepts_a_page_with_no_hits_and_no_body_hash(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_score(conn, snap, page_id, 0, False, None, [], T0)
+    row = conn.execute("SELECT score, flagged, body_sha256 FROM scores").fetchone()
+    assert tuple(row) == (0, 0, None)
+    assert conn.execute("SELECT COUNT(*) FROM hits").fetchone()[0] == 0
+
+
+def test_save_score_twice_replaces_the_first_result(conn):
+    # Rerunning the classifier after a rule change must not pile up rows.
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_score(conn, snap, page_id, 6, True, None, HITS, T0)
+    save_score(conn, snap, page_id, 1, False, None, HITS[1:], T0 + 9)
+    assert [tuple(r) for r in conn.execute("SELECT score, flagged FROM scores")] == [
+        (1, 0)
+    ]
+    assert [r["rule"] for r in conn.execute("SELECT rule FROM hits")] == [
+        "telegram_link"
+    ]
+
+
+def test_save_score_leaves_other_snapshots_alone(conn):
+    a, snap_a = stored_page(conn, "a-01-01")
+    b, snap_b = stored_page(conn, "b-01-01")
+    save_score(conn, snap_a, a, 6, True, None, HITS, T0)
+    save_score(conn, snap_b, b, 0, False, None, [], T0)
+    save_score(conn, snap_b, b, 1, False, None, HITS[1:], T0)
+    assert conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM hits").fetchone()[0] == 3
+
+
+def test_save_score_does_not_commit(tmp_path):
+    # The caller commits in batches; a rollback must undo an uncommitted score.
+    c = connect(tmp_path / "g.sqlite")
+    page_id, snap = stored_page(c, "a-01-01")
+    save_score(c, snap, page_id, 6, True, None, HITS, T0)
+    c.rollback()
+    assert c.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM hits").fetchone()[0] == 0
+    c.close()
+
+
+def test_explain_rows_returns_the_score_and_its_hits(conn):
+    page_id, snap = stored_page(conn, "a-01-01", "Hello-10-17-5")
+    save_score(conn, snap, page_id, 6, True, None, HITS, T0)
+    row, hits = explain_rows(conn, "a-01-01")
+    assert (row["path"], row["score"], row["flagged"], row["held_out"]) == (
+        "a-01-01",
+        6,
+        1,
+        0,
+    )
+    assert row["title"] == fixture_page("Hello-10-17-5")["title"]
+    assert [tuple(h) for h in hits] == HITS
+
+
+def test_explain_rows_is_empty_for_an_unknown_path(conn):
+    assert explain_rows(conn, "nope-01-01") == (None, [])
+
+
+def test_explain_rows_is_empty_for_a_page_not_yet_classified(conn):
+    stored_page(conn, "a-01-01")
+    assert explain_rows(conn, "a-01-01") == (None, [])
+
+
+def test_explain_rows_uses_the_newest_scored_snapshot(conn):
+    page_id, first = stored_page(conn, "a-01-01", "Test-10-16", T0)
+    second, _ = add_snapshot(conn, page_id, fixture_page("Hello-10-17-5"), T0 + 60, KEY)
+    save_score(conn, first, page_id, 0, False, None, [], T0)
+    save_score(conn, second, page_id, 6, True, None, HITS, T0 + 61)
+    row, hits = explain_rows(conn, "a-01-01")
+    assert row["score"] == 6
+    assert len(hits) == 2
