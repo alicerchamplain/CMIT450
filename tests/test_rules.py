@@ -6,6 +6,7 @@ are the benign fixtures and synthetic strings. Nothing here reads a held-out
 page from known.txt; those are for the recall check (#31), never for rules.
 """
 
+import base64
 import json
 import re
 from pathlib import Path
@@ -13,12 +14,16 @@ from pathlib import Path
 import pytest
 
 from graphwatch.rules import (
+    ENCODED_TOKEN_PATTERN,
+    IP_PATTERN,
     RULES,
     THRESHOLD,
+    UNPADDED_BASE64_PATTERN,
     WHERE,
     Hit,
     Rule,
     apply_rules,
+    decodes_to_pointer,
     decodes_to_printable,
     is_pointer,
     is_public_ip,
@@ -118,6 +123,7 @@ def test_the_expected_rules_are_present():
         "ip_in_title",
         "storage_key_marker",
         "base64_in_title",
+        "encoded_pointer",
         "api_sample_body",
         "ip_literal",
         "email_address",
@@ -136,7 +142,7 @@ def test_each_decisive_rule_clears_the_threshold_alone():
 
 
 def test_no_single_weak_rule_clears_the_threshold():
-    for name in ("base64_in_title", "api_sample_body", "ip_literal"):
+    for name in ("base64_in_title", "encoded_pointer", "api_sample_body", "ip_literal"):
         assert 0 < rule(name).weight < THRESHOLD, name
 
 
@@ -326,6 +332,118 @@ def test_actor_shapes_score_above_four():
 
 
 # --------------------------------------------------------------------------
+# encoded_pointer: a token that decodes to a whole pointer (#28)
+# --------------------------------------------------------------------------
+
+HIDDEN_HOST = "czMucmVkYXJvZGFzLmNvbQ=="  # s3.redarodas.com, from the actor's titles
+
+
+def test_decodes_to_pointer_accepts_a_token_hiding_a_host_or_ip():
+    assert decodes_to_pointer(HIDDEN_HOST)
+    assert decodes_to_pointer("NDUuNzcuOTMuMTg=")  # 45.77.93.18
+
+
+@pytest.mark.parametrize("token", ["dGViaQ==", "eWVsNA==", "2+2=", "aGVsbG8gd29ybGQ="])
+def test_decodes_to_pointer_rejects_tokens_that_decode_to_words(token):
+    # tebi, yel4, arithmetic, "hello world": printable, not pointers
+    assert not decodes_to_pointer(token)
+
+
+def test_encoded_pointer_fires_on_the_long_pointer_title():
+    title = POINTER_TITLE + "?" + HIDDEN_HOST
+    hits = apply_rules(title, API_SAMPLE, title + "\n" + API_SAMPLE + "\n" + API_SAMPLE)
+    by_name = {h.rule.name: h.evidence for h in hits}
+    assert by_name["encoded_pointer"] == HIDDEN_HOST
+    # base64_in_title still reports the first padded token, as before
+    assert by_name["base64_in_title"] == "dGViaQ=="
+
+
+def test_encoded_pointer_does_not_fire_on_the_short_pointer_title():
+    hits = apply_rules(POINTER_TITLE, API_SAMPLE, POINTER_TITLE + "\n" + API_SAMPLE)
+    assert "encoded_pointer" not in names(hits)
+    assert "base64_in_title" in names(hits)
+
+
+def test_encoded_pointer_fires_in_the_body_too():
+    hits = apply_rules("Hello", "", "Hello\n\nconfig " + HIDDEN_HOST)
+    assert names(hits) == ["encoded_pointer"]
+
+
+def test_an_encoded_pointer_alone_does_not_flag_but_with_the_api_sample_it_does():
+    alone = apply_rules("Hello", "", "Hello\n\n" + HIDDEN_HOST)
+    assert score(alone) == 3 < THRESHOLD
+    with_sample = apply_rules(
+        "Hello", API_SAMPLE, "Hello\n" + API_SAMPLE + "\n" + HIDDEN_HOST
+    )
+    assert names(with_sample) == ["encoded_pointer", "api_sample_body"]
+    assert score(with_sample) >= THRESHOLD
+
+
+UNPADDED_IP = "NDUuNzcuOTMuMTg3"  # 45.77.93.187: 12 bytes, so base64 adds no padding
+
+
+@pytest.mark.parametrize("run", ["a" * 12, "a" * 16, "NDUuNzcuOTMuMTg3", "ab+/" * 5])
+def test_unpadded_pattern_matches_whole_runs_in_groups_of_four(run):
+    assert UNPADDED_BASE64_PATTERN.fullmatch(run)
+    assert [m.group(0) for m in UNPADDED_BASE64_PATTERN.finditer(f"x {run} y")] == [run]
+
+
+@pytest.mark.parametrize("run", ["a" * 8, "a" * 11, "a" * 13, "a" * 14, "a" * 15])
+def test_unpadded_pattern_ignores_short_runs_and_odd_lengths(run):
+    assert UNPADDED_BASE64_PATTERN.findall(f"x {run} y") == []
+
+
+def test_unpadded_pattern_leaves_padded_tokens_to_the_padded_pattern():
+    assert UNPADDED_BASE64_PATTERN.findall(HIDDEN_HOST) == []
+    assert ENCODED_TOKEN_PATTERN.findall(HIDDEN_HOST) == [HIDDEN_HOST]
+    assert ENCODED_TOKEN_PATTERN.findall(f"{HIDDEN_HOST} {UNPADDED_IP}") == [
+        HIDDEN_HOST,
+        UNPADDED_IP,
+    ]
+
+
+def test_decodes_to_pointer_accepts_an_unpadded_token():
+    assert decodes_to_pointer(UNPADDED_IP)
+
+
+@pytest.mark.parametrize(
+    "word", ["internationalization", "abcdefghijkl", "YztOEovieQIzZjY8", "0123456789abcdef"]
+)
+def test_decodes_to_pointer_rejects_ordinary_unpadded_words(word):
+    assert not decodes_to_pointer(word)
+
+
+def test_an_unpadded_token_only_gets_plain_base64():
+    # 15 bytes XORed with 0x5a: the full decoder would find it, but unpadded
+    # tokens look like ordinary words, so XOR is not tried on them.
+    hidden = bytes(b ^ 0x5A for b in b"cdn.example.com")
+    token = base64.b64encode(hidden).decode()
+    assert not token.endswith("=")
+    assert not decodes_to_pointer(token)
+
+
+def test_encoded_pointer_fires_on_an_unpadded_token():
+    hits = apply_rules("Hello", "", "Hello\n\nconfig " + UNPADDED_IP)
+    assert [(h.rule.name, h.evidence) for h in hits] == [("encoded_pointer", UNPADDED_IP)]
+
+
+def test_encoded_pointer_ignores_long_ordinary_words():
+    text = "Hello\n\ninternationalization of t.me/+YztOEovieQIzZjY8 abcdefghijkl"
+    assert "encoded_pointer" not in names(apply_rules("Hello", "", text))
+
+
+def test_base64_in_title_still_needs_padding():
+    # The unpadded pattern belongs to encoded_pointer only.
+    hits = apply_rules(UNPADDED_IP, "", UNPADDED_IP)
+    assert names(hits) == ["encoded_pointer"]
+
+
+def test_encoded_pointer_ignores_base64_that_hides_ordinary_text():
+    hits = apply_rules("Hello", "", "Hello\n\nsecret: aGVsbG8gd29ybGQ=")
+    assert "encoded_pointer" not in names(hits)
+
+
+# --------------------------------------------------------------------------
 # benign shapes do not
 # --------------------------------------------------------------------------
 
@@ -384,6 +502,43 @@ def test_version_string_is_the_documented_false_positive_of_ip_literal():
     hits = apply_rules("News", None, "VL700 Firmware [vli_vl700_(1.0.2.10).bin]")
     assert names(hits) == ["ip_literal"]
     assert score(hits) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "WhatsApp v2.22.23.12 released",
+        "build V8.8.8.8",
+        "version2.22.23.12",
+        "app_8.8.8.8",
+        "сборка8.8.8.8",
+    ],
+)
+def test_a_dotted_number_glued_to_a_word_is_not_an_ip(text):
+    # Version strings: 282 of the 1,688 benign IP matches on night 1.
+    assert names(apply_rules("News", None, text)) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "8.8.8.8",
+        "ip 8.8.8.8",
+        "ip:8.8.8.8",
+        "ip=8.8.8.8",
+        "(8.8.8.8)",
+        "http://8.8.8.8/x",
+        "user@8.8.8.8",
+        "first\n8.8.8.8",
+        "8.8.8.8:53",
+    ],
+)
+def test_an_ip_after_punctuation_or_space_is_still_an_ip(text):
+    assert [m.group(0) for m in IP_PATTERN.finditer(text)] == ["8.8.8.8"]
+
+
+def test_the_pointer_title_still_leads_with_its_ip():
+    assert IP_PATTERN.match(POINTER_TITLE).group(0) == "207.246.108.214"
 
 
 def test_a_longer_dotted_number_is_not_an_ip():

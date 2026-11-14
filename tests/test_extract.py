@@ -203,11 +203,29 @@ def test_a_base64_token_that_hides_an_ip_yields_the_ip():
     ]
 
 
-def test_unpadded_base64_is_not_offered_to_the_decoders():
-    # The token pattern is the rule table's BASE64_PATTERN, which needs padding.
+def test_an_unpadded_base64_token_that_hides_an_ip_yields_the_ip():
     token = base64.b64encode(b"45.77.93.187").decode()
     assert not token.endswith("=")
+    assert body(f"x {token} y") == [
+        Indicator("token", token, "text"),
+        Indicator("ip", "45.77.93.187", "text:base64"),
+    ]
+
+
+def test_long_ordinary_words_are_not_tokens():
+    # Unpadded runs are everywhere; only one that decodes to a pointer is kept.
+    assert body("internationalization abcdefghijkl YztOEovieQIzZjY8") == []
+
+
+def test_an_unpadded_token_is_not_tried_with_xor():
+    hidden = bytes(b ^ 0x5A for b in b"cdn.example.com")
+    token = base64.b64encode(hidden).decode()
+    assert not token.endswith("=")
     assert body(f"x {token} y") == []
+
+
+def test_a_version_string_is_not_an_ip():
+    assert body("WhatsApp v2.22.23.12 and build_8.8.8.8") == []
 
 
 def test_a_long_hex_run_is_a_token_and_is_decoded():

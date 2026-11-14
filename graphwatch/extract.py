@@ -6,12 +6,13 @@ Reads text only. Nothing here resolves a name or contacts a host.
 import re
 from dataclasses import dataclass
 
-from graphwatch.decode import decode_pointer
+from graphwatch.decode import decode_base64_pointer, decode_pointer
 from graphwatch.rules import (
     BASE64_PATTERN,
     HOST,
     IP_PATTERN,
     PORT_PATTERN,
+    UNPADDED_BASE64_PATTERN,
     USERINFO_SPOOF_PATTERN,
     is_pointer,
     is_public_ip,
@@ -130,4 +131,12 @@ def extract(title: str | None, text: str | None) -> list[Indicator]:
                 for decoded in decode_pointer(token, is_pointer):
                     kind = pointer_kind(decoded.value)
                     add(kind, decoded.value, f"{source}:{decoded.encoding}")
+        # Unpadded base64 looks like any long word, so a run is only reported
+        # when it really decodes to a pointer.
+        for match in UNPADDED_BASE64_PATTERN.finditer(field):
+            token = match.group(0)
+            for decoded in decode_base64_pointer(token, is_pointer):
+                add("token", token, source)
+                kind = pointer_kind(decoded.value)
+                add(kind, decoded.value, f"{source}:{decoded.encoding}")
     return found

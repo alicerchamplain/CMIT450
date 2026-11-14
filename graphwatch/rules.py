@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from graphwatch.decode import decode_base64_pointer, decode_pointer
+
 WHERE = frozenset(["title", "description", "text", "computed"])
 
 # Score Threshold
@@ -53,10 +55,11 @@ STORAGE_KEY_PATTERN = re.compile(r"/!\S+")
 EMAIL_PATTERN = re.compile(rf"(?<![\w.@-])[\w.+-]+@{HOST}(?![\w@-])", re.IGNORECASE)
 
 # Regex for detecting IPs
-# (?<![\d.])          : not inside a longer dotted number
+# (?<![\w.])          : not inside a longer dotted number or a word, so the
+#                       version string v2.22.23.12 is not an IP
 # \d{1,3}(?:\.\d{1,3}){3} : four groups of 1 to 3 digits
 # (?![\d.])           : not followed by more digits or dots
-IP_PATTERN = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
+IP_PATTERN = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
 
 
 # Regex for detecting base64 strings
@@ -65,6 +68,21 @@ IP_PATTERN = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
 # (?![A-Za-z0-9+/=])  : end of the token
 BASE64_PATTERN = re.compile(
     r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{2,}={1,2}(?![A-Za-z0-9+/=])"
+)
+
+# Regex for detecting base64 strings that need no padding
+# Base64 only pads when the original length is not a multiple of 3, so
+# 45.77.93.187 (12 characters) encodes to NDUuNzcuOTMuMTg3 with no = at all.
+# (?<![A-Za-z0-9+/=])      : start of a token
+# (?:[A-Za-z0-9+/]{4}){3,} : twelve or more base64 characters in groups of four
+# (?![A-Za-z0-9+/=])       : end of the token
+UNPADDED_BASE64_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9+/=])(?:[A-Za-z0-9+/]{4}){3,}(?![A-Za-z0-9+/=])"
+)
+
+# Either kind of base64 token: padded first, then unpadded
+ENCODED_TOKEN_PATTERN = re.compile(
+    f"{BASE64_PATTERN.pattern}|{UNPADDED_BASE64_PATTERN.pattern}"
 )
 
 # Regex for detecting the default API title
@@ -142,6 +160,17 @@ def decodes_to_printable(s: str) -> bool:
     return len(raw) > 0 and all(32 <= byte < 127 for byte in raw)
 
 
+def decodes_to_pointer(s: str) -> bool:
+    """Function to check if a token decodes to a whole pointer
+
+    A padded token is tried with every decoder. An unpadded one looks like
+    any long word, so it only gets plain base64.
+    """
+    if s.endswith("="):
+        return len(decode_pointer(s, accept=is_pointer)) > 0
+    return len(decode_base64_pointer(s, accept=is_pointer)) > 0
+
+
 def _not_a_host_local_part(s: str) -> bool:
     local = s.split("@", 1)[0]
     return re.fullmatch(HOST, local, re.IGNORECASE) is None
@@ -177,6 +206,14 @@ RULES: tuple[Rule, ...] = (
         BASE64_PATTERN,
         "Matching Gamaredon-like pages which have base64 encodded patterns in the title.",
         check=decodes_to_printable,
+    ),
+    Rule(
+        "encoded_pointer",
+        3,
+        "text",
+        ENCODED_TOKEN_PATTERN,
+        "Matching pages that hide a server address in a base64 token, padded or not, like czMucmVkYXJvZGFzLmNvbQ== for s3[.]redarodas[.]com",
+        check=decodes_to_pointer,
     ),
     Rule(
         "api_sample_body",

@@ -139,3 +139,27 @@ def decode_pointer(token: str, accept: Callable[[str], bool]) -> list[Decoded]:
         if text != token and accept(text):
             results.append(Decoded(f"rot{n}", text))
     return results
+
+
+def decode_base64_pointer(token: str, accept: Callable[[str], bool]) -> list[Decoded]:
+    """Try plain base64 only, for tokens that carry no padding
+
+    Without the = on the end a base64 token looks like any long word, and
+    there are far too many of those to try XOR, hex, base32 and the rotations
+    on each. Plain base64 is cheap and does not turn words into hostnames.
+
+    Args:
+        token (str): the candidate token, e.g. NDUuNzcuOTMuMTg3
+        accept (Callable[[str], bool]): True if the whole decoded string is a
+            pointer
+
+    Returns:
+        list[Decoded]: one base64 decoding if it is a pointer, else empty
+    """
+    raw = from_base64(token)
+    if raw is None or len(raw) > MAX_POINTER_BYTES:
+        return []
+    text = as_text(raw)
+    if text is not None and accept(text):
+        return [Decoded("base64", text)]
+    return []

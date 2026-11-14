@@ -15,6 +15,7 @@ from graphwatch.decode import (
     MIN_XOR_BYTES,
     Decoded,
     as_text,
+    decode_base64_pointer,
     decode_pointer,
     from_base32,
     from_base64,
@@ -230,3 +231,46 @@ def test_decode_pointer_returns_decoded_records():
     assert (result.encoding, result.value) == ("base64", HOST)
     with pytest.raises(AttributeError):
         result.value = "other"
+
+
+# --------------------------------------------------------------------------
+# decode_base64_pointer: plain base64 only, for unpadded tokens
+# --------------------------------------------------------------------------
+
+UNPADDED_IP = "NDUuNzcuOTMuMTg3"  # 45.77.93.187: 12 bytes, so no padding
+
+
+def test_decode_base64_pointer_finds_an_unpadded_pointer():
+    assert base64.b64encode(IP.encode()).decode() == UNPADDED_IP
+    assert decode_base64_pointer(UNPADDED_IP, dotted) == [Decoded("base64", IP)]
+
+
+def test_decode_base64_pointer_also_reads_padded_tokens():
+    token = base64.b64encode(HOST.encode()).decode()
+    assert decode_base64_pointer(token, dotted) == [Decoded("base64", HOST)]
+
+
+@pytest.mark.parametrize(
+    "token", ["internationalization", "abcdefghijkl", "YztOEovieQIzZjY8", "", "!!!!"]
+)
+def test_decode_base64_pointer_rejects_ordinary_words(token):
+    assert decode_base64_pointer(token, dotted) == []
+
+
+def test_decode_base64_pointer_does_not_try_xor():
+    hidden = b"cdn.example.com"  # 15 bytes: unpadded
+    token = base64.b64encode(xored(hidden, 0x5A)).decode()
+    assert not token.endswith("=")
+    assert decode_base64_pointer(token, only("cdn.example.com")) == []
+    # the full decoder would have found it
+    assert decode_pointer(token, only("cdn.example.com")) != []
+
+
+def test_decode_base64_pointer_does_not_try_hex_or_rotations():
+    assert decode_base64_pointer(b"s3.redarodas.com".hex(), dotted) == []
+    assert decode_base64_pointer(rot(HOST, 13), only(HOST)) == []
+
+
+def test_decode_base64_pointer_skips_oversized_tokens():
+    token = base64.b64encode(b"a" * (MAX_POINTER_BYTES + 1)).decode()
+    assert decode_base64_pointer(token, lambda s: True) == []
