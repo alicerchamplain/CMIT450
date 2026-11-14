@@ -20,6 +20,7 @@ from graphwatch.rules import (
     Rule,
     apply_rules,
     decodes_to_printable,
+    is_pointer,
     is_public_ip,
     render_table,
     score,
@@ -93,7 +94,7 @@ def test_every_rule_has_a_nonzero_weight():
 
 
 def test_where_is_one_of_the_known_fields():
-    assert WHERE == {"title", "description", "text", "computed"}
+    assert {"title", "description", "text", "computed"} == WHERE
     for r in RULES:
         assert r.where in WHERE, r.name
 
@@ -205,6 +206,52 @@ def test_decodes_to_printable_accepts_the_actor_fields(token, plain):
 @pytest.mark.parametrize("token", ["2+2=", "////", "AAAA", "abc", "abcde=", "", "===="])
 def test_decodes_to_printable_rejects_binary_and_malformed(token):
     assert not decodes_to_printable(token)
+
+
+@pytest.mark.parametrize(
+    "s",
+    [
+        "s3.redarodas.com",
+        "S3.REDARODAS.COM",
+        "opportunizz.pro",
+        "agfc.harper18.workers.dev",
+        "45.77.93.187",
+        "45.77.93.187:8443",
+        "s3.redarodas.com:443",
+        "http://s3.redarodas.com/",
+        "https://45.77.93.187:8443/a/b?c=d",
+        "HTTP://S3.REDARODAS.COM/x",
+        "http://www.tenable.com@agfc.harper18.workers.dev/",
+    ],
+)
+def test_is_pointer_accepts_a_whole_ip_host_or_url(s):
+    assert is_pointer(s)
+
+
+@pytest.mark.parametrize(
+    "s",
+    [
+        "",
+        "tebi",
+        "yel4",
+        "go to s3.redarodas.com",
+        "s3.redarodas.com now",
+        "s3.redarodas.com\n",
+        "s3.redarodas.com/path",
+        "192.168.1.1",
+        "http://192.168.1.1/",
+        "http://localhost/",
+        "http://",
+        "ftp://s3.redarodas.com/",
+        "solano.elsa",
+        "grove.7",
+        "bob@gmail.com",
+        "2.22.23",
+        "s3.redarodas.com:port",
+    ],
+)
+def test_is_pointer_rejects_partial_private_and_non_pointers(s):
+    assert not is_pointer(s)
 
 
 # --------------------------------------------------------------------------

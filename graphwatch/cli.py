@@ -34,6 +34,7 @@ from graphwatch.db import (
     store_meta,
     upsert_title,
 )
+from graphwatch.extract import extract
 from graphwatch.rules import THRESHOLD, score
 from graphwatch.slugify import (
     Entry,
@@ -389,8 +390,9 @@ def run_classify(conn: Connection, threshold: int = THRESHOLD, log=print) -> dic
 def run_explain(conn: Connection, path: str, log=print) -> bool:
     """Function to print why one page scored what it did, from the stored hits
 
-    A held-out page gets its score and nothing else: its evidence is what a
-    rule would be written from, and the evaluation set is never read for that.
+    A flagged page also gets the indicators the extractor finds in it. A
+    held-out page gets its score and nothing else: its evidence is what a rule
+    would be written from, and the evaluation set is never read for that.
 
     Args:
         conn (Connection): SQL db connection
@@ -415,6 +417,9 @@ def run_explain(conn: Connection, path: str, log=print) -> bool:
         # A rule that matched more than once shows how often: "x3"
         times = f" x{hit['matches']}" if hit["matches"] > 1 else ""
         log(f"  {hit['weight']:+d} {hit['rule']:<20} {hit['evidence']}{times}")
+    if row["flagged"]:
+        for indicator in extract(row["title"], row["text"]):
+            log(f"  {indicator.kind:<5} {indicator.value} ({indicator.source})")
     return True
 
 

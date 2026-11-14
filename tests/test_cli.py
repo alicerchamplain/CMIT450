@@ -27,7 +27,7 @@ from graphwatch.cli import (
     run_sweep,
 )
 from graphwatch.config import CONFIG
-from graphwatch.crowd import save_day_count, DayCount
+from graphwatch.crowd import DayCount, save_day_count
 from graphwatch.db import (
     add_snapshot,
     connect,
@@ -1285,3 +1285,26 @@ def test_main_classify_explain_reads_the_stored_result(tmp_path, capsys, no_netw
     assert "Hello-10-17-9: score 6, flagged" in out
     assert "+5 userinfo_spoof" in out
     assert "classified" not in out  # explain does not rescore
+
+
+def test_run_explain_lists_the_indicators_of_a_flagged_page(swept):
+    run_classify(swept, log=quiet)
+    lines = []
+    run_explain(swept, "Hello-10-17-9", log=lines.append)
+    assert "  decoy www.tenable.com (title)" in lines
+    assert "  host  agfc.harper18.workers.dev (title)" in lines
+
+
+def test_run_explain_lists_no_indicators_for_an_unflagged_page(swept):
+    run_classify(swept, log=quiet)
+    lines = []
+    run_explain(swept, "Mimikatz-10-17", log=lines.append)
+    assert not any(line.startswith("  host") for line in lines)
+
+
+def test_run_explain_lists_no_indicators_for_a_held_out_page(swept):
+    put(swept, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
+    run_classify(swept, log=quiet)
+    lines = []
+    run_explain(swept, "Known-01-02", log=lines.append)
+    assert not any("workers.dev" in line for line in lines)

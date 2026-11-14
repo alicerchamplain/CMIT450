@@ -6,6 +6,7 @@ import ipaddress
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 WHERE = frozenset(["title", "description", "text", "computed"])
 
@@ -24,6 +25,15 @@ TLD = (
 # (?:[a-z0-9-]+\.)+ : one or more labels, each followed by a dot
 # TLD               : a known top-level domain
 HOST = rf"(?:[a-z0-9-]+\.)+{TLD}"
+
+# HOST compiled for whole-string checks: HOST_PATTERN.fullmatch(s)
+HOST_PATTERN = re.compile(HOST, re.IGNORECASE)
+
+# Regex for a port number on the end of a host or IP
+# :       : the separator
+# \d{1,5} : one to five digits
+# $       : at the very end
+PORT_PATTERN = re.compile(r":\d{1,5}$")
 
 # Regex for detecting Gamaredon fake userinfo strings like onmedservice[.]com[.]ua@opportunizz[.]pro
 # (?<![\w.@-]) : not preceded by a word char, dot, @ or hyphen
@@ -102,6 +112,25 @@ def is_public_ip(s: str) -> bool:
     except ValueError:
         return False
     return address.is_global and not address.is_multicast
+
+
+def is_pointer(s: str) -> bool:
+    """Function to check if a whole string is a pointer to a server
+
+    A pointer is a public IP, a hostname with a known TLD, or an http(s) URL
+    to one of those. A port may follow the host. Nothing may be left over:
+    "s3.redarodas.com" is a pointer, "go to s3.redarodas.com" is not.
+    """
+    if re.search(r"\s", s):
+        return False
+    if s.lower().startswith(("http://", "https://")):
+        try:
+            host = urlsplit(s).hostname or ""
+        except ValueError:
+            return False
+    else:
+        host = PORT_PATTERN.sub("", s)
+    return is_public_ip(host) or HOST_PATTERN.fullmatch(host) is not None
 
 
 def decodes_to_printable(s: str) -> bool:
