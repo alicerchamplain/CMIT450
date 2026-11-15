@@ -45,6 +45,19 @@ USERINFO_SPOOF_PATTERN = re.compile(
     rf"(?<![\w.@-])({HOST})@({HOST})(?![\w@-])", re.IGNORECASE
 )
 
+# Regex for detecting the same spoof in a title whatever the decoy's ending,
+# like primewire[.]ag@agfc[.]harper18[.]workers[.]dev
+# The left side is bait and can be any site, so only the right side, the real
+# destination, has to end in a known TLD. Titles only: in body text this
+# shape is mostly email addresses like first.last@provider.
+# (?<![\w.@-])                  : not preceded by a word char, dot, @ or hyphen
+# ((?:[a-z0-9-]+\.)+[a-z]{2,})  : the decoy, any dotted name
+# @(HOST)                       : the destination, a hostname with a known TLD
+# (?![\w@-])                    : the right host ends here
+TITLE_SPOOF_PATTERN = re.compile(
+    rf"(?<![\w.@-])((?:[a-z0-9-]+\.)+[a-z]{{2,}})@({HOST})(?![\w@-])", re.IGNORECASE
+)
+
 # Regex for detecting s3 storage keys used by Gamaredon
 # /!   : the storage-key marker
 # \S+  : the hashed key and whatever follows up to whitespace
@@ -183,6 +196,14 @@ RULES: tuple[Rule, ...] = (
         "text",
         USERINFO_SPOOF_PATTERN,
         "Matching the Gamaredon userinfo spoof pattern like onmedservice[.]com[.]ua@opportunizz[.]pro",
+    ),
+    Rule(
+        "spoof_in_title",
+        5,
+        "title",
+        TITLE_SPOOF_PATTERN,
+        "Matching userinfo spoof titles whose decoy site ends in a TLD outside the list, like primewire[.]ag@agfc[.]harper18[.]workers[.]dev, which userinfo_spoof misses",
+        check=_not_a_host_local_part,
     ),
     Rule(
         "ip_in_title",

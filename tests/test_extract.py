@@ -114,6 +114,24 @@ def test_a_decoy_is_never_reported_as_a_host_anywhere_on_the_page():
     assert of_kind(found, "decoy") == ["www.tenable.com"]
 
 
+AG_TITLE = "primewire.ag@agfc.harper18.workers.dev/"
+
+
+def test_a_title_spoof_with_an_unlisted_decoy_still_gives_the_front_host():
+    # Without this the front host never reaches enrichment: it follows an @,
+    # so the bare-hostname scan skips it as an email's domain.
+    found = extract(AG_TITLE, AG_TITLE + "\nHello,+world!\nHello,+world!")
+    assert found == [
+        Indicator("decoy", "primewire.ag", "title"),
+        Indicator("host", "agfc.harper18.workers.dev", "title"),
+    ]
+
+
+def test_the_looser_spoof_pattern_is_not_used_on_body_text():
+    found = extract("Netflix", "Netflix\n\nlogin solano.elsa@icloud.com today")
+    assert found == []
+
+
 def test_spoof_hosts_are_lowercased():
     found = extract("WWW.TENABLE.COM@AGFC.HARPER18.WORKERS.DEV/", "")
     assert pairs(found) == [

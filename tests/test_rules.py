@@ -18,6 +18,7 @@ from graphwatch.rules import (
     IP_PATTERN,
     RULES,
     THRESHOLD,
+    TITLE_SPOOF_PATTERN,
     UNPADDED_BASE64_PATTERN,
     WHERE,
     Hit,
@@ -120,6 +121,7 @@ def test_rules_are_frozen_dataclasses():
 def test_the_expected_rules_are_present():
     assert {
         "userinfo_spoof",
+        "spoof_in_title",
         "ip_in_title",
         "storage_key_marker",
         "base64_in_title",
@@ -137,7 +139,7 @@ def test_the_draft_threshold_is_four():
 
 
 def test_each_decisive_rule_clears_the_threshold_alone():
-    for name in ("userinfo_spoof", "ip_in_title", "storage_key_marker"):
+    for name in ("userinfo_spoof", "spoof_in_title", "ip_in_title", "storage_key_marker"):
         assert rule(name).weight >= THRESHOLD, name
 
 
@@ -309,6 +311,77 @@ def test_spoof_title_fires_userinfo_spoof_and_the_api_sample():
     hits = apply_rules(SPOOF_TITLE, API_SAMPLE, text)
     assert names(hits) == ["userinfo_spoof", "api_sample_body"]
     assert hits[0].evidence == "www.tenable.com@agfc.harper18.workers.dev"
+
+
+# --------------------------------------------------------------------------
+# spoof_in_title: the decoy ends in a TLD outside the list
+# --------------------------------------------------------------------------
+
+# Seen on 20 Hello pages from 3 to 18 October in the full sweep (held_out = 0):
+# userinfo_spoof missed them all because .ag is not in TLD.
+AG_TITLE = "primewire.ag@agfc.harper18.workers.dev/"
+
+
+def test_userinfo_spoof_misses_a_decoy_with_an_unlisted_tld():
+    hits = apply_rules(AG_TITLE, API_SAMPLE, AG_TITLE + "\n" + API_SAMPLE + "\n" + API_SAMPLE)
+    assert "userinfo_spoof" not in names(hits)
+
+
+def test_spoof_in_title_catches_the_unlisted_decoy_and_the_page_flags():
+    hits = apply_rules(AG_TITLE, API_SAMPLE, AG_TITLE + "\n" + API_SAMPLE + "\n" + API_SAMPLE)
+    assert names(hits) == ["spoof_in_title", "api_sample_body", "email_address"]
+    assert hits[0].evidence == "primewire.ag@agfc.harper18.workers.dev"
+    assert score(hits) >= THRESHOLD
+
+
+def test_title_spoof_pattern_captures_the_decoy_and_the_destination():
+    match = TITLE_SPOOF_PATTERN.search(AG_TITLE)
+    assert match.group(1) == "primewire.ag"
+    assert match.group(2) == "agfc.harper18.workers.dev"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "primewire.ag@agfc.harper18.workers.dev/",
+        "PRIMEWIRE.AG@AGFC.HARPER18.WORKERS.DEV/",
+        "some-site.museum@venture-cpu-sur-everyone.trycloudflare.com",
+        "news.example.today@opportunizz.pro/x",
+    ],
+)
+def test_spoof_in_title_fires_whatever_the_decoy_ends_in(title):
+    assert "spoof_in_title" in names(apply_rules(title, None, title))
+
+
+def test_spoof_in_title_leaves_listed_decoys_to_userinfo_spoof():
+    # One rule per page for one spoof, so scores stay comparable.
+    for title in (SPOOF_TITLE, POINTER_TITLE):
+        fired = names(apply_rules(title, None, title))
+        assert "userinfo_spoof" in fired
+        assert "spoof_in_title" not in fired
+
+
+def test_spoof_in_title_needs_a_known_tld_on_the_destination():
+    title = "primewire.ag@agfc.harper18.workers.zz"
+    assert "spoof_in_title" not in names(apply_rules(title, None, title))
+
+
+def test_spoof_in_title_does_not_look_at_the_body():
+    # In body text this shape is first.last@provider email: 80 pages on night 1.
+    text = "Netflix\n\nlogin solano.elsa@icloud.com:SECRET{" + "c" * 64 + "}"
+    assert "spoof_in_title" not in names(apply_rules("Netflix", None, text))
+
+
+def test_a_plain_email_in_a_title_is_not_a_spoof():
+    title = "write to bob@gmail.com"
+    assert "spoof_in_title" not in names(apply_rules(title, None, title))
+
+
+def test_a_dotted_email_in_a_title_is_the_documented_false_positive():
+    # first.last@provider in a title looks exactly like a spoof with an
+    # unlisted decoy. No title on night 1 carries one (0 of 92,922).
+    title = "contact solano.elsa@icloud.com"
+    assert "spoof_in_title" in names(apply_rules(title, None, title))
 
 
 @pytest.mark.parametrize(

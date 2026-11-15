@@ -12,6 +12,7 @@ from graphwatch.rules import (
     HOST,
     IP_PATTERN,
     PORT_PATTERN,
+    TITLE_SPOOF_PATTERN,
     UNPADDED_BASE64_PATTERN,
     USERINFO_SPOOF_PATTERN,
     is_pointer,
@@ -90,10 +91,15 @@ def extract(title: str | None, text: str | None) -> list[Indicator]:
     Returns:
         list[Indicator]: indicators in order of appearance, no repeats
     """
-    fields = (("title", title or ""), ("text", text or ""))
+    # In the title the decoy may end in any TLD; in the text that looser
+    # pattern would take every first.last@provider email for a spoof.
+    fields = (
+        ("title", title or "", TITLE_SPOOF_PATTERN),
+        ("text", text or "", USERINFO_SPOOF_PATTERN),
+    )
     decoys = set()
-    for _source, field in fields:
-        for match in USERINFO_SPOOF_PATTERN.finditer(field):
+    for _source, field, spoof_pattern in fields:
+        for match in spoof_pattern.finditer(field):
             decoys.add(match.group(1).lower())
 
     found = []
@@ -107,9 +113,9 @@ def extract(title: str | None, text: str | None) -> list[Indicator]:
             seen.add((kind, value))
             found.append(Indicator(kind, value, source))
 
-    for source, field in fields:
+    for source, field, spoof_pattern in fields:
         field = SECRET_PATTERN.sub(" ", field)
-        for match in USERINFO_SPOOF_PATTERN.finditer(field):
+        for match in spoof_pattern.finditer(field):
             add("decoy", match.group(1).lower(), source)
             add("host", match.group(2).lower(), source)
         for match in URL_PATTERN.finditer(field):
@@ -118,7 +124,7 @@ def extract(title: str | None, text: str | None) -> list[Indicator]:
                 add("url", url, source)
         # Blank out what is already claimed so its parts are not reported again.
         field = URL_PATTERN.sub(" ", field)
-        field = USERINFO_SPOOF_PATTERN.sub(" ", field)
+        field = spoof_pattern.sub(" ", field)
         for match in IP_PATTERN.finditer(field):
             if is_public_ip(match.group(0)):
                 add("ip", match.group(0), source)
