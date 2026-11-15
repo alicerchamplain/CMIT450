@@ -211,6 +211,7 @@ def run_sweep(
     fetch = make_fetch(client)
     stored = 0
     requests = 0
+    uncounted = 0
     try:
         for entry in entries:
             # The database speaks normalized keys; the network speaks the raw slug.
@@ -222,13 +223,18 @@ def run_sweep(
                 next_n, done = load_progress(conn, slug_key, month, day)
                 if done:
                     continue
+                if (slug_key, month, day) not in expected:
+                    # Without a crowd count the walk has no known end and would
+                    # stop at the first hole, so the day is left for a later run.
+                    uncounted += 1
+                    continue
                 gen = sweep_day(
                     fetch,
                     slug,
                     month,
                     day,
                     next_n,
-                    expected.get((slug_key, month, day), 0),
+                    expected[(slug_key, month, day)],
                     gap,
                     cap,
                 )
@@ -270,6 +276,10 @@ def run_sweep(
                     )
     except BudgetExceeded:
         log("budget exceeded")
+    if uncounted:
+        log(
+            f"skipped {uncounted} title-days with no crowd count; run crowd for those days, then sweep again"
+        )
     return stored, requests
 
 
@@ -458,7 +468,12 @@ def parse_args(argv: list[str]):
     sweep.add_argument("--rate", type=float, default=8.0)
     sweep.add_argument("--budget", type=int, default=230000)
     sweep.add_argument("--cap", type=int, default=None)
-    sweep.add_argument("--count-only-above", type=int, default=10000)
+    sweep.add_argument(
+        "--count-only-above",
+        type=int,
+        default=700,
+        help="average pages per day at which a title is counted, not swept",
+    )
     sweep.add_argument("--today", type=date.fromisoformat, default=None)
     sweep.add_argument(
         "--unfrozen", action="store_true", help="skip the SHA256SUMS check"

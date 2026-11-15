@@ -41,10 +41,28 @@ def recent_days(today: date, n: int) -> list[tuple[int, int]]:
     return collect
 
 
+# How far to look past the apparent end of a day, as a share of its size: a day
+# that ends at counter 128 is checked for 128 // 4 = 32 more counters. In the
+# first night's sweep 88% of the holes of three or more counters were shorter
+# than a quarter of the counter they started at and no longer than 32.
+LOOKAHEAD_SHARE = 4
+
+
 def count_day(
-    probe, slug: str, month: int, day: int, gap: int = 2, max_n: int = 2**20
+    probe,
+    slug: str,
+    month: int,
+    day: int,
+    gap: int = 2,
+    max_n: int = 2**20,
+    lookahead: int = 32,
 ) -> DayCount:
     """Count one title's pages on one day with a doubling probe and bisection
+
+    Removed pages leave holes in the counters. A hole wider than `gap` at a
+    counter the search happens to probe looks like the end of the day, so
+    once the search settles the counters past its answer are checked too,
+    and the search carries on from any page found there.
 
     Args:
         probe: callable taking a path string and returning an Outcome; in
@@ -56,6 +74,8 @@ def count_day(
             tolerate before declaring the end. Defaults to 2.
         max_n (int, optional): never confirm a counter above this; caps the
             cost of a title. Defaults to 2**20 (~1M).
+        lookahead (int, optional): the most counters to check past the
+            apparent end of the day; 0 turns the check off. Defaults to 32.
 
     Returns:
         DayCount: highest counter found, probes spent, failures, found paths
@@ -82,16 +102,13 @@ def count_day(
         # The whole window was empty: treat this as the end of the day's pages.
         return None
 
-    # Start at the bare path. If nothing exists at 1 (or in its gap window),
-    # the day has no pages and there is nothing more to probe.
-    first = alive(1)
-    if first is None:
-        highest = 0
-    else:
-        # Doubling phase. `last_hit` is always a counter we have confirmed exists.
-        last_hit = first
-        # Next counter to try. Goes doubles until we overshoot.
+    def climb(last_hit):
+        # Find the last page above `last_hit`, a counter we have confirmed exists.
+        # Doubling phase. Start at the first power of two above the floor and
+        # double until we overshoot.
         n = 2
+        while n <= last_hit:
+            n *= 2
         # `first_miss` will be the first counter whose whole window was empty.
         first_miss = None
         while n <= max_n:
@@ -122,7 +139,33 @@ def count_day(
                 # answer is there or above, so raise the floor.
                 last_hit = found
         # Adjacent last_hit and first_miss means last_hit is the last confirmed page.
-        highest = last_hit
+        return last_hit
+
+    def beyond(last_hit):
+        # Is there a page hidden behind a hole just past `last_hit`? The first
+        # gap + 1 counters after it are already known to be empty, so start
+        # after those. A bigger day earns a longer look, up to `lookahead`.
+        reach = min(last_hit // LOOKAHEAD_SHARE, lookahead)
+        start = last_hit + gap + 2
+        for candidate in range(start, min(start + reach - 1, max_n) + 1):
+            if look(candidate):
+                return candidate
+        return None
+
+    # Start at the bare path. If nothing exists at 1 (or in its gap window),
+    # the day has no pages and there is nothing more to probe.
+    first = alive(1)
+    if first is None:
+        highest = 0
+    else:
+        highest = climb(first)
+        while True:
+            # The search stops at the first hole it lands in. Look past it,
+            # and if a page turns up, keep counting from that page.
+            hidden = beyond(highest)
+            if hidden is None:
+                break
+            highest = climb(hidden)
 
     # One probe per entry in the memo, so its size is the request count.
     requests = len(seen)
@@ -220,16 +263,19 @@ def load_expected(conn: Connection) -> dict[tuple[str, int, int], int]:
 
 
 def count_only_slugs(conn: Connection, threshold: int) -> set[str]:
-    """Function to find slugs at or above a threshold
+    """Function to find slugs that average at or above a threshold of pages per day
+
+    The average is over the days counted for that slug. A sum would grow with
+    every day added to the crowd table until every busy title crossed it.
 
     Args:
         conn (Connection): SQL db connection
-        threshold (int): The threshold to search by
+        threshold (int): Average pages per counted day to search by
 
     Returns:
         set[str]: A set of slugs at or above the threshold
     """
-    sql = "SELECT slug FROM crowd GROUP by slug HAVING SUM(highest) >= ?"
+    sql = "SELECT slug FROM crowd GROUP BY slug HAVING AVG(highest) >= ?"
     rows = conn.execute(sql, (threshold,)).fetchall()
     return {row["slug"] for row in rows}
 

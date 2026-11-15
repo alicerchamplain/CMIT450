@@ -296,6 +296,14 @@ def seed_crowd(conn, rows):
         save_day_count(conn, DayCount(slug, month, day, highest, 1, 0, []), 0.0)
 
 
+@pytest.fixture
+def counted(conn):
+    """A crowd count of 0 for every title-day these tests sweep. run_sweep only
+    walks a day that has been counted; 0 leaves the walk ending at the gap."""
+    seed_crowd(conn, [(e.slug, m, d, 0) for e in ENTRIES for m, d in DAYS])
+    return conn
+
+
 def stored_paths(conn):
     return [r["path"] for r in conn.execute("SELECT path FROM pages ORDER BY id")]
 
@@ -310,7 +318,7 @@ def test_make_fetch_returns_the_whole_fetch_with_content():
     assert fetch("Hello-10-23").outcome is Outcome.NOT_FOUND
 
 
-def test_run_sweep_stores_every_page_of_every_day(conn):
+def test_run_sweep_stores_every_page_of_every_day(conn, counted):
     client, _ = make_sweep_client({"Hello-10-24", "Hello-10-24-2", "Povіstka-10-23"})
     stored, requests = run_sweep(
         conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None
@@ -323,7 +331,7 @@ def test_run_sweep_stores_every_page_of_every_day(conn):
     assert client.requests_made == requests
 
 
-def test_run_sweep_registers_titles_and_links_pages_to_them(conn):
+def test_run_sweep_registers_titles_and_links_pages_to_them(conn, counted):
     client, _ = make_sweep_client({"Hello-10-24"})
     run_sweep(conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None)
     row = conn.execute(
@@ -332,7 +340,7 @@ def test_run_sweep_registers_titles_and_links_pages_to_them(conn):
     assert row["slug"] == "hello"
 
 
-def test_run_sweep_stores_redacted_content(conn):
+def test_run_sweep_stores_redacted_content(conn, counted):
     client, session = make_sweep_client({"Hello-10-24"})
     # make the fixture body carry a secret in the title
     orig = session.get
@@ -352,7 +360,7 @@ def test_run_sweep_stores_redacted_content(conn):
     assert "SECRET{" in title
 
 
-def test_run_sweep_records_progress_per_day(conn):
+def test_run_sweep_records_progress_per_day(conn, counted):
     client, _ = make_sweep_client({"Hello-10-24", "Hello-10-24-2"})
     run_sweep(conn, client, ENTRIES, DAYS, KEY, 1, None, set(), log=lambda s: None)
     assert load_progress(conn, "Hello", 10, 24) == (5, True)  # 1, 2 found; 3, 4 miss
@@ -363,7 +371,7 @@ def test_run_sweep_records_progress_per_day(conn):
     assert (row["requests"], row["failures"]) == (4, 0)
 
 
-def test_run_sweep_skips_excluded_slugs_entirely(conn):
+def test_run_sweep_skips_excluded_slugs_entirely(conn, counted):
     client, session = make_sweep_client({"Hello-10-24", "Povіstka-10-23"})
     stored, _ = run_sweep(
         conn, client, ENTRIES, DAYS, KEY, 0, None, {"hello"}, log=lambda s: None
@@ -373,7 +381,7 @@ def test_run_sweep_skips_excluded_slugs_entirely(conn):
     assert load_progress(conn, "Hello", 10, 24) == (1, False)
 
 
-def test_run_sweep_skips_days_already_done(conn):
+def test_run_sweep_skips_days_already_done(conn, counted):
     client1, _ = make_sweep_client({"Hello-10-24"})
     run_sweep(conn, client1, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None)
     client2, session2 = make_sweep_client({"Hello-10-24"})
@@ -384,7 +392,7 @@ def test_run_sweep_skips_days_already_done(conn):
     assert session2.paths == []
 
 
-def test_run_sweep_resumes_a_day_cut_off_by_the_budget(conn):
+def test_run_sweep_resumes_a_day_cut_off_by_the_budget(conn, counted):
     existing = {"Hello-10-23", "Hello-10-23-2", "Hello-10-23-3", "Hello-10-23-4"}
     # Night one: budget allows 1, 2 and the request for 3 is refused.
     client1, session1 = make_sweep_client(existing, budget=2)
@@ -409,7 +417,7 @@ def test_run_sweep_resumes_a_day_cut_off_by_the_budget(conn):
     ]
 
 
-def test_run_sweep_budget_exceeded_is_logged_not_raised(conn):
+def test_run_sweep_budget_exceeded_is_logged_not_raised(conn, counted):
     client, _ = make_sweep_client({"Hello-10-23", "Hello-10-23-2"}, budget=1)
     lines = []
     stored, _ = run_sweep(
@@ -419,7 +427,7 @@ def test_run_sweep_budget_exceeded_is_logged_not_raised(conn):
     assert any("budget" in line for line in lines)
 
 
-def test_run_sweep_uses_expected_from_the_crowd_table(conn):
+def test_run_sweep_uses_expected_from_the_crowd_table(conn, counted):
     # Pages at 1 and 5; crowd says the day reaches 5. gap 0 would otherwise stop at 2.
     seed_crowd(conn, [("Hello", 10, 23, 5)])
     client, session = make_sweep_client({"Hello-10-23", "Hello-10-23-5"})
@@ -430,7 +438,7 @@ def test_run_sweep_uses_expected_from_the_crowd_table(conn):
     assert "Hello-10-23-5" in session.paths
 
 
-def test_run_sweep_cap_truncates_a_day(conn):
+def test_run_sweep_cap_truncates_a_day(conn, counted):
     existing = {f"Hello-10-23-{n}" for n in range(2, 10)} | {"Hello-10-23"}
     seed_crowd(conn, [("Hello", 10, 23, 9)])
     client, session = make_sweep_client(existing)
@@ -441,7 +449,7 @@ def test_run_sweep_cap_truncates_a_day(conn):
     assert load_progress(conn, "Hello", 10, 23) == (4, True)
 
 
-def test_run_sweep_failed_tail_leaves_the_day_for_retry(conn):
+def test_run_sweep_failed_tail_leaves_the_day_for_retry(conn, counted):
     client, _ = make_sweep_client(
         {"Hello-10-23"}, failing={"Hello-10-23-2", "Hello-10-23-3"}
     )
@@ -454,7 +462,7 @@ def test_run_sweep_failed_tail_leaves_the_day_for_retry(conn):
     assert any("Hello" in line and "10-23" in line for line in lines)
 
 
-def test_run_sweep_logs_days_with_pages_only(conn):
+def test_run_sweep_logs_days_with_pages_only(conn, counted):
     client, _ = make_sweep_client({"Hello-10-24"})
     lines = []
     run_sweep(conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lines.append)
@@ -462,7 +470,7 @@ def test_run_sweep_logs_days_with_pages_only(conn):
     assert "Hello" in lines[0] and "10-24" in lines[0]
 
 
-def test_run_sweep_logs_every_request(conn):
+def test_run_sweep_logs_every_request(conn, counted):
     client, _ = make_sweep_client({"Hello-10-24"})
     client.log = __import__("graphwatch.db", fromlist=["http_logger"]).http_logger(conn)
     run_sweep(conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lambda s: None)
@@ -472,7 +480,7 @@ def test_run_sweep_logs_every_request(conn):
     )
 
 
-def test_run_sweep_stores_the_api_path_not_the_requested_one(conn):
+def test_run_sweep_stores_the_api_path_not_the_requested_one(conn, counted):
     client, session = make_sweep_client({"hello-10-24"})
     # The API answers for Hello-10-24 but reports its own spelling.
     orig = session.get
@@ -488,6 +496,68 @@ def test_run_sweep_stores_the_api_path_not_the_requested_one(conn):
     assert stored_paths(conn) == ["hello-10-24"]
     # progress is keyed by the slug we swept, case-insensitively
     assert load_progress(conn, "Hello", 10, 24)[1] is True
+
+
+def test_run_sweep_skips_a_title_day_that_has_no_crowd_count(conn):
+    # With no count the walk would stop at the first hole of gap + 1 counters,
+    # which is how 2 to 4 November lost pages. Nothing is fetched or marked done.
+    client, session = make_sweep_client({"Hello-10-24", "Hello-10-24-2"})
+    lines = []
+    stored, requests = run_sweep(
+        conn, client, ENTRIES[:1], [(10, 24)], KEY, 2, None, set(), log=lines.append
+    )
+    assert (stored, requests) == (0, 0)
+    assert session.paths == []
+    assert load_progress(conn, "Hello", 10, 24) == (1, False)
+    assert len(lines) == 1
+    assert "1 title-days" in lines[0] and "crowd" in lines[0]
+
+
+def test_run_sweep_sweeps_the_counted_days_and_reports_the_rest(conn):
+    seed_crowd(conn, [("Hello", 10, 24, 2)])
+    client, session = make_sweep_client({"Hello-10-23", "Hello-10-24", "Hello-10-24-2"})
+    lines = []
+    stored, _ = run_sweep(
+        conn, client, ENTRIES, DAYS, KEY, 0, None, set(), log=lines.append
+    )
+    assert stored == 2
+    assert stored_paths(conn) == ["Hello-10-24", "Hello-10-24-2"]
+    assert not any(path.startswith("Hello-10-23") for path in session.paths)
+    assert load_progress(conn, "Hello", 10, 24)[1] is True
+    assert load_progress(conn, "Hello", 10, 23)[1] is False
+    # Hello 10-23 and both Povіstka days have no count
+    assert any("3 title-days" in line for line in lines)
+
+
+def test_run_sweep_a_counted_empty_day_is_swept_and_closed(conn):
+    # A count of 0 is a count: the day costs its gap probes and is marked done.
+    seed_crowd(conn, [("Hello", 10, 24, 0)])
+    client, session = make_sweep_client(set())
+    lines = []
+    _, requests = run_sweep(
+        conn, client, ENTRIES[:1], [(10, 24)], KEY, 2, None, set(), log=lines.append
+    )
+    assert requests == 3
+    assert load_progress(conn, "Hello", 10, 24) == (4, True)
+    assert lines == []
+
+
+def test_run_sweep_does_not_report_a_done_day_whose_count_is_gone(conn, counted):
+    client, _ = make_sweep_client({"Hello-10-24"})
+    run_sweep(conn, client, ENTRIES[:1], [(10, 24)], KEY, 0, None, set(), log=lambda s: None)
+    conn.execute("DELETE FROM crowd")
+    lines = []
+    client2, session2 = make_sweep_client({"Hello-10-24"})
+    run_sweep(conn, client2, ENTRIES[:1], [(10, 24)], KEY, 0, None, set(), log=lines.append)
+    assert session2.paths == []
+    assert lines == []
+
+
+def test_run_sweep_does_not_report_excluded_slugs_as_uncounted(conn):
+    client, _ = make_sweep_client(set())
+    lines = []
+    run_sweep(conn, client, ENTRIES[:1], DAYS, KEY, 0, None, {"hello"}, log=lines.append)
+    assert lines == []
 
 
 # --------------------------------------------------------------------------
@@ -565,6 +635,11 @@ def test_main_crowd_takes_today_so_the_nightly_job_can_count_a_finished_day(work
 
 
 def test_main_sweep_prints_the_plan_then_stops_on_the_budget(workdir, capsys):
+    # The sweep only walks counted days, so count both (empty) days first.
+    c = connect(workdir / "g.sqlite")
+    save_day_count(c, DayCount("Hello", 10, 31, 0, 1, 0, []), 0.0)
+    save_day_count(c, DayCount("Hello", 11, 1, 0, 1, 0, []), 0.0)
+    c.close()
     main(
         [
             "--config",

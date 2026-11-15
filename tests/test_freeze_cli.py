@@ -10,6 +10,8 @@ import hashlib
 import pytest
 
 from graphwatch.cli import load_frozen, main, parse_args, run_freeze
+from graphwatch.crowd import DayCount, save_day_count
+from graphwatch.db import connect
 from graphwatch.slugify import SUMS_FILE, read_sums, verify_wordlists
 
 
@@ -174,6 +176,10 @@ def test_main_sweep_refuses_changed_lists_after_the_key_check(workdir):
 
 def test_main_sweep_unfrozen_runs_with_changed_lists(workdir, capsys):
     (workdir / "wordlists" / "greetings.txt").write_text("Hello\nTest\n", encoding="utf-8")
+    # The sweep only walks counted days; a count lets it reach the budget stop.
+    c = connect(workdir / "g.sqlite")
+    save_day_count(c, DayCount("Hello", 11, 1, 0, 1, 0, []), 0.0)
+    c.close()
     main(
         [
             "--config",

@@ -191,9 +191,90 @@ def test_requests_equals_probe_calls():
 
 
 def test_busy_day_costs_far_fewer_probes_than_pages():
-    # Exponential probe then bisection: 154 pages in well under 154 requests.
+    # Exponential probe then bisection, then a look past the end that is
+    # capped at 32 counters: 154 pages in well under 154 requests.
     result, probe = check(existing=range(1, 155), gap=2)
-    assert result.requests <= 40
+    assert result.requests <= 60
+    assert check(existing=range(1, 155), gap=2, lookahead=0)[0].requests <= 40
+
+
+# --------------------------------------------------------------------------
+# Looking past the end: a hole wider than the gap must not end the count
+# --------------------------------------------------------------------------
+
+# Hello on 3 November 2026: counters 128 to 130 were gone and the doubling
+# probe landed exactly on them, so the count came back as 127 of 160.
+HELLO_11_03 = [*range(1, 128), *range(131, 161)]
+
+
+def test_a_hole_at_a_doubling_probe_does_not_end_the_count():
+    result, _ = check(existing=HELLO_11_03, gap=2)
+    assert result.highest == 160
+
+
+def test_lookahead_zero_is_the_old_rule_and_stops_at_the_hole():
+    result, _ = check(existing=HELLO_11_03, gap=2, lookahead=0)
+    assert result.highest == 127
+
+
+def test_a_hole_at_a_bisection_probe_does_not_end_the_count():
+    # Doubling passes 128 and misses at 256; the first midpoint is 192, which
+    # sits in a hole of three with pages on both sides.
+    existing = [*range(1, 192), *range(195, 221)]
+    assert check(existing=existing, gap=2, lookahead=0)[0].highest == 191
+    assert check(existing=existing, gap=2)[0].highest == 220
+
+
+def test_the_count_carries_on_past_several_holes():
+    existing = [*range(1, 128), *range(131, 161), *range(170, 201), *range(205, 231)]
+    result, _ = check(existing=existing, gap=2)
+    assert result.highest == 230
+
+
+def test_a_hole_longer_than_the_look_still_ends_the_count():
+    # 40 pages earn a look of 40 // 4 = 10 counters past the gap window (44 to
+    # 53), so a hole of 14 is the end of the day as far as the count can tell.
+    # The far pages stop at 62 so the doubling probe at 64 does not find them.
+    existing = [*range(1, 41), *range(55, 63)]
+    result, _ = check(existing=existing, gap=2)
+    assert result.highest == 40
+
+
+def test_the_look_grows_with_the_day_and_is_capped_by_lookahead():
+    # After 40 the gap window covers 41 to 43 and the look covers 44 to 53.
+    assert check(existing=[*range(1, 41), 53], gap=2)[0].highest == 53
+    assert check(existing=[*range(1, 41), 54], gap=2)[0].highest == 40
+    # A cap of 4 shortens it to 44 to 47. (48 to 50 is a bisection window, so
+    # the page just outside the look is put at 51.)
+    assert check(existing=[*range(1, 41), 47], gap=2, lookahead=4)[0].highest == 47
+    assert check(existing=[*range(1, 41), 51], gap=2, lookahead=4)[0].highest == 40
+
+
+def test_the_look_past_the_end_is_at_most_lookahead_probes():
+    # Fewer than 32 here: bisection already asked about some of those counters.
+    plain, _ = check(existing=range(1, 1001), gap=2, lookahead=0)
+    looked, _ = check(existing=range(1, 1001), gap=2)
+    assert looked.highest == plain.highest == 1000
+    assert plain.requests < looked.requests <= plain.requests + 32
+
+
+def test_small_days_cost_exactly_what_they_did_before():
+    # Under four pages the look is 0 counters, so nothing extra is asked.
+    for pages in (0, 1, 2, 3):
+        plain, _ = check(existing=range(1, pages + 1), gap=2, lookahead=0)
+        looked, _ = check(existing=range(1, pages + 1), gap=2)
+        assert looked.requests == plain.requests
+
+
+def test_the_look_past_the_end_stops_at_max_n():
+    result, probe = check(existing=range(1, 101), gap=2, max_n=100)
+    assert result.highest == 100
+    assert not any(path.endswith(("-101", "-102", "-110")) for path in probe.calls)
+
+
+def test_looking_past_the_end_never_probes_a_path_twice():
+    _, probe = check(existing=HELLO_11_03, gap=2)
+    assert len(probe.calls) == len(set(probe.calls))
 
 
 def test_empty_day_costs_only_the_gap_window():
@@ -413,14 +494,42 @@ def seed(conn, rows):
         save_day_count(conn, DayCount(slug, month, day, highest, 1, 0, []), 0.0)
 
 
-def test_count_only_slugs_sums_pages_across_days(conn):
-    seed(conn, [("Big", 10, 31, 6_000), ("Big", 11, 1, 4_000), ("Small", 11, 1, 9_999)])
-    assert count_only_slugs(conn, 10_000) == {"big"}
+def test_count_only_slugs_averages_pages_per_counted_day(conn):
+    # Big averages 800 a day over two days; Small never gets near it.
+    seed(conn, [("Big", 10, 31, 1_000), ("Big", 11, 1, 600), ("Small", 11, 1, 699)])
+    assert count_only_slugs(conn, 700) == {"big"}
+
+
+def test_count_only_slugs_does_not_grow_with_the_number_of_days(conn):
+    # 184 pages a day for 60 days is 11,040 in total, which a sum over the
+    # table would exclude at 10,000. This is Hello; it must stay swept.
+    seed(conn, [("Hello", 10, d, 184) for d in range(1, 31)])
+    seed(conn, [("Hello", 11, d, 184) for d in range(1, 31)])
+    assert count_only_slugs(conn, 700) == set()
+
+
+def test_count_only_slugs_one_burst_day_does_not_exclude_a_quiet_title(conn):
+    # 9,200 pages on one day out of 42 averages about 240 a day.
+    seed(conn, [("Free", 10, d, 20) for d in range(1, 32)])
+    seed(conn, [("Free", 11, d, 20) for d in range(1, 11)])
+    seed(conn, [("Free", 11, 11, 9_200)])
+    assert count_only_slugs(conn, 700) == set()
+
+
+def test_count_only_slugs_a_title_busy_every_day_is_excluded(conn):
+    seed(conn, [("Links", 10, d, 12_000) for d in range(1, 32)])
+    assert count_only_slugs(conn, 700) == {"links"}
+
+
+def test_count_only_slugs_empty_days_pull_the_average_down(conn):
+    # A counted day with no pages is still a day: (2,000 + 0 + 0) / 3 is under 700.
+    seed(conn, [("Burst", 11, 1, 2_000), ("Burst", 11, 2, 0), ("Burst", 11, 3, 0)])
+    assert count_only_slugs(conn, 700) == set()
 
 
 def test_count_only_slugs_threshold_is_inclusive(conn):
-    seed(conn, [("Exact", 11, 1, 10_000)])
-    assert count_only_slugs(conn, 10_000) == {"exact"}
+    seed(conn, [("Exact", 10, 31, 600), ("Exact", 11, 1, 800)])
+    assert count_only_slugs(conn, 700) == {"exact"}
 
 
 def test_count_only_slugs_empty_table(conn):
