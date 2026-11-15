@@ -446,6 +446,7 @@ def parse_args(argv: list[str]):
     crowd.add_argument("--gap", type=int, default=2)
     crowd.add_argument("--rate", type=float, default=8.0)
     crowd.add_argument("--budget", type=int, default=None)
+    crowd.add_argument("--today", type=date.fromisoformat, default=None)
     crowd.add_argument(
         "--unfrozen", action="store_true", help="skip the SHA256SUMS check"
     )
@@ -512,7 +513,7 @@ def main(argv: list[str] | None = None):
         rate_per_s=args.rate, budget=args.budget, log=http_logger(conn)
     )
     if args.command == "crowd":
-        days = recent_days(date.today(), args.days)
+        days = recent_days(args.today or date.today(), args.days)
         started = time.time()
         checked = run_crowd(
             conn,

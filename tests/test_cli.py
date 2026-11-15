@@ -550,6 +550,20 @@ def test_main_crowd_does_not_need_the_config(workdir, capsys):
     assert "checked 0 title-days" in out
 
 
+def test_main_crowd_takes_today_so_the_nightly_job_can_count_a_finished_day(workdir, monkeypatch):
+    # Without --today, crowd counts the current, unfinished day and never
+    # recounts it; the nightly job passes yesterday, the same way sweep does.
+    seen = {}
+
+    def fake_run_crowd(conn, client, entries, days, gap=2, log=print):
+        seen["days"] = days
+        return 0
+
+    monkeypatch.setattr("graphwatch.cli.run_crowd", fake_run_crowd)
+    main(["crowd", *common(workdir), "--days", "2", "--today", "2026-11-13"])
+    assert seen["days"] == [(11, 12), (11, 13)]
+
+
 def test_main_sweep_prints_the_plan_then_stops_on_the_budget(workdir, capsys):
     main(
         [
