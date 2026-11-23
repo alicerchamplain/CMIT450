@@ -24,6 +24,8 @@ POINTER_TITLE = (
     + "}?dGViaQ==?eWVsNA==?czMucmVkYXJvZGFzLmNvbQ=="
 )
 SPOOF_TITLE = "www.tenable.com@agfc.harper18.workers.dev/"
+AG_TITLE = "primewire.ag@agfc.harper18.workers.dev/"
+HEX_HOST = b"s3.redarodas.com".hex()
 
 
 def fixture_page(name: str) -> dict:
@@ -39,17 +41,13 @@ def pairs(indicators) -> list[tuple[str, str]]:
     return [(i.kind, i.value) for i in indicators]
 
 
-def of_kind(indicators, kind: str) -> list[str]:
-    return [i.value for i in indicators if i.kind == kind]
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
 
 
 # --------------------------------------------------------------------------
 # the record
 # --------------------------------------------------------------------------
-
-
-def test_kinds_are_the_five_planned():
-    assert {"ip", "host", "url", "decoy", "token"} == KINDS
 
 
 def test_indicator_is_a_frozen_record():
@@ -58,9 +56,9 @@ def test_indicator_is_a_frozen_record():
         indicator.value = "1.1.1.1"
 
 
-def test_every_extracted_kind_is_a_known_kind():
-    found = extract(POINTER_TITLE, POINTER_TITLE + "\nd\nhttp://a.com/x deadbeef" * 2)
-    assert {i.kind for i in found} <= KINDS
+def test_one_page_can_give_all_five_kinds_and_there_is_no_sixth():
+    found = extract(POINTER_TITLE, POINTER_TITLE + "\nd\nhttp://a.com/x")
+    assert {i.kind for i in found} == KINDS == {"ip", "host", "url", "decoy", "token"}
 
 
 # --------------------------------------------------------------------------
@@ -68,53 +66,65 @@ def test_every_extracted_kind_is_a_known_kind():
 # --------------------------------------------------------------------------
 
 
-def test_pointer_title_gives_the_ip_the_front_and_the_decoy():
+def test_pointer_title_gives_the_decoy_the_front_the_ip_the_tokens_and_the_hidden_host():
+    # The two hashed fields give nothing: 64 hex digits would otherwise be tokens.
     found = extract(POINTER_TITLE, POINTER_TITLE + "\nHello,+world!\nHello,+world!")
-    assert of_kind(found, "ip") == ["207.246.108.214"]
-    assert of_kind(found, "decoy") == ["onmedservice.com.ua"]
-    assert "opportunizz.pro" in of_kind(found, "host")
-
-
-def test_pointer_title_decodes_the_hidden_host():
-    found = extract(POINTER_TITLE, POINTER_TITLE)
-    hidden = [i for i in found if i.value == "s3.redarodas.com"]
-    assert hidden == [Indicator("host", "s3.redarodas.com", "title:base64")]
-
-
-def test_pointer_title_keeps_the_undecodable_fields_as_tokens():
-    found = extract(POINTER_TITLE, POINTER_TITLE)
-    assert of_kind(found, "token") == [
-        "dGViaQ==",
-        "eWVsNA==",
-        "czMucmVkYXJvZGFzLmNvbQ==",
+    assert found == [
+        Indicator("decoy", "onmedservice.com.ua", "title"),
+        Indicator("host", "opportunizz.pro", "title"),
+        Indicator("ip", "207.246.108.214", "title"),
+        Indicator("token", "dGViaQ==", "title"),
+        Indicator("token", "eWVsNA==", "title"),
+        Indicator("token", "czMucmVkYXJvZGFzLmNvbQ==", "title"),
+        Indicator("host", "s3.redarodas.com", "title:base64"),
     ]
 
 
-def test_pointer_fixture_extracts_a_public_ip_and_a_front_host():
+def test_pointer_fixture_gives_a_decoy_a_front_an_ip_and_two_tokens_all_from_the_title():
     page = fixture_page("Hello-10-17-154")
     found = extract(page["title"], page_text(page))
-    assert len(of_kind(found, "ip")) == 1
-    assert len(of_kind(found, "decoy")) == 1
-    assert len(of_kind(found, "host")) >= 1
-    assert all(i.source.startswith("title") for i in found)
-
-
-def test_spoof_url_right_side_is_the_indicator_and_left_side_the_decoy():
-    found = extract(SPOOF_TITLE, SPOOF_TITLE + "\nHello,+world!\nHello,+world!")
-    assert pairs(found) == [
-        ("decoy", "www.tenable.com"),
-        ("host", "agfc.harper18.workers.dev"),
+    assert [(i.kind, i.source) for i in found] == [
+        ("decoy", "title"),
+        ("host", "title"),
+        ("ip", "title"),
+        ("token", "title"),
+        ("token", "title"),
     ]
 
 
-def test_a_decoy_is_never_reported_as_a_host_anywhere_on_the_page():
+@pytest.mark.parametrize("title", [SPOOF_TITLE, SPOOF_TITLE.upper()])
+def test_spoof_url_right_side_is_the_indicator_and_left_side_the_decoy_both_lowercased(title):
+    # From the title, whatever its case: the text repeats it and comes second
+    found = extract(title, title + "\nHello,+world!\nHello,+world!")
+    assert found == [
+        Indicator("decoy", "www.tenable.com", "title"),
+        Indicator("host", "agfc.harper18.workers.dev", "title"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "title, text, expected",
+    [
+        (
+            SPOOF_TITLE.upper(),
+            SPOOF_TITLE.upper() + "\n\nvisit www.tenable.com today",
+            [("decoy", "www.tenable.com"), ("host", "agfc.harper18.workers.dev")],
+        ),
+        (
+            # The bait is named before the spoof that makes it bait
+            "",
+            "www.tenable.com is at http://www.tenable.com@agfc.harper18.workers.dev/a",
+            [
+                ("decoy", "www.tenable.com"),
+                ("host", "agfc.harper18.workers.dev"),
+                ("url", "http://www.tenable.com@agfc.harper18.workers.dev/a"),
+            ],
+        ),
+    ],
+)
+def test_a_decoy_is_never_reported_as_a_host_anywhere_on_the_page(title, text, expected):
     # The bait host repeated in the body must not reach enrichment as a C2.
-    found = extract(SPOOF_TITLE, SPOOF_TITLE + "\n\nvisit www.tenable.com today")
-    assert "www.tenable.com" not in of_kind(found, "host")
-    assert of_kind(found, "decoy") == ["www.tenable.com"]
-
-
-AG_TITLE = "primewire.ag@agfc.harper18.workers.dev/"
+    assert pairs(extract(title, text)) == expected
 
 
 def test_a_title_spoof_with_an_unlisted_decoy_still_gives_the_front_host():
@@ -128,16 +138,8 @@ def test_a_title_spoof_with_an_unlisted_decoy_still_gives_the_front_host():
 
 
 def test_the_looser_spoof_pattern_is_not_used_on_body_text():
-    found = extract("Netflix", "Netflix\n\nlogin solano.elsa@icloud.com today")
+    found = extract("Netflix", "Netflix\n\nlogin first.last@icloud.com today")
     assert found == []
-
-
-def test_spoof_hosts_are_lowercased():
-    found = extract("WWW.TENABLE.COM@AGFC.HARPER18.WORKERS.DEV/", "")
-    assert pairs(found) == [
-        ("decoy", "www.tenable.com"),
-        ("host", "agfc.harper18.workers.dev"),
-    ]
 
 
 def test_a_spoof_inside_a_url_keeps_the_whole_url_too():
@@ -163,8 +165,9 @@ def test_an_ip_with_a_port_is_the_ip():
     assert pairs(body("connect 45.77.93.187:8443")) == [("ip", "45.77.93.187")]
 
 
-def test_a_longer_dotted_number_is_not_an_ip():
-    assert body("build 1.2.3.4.5") == []
+@pytest.mark.parametrize("text", ["build 1.2.3.4.5", "WhatsApp v2.22.23.12", "build_8.8.8.8"])
+def test_a_longer_dotted_number_or_a_version_string_is_not_an_ip(text):
+    assert body(text) == []
 
 
 def test_bare_hostnames_are_extracted_lowercased():
@@ -174,18 +177,42 @@ def test_bare_hostnames_are_extracted_lowercased():
     ]
 
 
-def test_a_word_with_an_unknown_ending_is_not_a_host():
-    assert body("read notes.txt and setup.py and solano.elsa") == []
+@pytest.mark.parametrize(
+    "text",
+    [
+        "read notes.txt and setup.py and first.last",  # no known ending
+        "see photo.jpg",  # .jp is known, .jpg is not
+        "node cdn.us-east-1",  # the name goes on after .us
+        # The domain of an address is where mail goes, not a pointer
+        "write to bob@gmail.com or first.last@icloud.com",
+        "write to bob@my-mail.com",
+        # nor is a local part that ends like a domain. The provider ends in
+        # .kg, outside the TLD list, so this row is about the host scan alone:
+        # with a listed provider on the right (ivan.pro@gmail.com) the spoof
+        # pattern takes the address for decoy@host today, and no row here
+        # says whether it should
+        "write to ivan.pro@yandex.kg",
+    ],
+)
+def test_a_file_name_a_longer_name_or_an_email_gives_no_host(text):
+    assert body(text) == []
 
 
-def test_an_email_gives_no_host():
-    # The domain of an address is where mail goes, not a pointer.
-    assert of_kind(body("write to bob@gmail.com or first.last@icloud.com"), "host") == []
-
-
-def test_urls_are_extracted_whole():
-    found = body("get https://example.com/a/b?c=d&e=f here")
-    assert pairs(found) == [("url", "https://example.com/a/b?c=d&e=f")]
+@pytest.mark.parametrize(
+    "text, url",
+    [
+        ("get https://example.com/a/b?c=d&e=f here", "https://example.com/a/b?c=d&e=f"),
+        ("get HTTP://Example.com/x here", "HTTP://Example.com/x"),  # kept as written
+        ('"url": "http://example.com/x"', "http://example.com/x"),
+        ("url = 'http://example.com/x'", "http://example.com/x"),
+        ("<http://example.com/x>", "http://example.com/x"),
+        ("http://example.com/x<br>", "http://example.com/x"),
+        # every character of URL_TRAILING: sentence punctuation, not the URL's
+        ("was it http://example.com/x.,;:!?)]} or not", "http://example.com/x"),
+    ],
+)
+def test_a_url_is_extracted_whole_and_ends_at_a_space_a_quote_a_bracket_or_the_sentence(text, url):
+    assert pairs(body(text)) == [("url", url)]
 
 
 def test_a_url_does_not_also_report_its_host_or_ip():
@@ -193,9 +220,9 @@ def test_a_url_does_not_also_report_its_host_or_ip():
     assert pairs(found) == [("url", "http://example.com/x"), ("url", "http://8.8.8.8/y")]
 
 
-def test_sentence_punctuation_after_a_url_is_dropped():
-    assert pairs(body("go to http://example.com/x.")) == [("url", "http://example.com/x")]
-    assert pairs(body("(see http://example.com/x)")) == [("url", "http://example.com/x")]
+def test_an_address_behind_another_scheme_is_no_url_but_still_an_ip_or_a_host():
+    found = body("tcp://45.77.93.187:8443 or ftp://files.example.com/x")
+    assert pairs(found) == [("ip", "45.77.93.187"), ("host", "files.example.com")]
 
 
 def test_a_url_to_a_private_address_or_unknown_host_is_not_an_indicator():
@@ -207,27 +234,22 @@ def test_a_url_to_a_private_address_or_unknown_host_is_not_an_indicator():
 # --------------------------------------------------------------------------
 
 
-def test_a_padded_base64_token_is_kept_even_when_it_decodes_to_nothing_useful():
-    assert pairs(body("key dGViaQ== end")) == [("token", "dGViaQ==")]
-
-
-def test_a_base64_token_that_hides_an_ip_yields_the_ip():
-    token = base64.b64encode(b"45.77.93.18").decode()
-    assert token.endswith("=")
-    found = body(f"x {token} y")
-    assert found == [
-        Indicator("token", token, "text"),
-        Indicator("ip", "45.77.93.18", "text:base64"),
-    ]
-
-
-def test_an_unpadded_base64_token_that_hides_an_ip_yields_the_ip():
-    token = base64.b64encode(b"45.77.93.187").decode()
-    assert not token.endswith("=")
-    assert body(f"x {token} y") == [
-        Indicator("token", token, "text"),
-        Indicator("ip", "45.77.93.187", "text:base64"),
-    ]
+@pytest.mark.parametrize(
+    "token, pointer",
+    [
+        (b64(b"45.77.93.18"), Indicator("ip", "45.77.93.18", "text:base64")),  # ends in =
+        (b64(b"45.77.93.187"), Indicator("ip", "45.77.93.187", "text:base64")),  # no padding
+        (
+            b64(b"http://s3.redarodas.com/a"),
+            Indicator("url", "http://s3.redarodas.com/a", "text:base64"),
+        ),
+        (HEX_HOST, Indicator("host", "s3.redarodas.com", "text:hex")),
+        (HEX_HOST.upper(), Indicator("host", "s3.redarodas.com", "text:hex")),
+        (b"ab.cd.ru".hex(), Indicator("host", "ab.cd.ru", "text:hex")),  # eight pairs: the fewest
+    ],
+)
+def test_a_token_that_hides_a_pointer_yields_the_token_and_then_the_pointer(token, pointer):
+    assert body(f"x {token} y") == [Indicator("token", token, "text"), pointer]
 
 
 def test_long_ordinary_words_are_not_tokens():
@@ -237,31 +259,25 @@ def test_long_ordinary_words_are_not_tokens():
 
 def test_an_unpadded_token_is_not_tried_with_xor():
     hidden = bytes(b ^ 0x5A for b in b"cdn.example.com")
-    token = base64.b64encode(hidden).decode()
+    token = b64(hidden)
     assert not token.endswith("=")
     assert body(f"x {token} y") == []
 
 
-def test_a_version_string_is_not_an_ip():
-    assert body("WhatsApp v2.22.23.12 and build_8.8.8.8") == []
-
-
-def test_a_long_hex_run_is_a_token_and_is_decoded():
-    token = b"s3.redarodas.com".hex()
-    found = body(f"cfg {token} end")
-    assert pairs(found) == [("token", token), ("host", "s3.redarodas.com")]
-    assert found[1].source == "text:hex"
-
-
-def test_a_short_hex_run_is_not_a_token():
-    assert body("color deadbeef") == []
-
-
-def test_a_decoded_url_is_a_url():
-    token = base64.b64encode(b"http://s3.redarodas.com/a").decode()
-    assert token.endswith("=")
-    found = body(token)
-    assert ("url", "http://s3.redarodas.com/a") in pairs(found)
+@pytest.mark.parametrize(
+    "text",
+    [
+        b"a.cd.ru".hex(),  # seven pairs: one too few
+        f"0{HEX_HOST}",  # an odd number of digits is not pairs
+        # inside a longer word
+        f"g{HEX_HOST}",
+        f"G{HEX_HOST}",
+        f"{HEX_HOST}g",
+        f"{HEX_HOST}G",
+    ],
+)
+def test_a_hex_run_that_is_short_odd_or_inside_a_longer_word_is_not_a_token(text):
+    assert body(f"cfg {text} end") == []
 
 
 def test_hashed_secrets_are_never_tokens():
@@ -312,7 +328,6 @@ def test_benign_fixtures_give_no_pointer_from_the_decoders():
     [
         ("45.77.93.187", "ip"),
         ("45.77.93.187:8443", "ip"),
-        ("s3.redarodas.com", "host"),
         ("s3.redarodas.com:443", "host"),
         ("http://s3.redarodas.com/", "url"),
         ("HTTPS://45.77.93.187/", "url"),

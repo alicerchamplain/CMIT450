@@ -4,6 +4,8 @@ Every test writes its own config file under tmp_path. Nothing here reads the
 real ~/.config/graphwatch/config.env.
 """
 
+import logging
+
 import pytest
 
 from graphwatch.config import CONFIG, hmac_key, load_config
@@ -28,8 +30,9 @@ def test_load_config_reads_name_value_pairs(tmp_path):
 
 
 def test_load_config_skips_comments_and_blank_lines(tmp_path):
-    cfg = load_config(write(tmp_path, "# comment\n\n   \nA=1\n  # indented comment\n"))
-    assert cfg == {"A": "1"}
+    # A commented-out setting is a comment too, indented or not.
+    text = "# comment\n\n   \nA=1\n#A=0\n  # indented comment\n  # B=2\n"
+    assert load_config(write(tmp_path, text)) == {"A": "1"}
 
 
 def test_load_config_skips_lines_without_an_equals_sign(tmp_path):
@@ -42,7 +45,7 @@ def test_load_config_strips_spaces_around_name_and_value(tmp_path):
     assert cfg == {"A": "1"}
 
 
-@pytest.mark.parametrize("quoted", ['"abc"', "'abc'"])
+@pytest.mark.parametrize("quoted", ['"abc"', "'abc'", ' "abc" '])
 def test_load_config_strips_surrounding_quotes(tmp_path, quoted):
     cfg = load_config(write(tmp_path, f"A={quoted}\n"))
     assert cfg == {"A": "abc"}
@@ -73,34 +76,33 @@ def test_load_config_missing_file_raises(tmp_path):
         load_config(tmp_path / "nope.env")
 
 
-def test_load_config_does_not_print_or_log_values(tmp_path, capsys):
+def test_load_config_does_not_print_or_log_values(tmp_path, capsys, caplog):
+    caplog.set_level(logging.DEBUG)
     load_config(write(tmp_path, "HMAC_KEY=sensitive\n"))
     out, err = capsys.readouterr()
-    assert "sensitive" not in out + err
+    assert "sensitive" not in out + err + caplog.text
 
 
 # --- hmac_key -------------------------------------------------------------------
 
 
-def test_hmac_key_decodes_hex():
-    assert hmac_key({"HMAC_KEY": "00ff10"}) == b"\x00\xff\x10"
-
-
-def test_hmac_key_decodes_a_64_char_token_hex_to_32_bytes():
-    assert len(hmac_key({"HMAC_KEY": "ab" * 32})) == 32
-
-
-def test_hmac_key_falls_back_to_utf8_for_a_passphrase():
-    assert hmac_key({"HMAC_KEY": "correct horse"}) == b"correct horse"
-
-
-def test_hmac_key_odd_length_hex_like_string_is_treated_as_a_passphrase():
-    # "abc" is not valid hex (odd length), so it is a passphrase, not an error.
-    assert hmac_key({"HMAC_KEY": "abc"}) == b"abc"
-
-
-def test_hmac_key_non_ascii_passphrase():
-    assert hmac_key({"HMAC_KEY": "пароль"}) == "пароль".encode("utf-8")
+# Every value below makes a key of 32 bytes or more. The rows are about how
+# the value is read. hmac_key has no minimum length today; if it is given
+# one, none of these should turn red for being short.
+@pytest.mark.parametrize(
+    "value, key",
+    [
+        # a 64-character hex token is decoded to 32 bytes
+        ("00ff10" + "ab" * 29, b"\x00\xff\x10" + b"\xab" * 29),
+        ("00FF10" + "AB" * 29, b"\x00\xff\x10" + b"\xab" * 29),  # in either case
+        # anything else is a passphrase
+        ("correct horse battery staple again", b"correct horse battery staple again"),
+        ("abc" * 21, b"abc" * 21),  # 63 hex digits: odd, so not hex, and not an error
+        ("пароль" * 3, ("пароль" * 3).encode("utf-8")),
+    ],
+)
+def test_hmac_key_is_hex_decoded_or_else_the_utf8_passphrase(value, key):
+    assert hmac_key({"HMAC_KEY": value}) == key
 
 
 def test_hmac_key_missing_raises_key_error():
@@ -109,5 +111,5 @@ def test_hmac_key_missing_raises_key_error():
 
 
 def test_hmac_key_round_trip_through_load_config(tmp_path):
-    cfg = load_config(write(tmp_path, "HMAC_KEY=00ff\n"))
-    assert hmac_key(cfg) == b"\x00\xff"
+    cfg = load_config(write(tmp_path, "HMAC_KEY=" + "00ff" * 16 + "\n"))
+    assert hmac_key(cfg) == b"\x00\xff" * 16

@@ -1,6 +1,14 @@
-"""Shared by every test module: a clock for the tests that time a pattern.
+"""Shared by every test module: a guard that keeps the suite off the network,
+and a clock for the tests that time a pattern.
 
-A page is up to 64 KB and whoever posts it chooses every character, so the
+The guard. Every client takes a fake session, and the tests of main stay
+offline through --budget 0. Neither holds when the code under test is wrong:
+with the budget check or the session default broken, a plain `pytest` sent
+real, unpaced requests to Telegraph and to the four feeds (found on 22
+November by breaking those lines on purpose). So no test can open a
+connection or resolve a name, and a test that tries fails and says where to.
+
+The clock. A page is up to 64 KB and whoever posts it chooses every character, so the
 suite holds tests that a pattern stays quick on a long run. Their limit is one
 second, chosen on the laptop, where a good pattern takes a tenth of that and a
 bad one took 4 to 54 seconds.
@@ -19,9 +27,46 @@ chosen.
 """
 
 import re
+import socket
 import time
 
 import pytest
+
+
+class NetworkUse(OSError):
+    """Raised in place of a connection or a name lookup
+
+    An OSError, because that is what a real failure to connect is: the code
+    under test handles it the way it would handle the network being down.
+    """
+
+
+@pytest.fixture(autouse=True)
+def network_refused(monkeypatch):
+    """Keeps every test off the network and fails the one that tried
+
+    Two doors are shut: socket.getaddrinfo, which is where a host name is
+    resolved (a DNS query is traffic too), and socket.socket.connect. The
+    clients turn a failed request into an Outcome or a Verdict and carry on,
+    so the refusal alone would not fail a test; the list checked at the end
+    does.
+    """
+    tried = []
+
+    def refuse_lookup(host, *args, **kwargs):
+        tried.append(str(host))
+        raise NetworkUse(f"the suite is offline; a test looked up {host}")
+
+    def refuse_connect(sock, address, *args, **kwargs):
+        tried.append(str(address))
+        raise NetworkUse(f"the suite is offline; a test connected to {address}")
+
+    monkeypatch.setattr(socket, "getaddrinfo", refuse_lookup)
+    monkeypatch.setattr(socket.socket, "connect", refuse_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse_connect)
+    yield
+    assert not tried, f"this test tried to reach the network: {sorted(set(tried))}"
+
 
 # The yardstick: one pattern over one text, both fixed. The pattern never
 # matches: from every letter it reads up to 400 more, finds no digit and gives

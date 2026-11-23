@@ -11,8 +11,6 @@ import re
 import pytest
 
 from graphwatch.decode import (
-    MAX_POINTER_BYTES,
-    MIN_XOR_BYTES,
     Decoded,
     as_text,
     decode_base64_pointer,
@@ -40,39 +38,28 @@ def xored(data: bytes, key: int) -> bytes:
     return bytes(b ^ key for b in data)
 
 
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
 # --------------------------------------------------------------------------
 # the single decoders
 # --------------------------------------------------------------------------
 
 
-def test_from_base64_decodes_a_padded_token():
+def test_from_base64_decodes_padded_unpadded_and_url_safe():
     assert from_base64("czMucmVkYXJvZGFzLmNvbQ==") == HOST.encode()
-
-
-def test_from_base64_decodes_without_padding():
-    assert from_base64("czMucmVkYXJvZGFzLmNvbQ") == HOST.encode()
-
-
-def test_from_base64_decodes_the_url_safe_alphabet():
-    data = b"http://a.com/?>~"
+    assert from_base64("czMucmVkYXJvZGFzLmNvbQ") == HOST.encode()  # two = missing
+    assert from_base64("NDUuNzcuOTMuMTg") == b"45.77.93.18"  # one = missing
+    data = b"http://a.com/???>~"
     token = base64.urlsafe_b64encode(data).decode()
-    assert "-" in token or "_" in token  # the example really needs the alphabet
+    assert "-" in token and "_" in token  # the example needs both URL-safe characters
     assert from_base64(token) == data
-
-
-@pytest.mark.parametrize("token", ["not base64!", "a", "abcde", "====", "приве"])
-def test_from_base64_returns_none_for_what_is_not_base64(token):
-    assert from_base64(token) is None
 
 
 def test_from_hex_decodes_either_case():
     assert from_hex("6578616d706c652e636f6d") == b"example.com"
     assert from_hex("6578616D706C652E636F6D") == b"example.com"
-
-
-@pytest.mark.parametrize("token", ["abc", "zz", "0x41", "привет"])
-def test_from_hex_returns_none_for_what_is_not_hex(token):
-    assert from_hex(token) is None
 
 
 def test_from_base32_decodes_padded_unpadded_and_lowercase():
@@ -83,59 +70,65 @@ def test_from_base32_decodes_padded_unpadded_and_lowercase():
     assert from_base32(token.lower()) == b"example.com"
 
 
-@pytest.mark.parametrize("token", ["1", "abc01", "!!!!!!!!", "привет"])
-def test_from_base32_returns_none_for_what_is_not_base32(token):
-    assert from_base32(token) is None
+# One token per way of not being the encoding. The Cyrillic ones are refused
+# by the standard library with a different exception from the others.
+@pytest.mark.parametrize(
+    "decoder, token",
+    [
+        (from_base64, "not base64!"),
+        (from_base64, "abcde"),  # no padding makes five characters whole
+        (from_base64, "===="),
+        (from_base64, "приве"),
+        (from_hex, "abc"),  # half a pair
+        (from_hex, "zz"),
+        (from_hex, "привет"),
+        (from_base32, "abc01"),  # 0 and 1 are not in the alphabet
+        (from_base32, "привет"),
+    ],
+)
+def test_a_decoder_returns_none_for_what_is_not_its_encoding(decoder, token):
+    assert decoder(token) is None
 
 
-def test_rot_thirteen_is_the_familiar_one():
-    assert rot("rknzcyr.pbz", 13) == "example.com"
-
-
-def test_rot_keeps_case_digits_and_punctuation():
-    assert rot("Abc-9.Xyz", 1) == "Bcd-9.Yza"
-
-
-@pytest.mark.parametrize("n", range(1, 26))
-def test_rot_is_undone_by_the_complement(n):
-    assert rot(rot("s3.RedArodas.com", n), 26 - n) == "s3.RedArodas.com"
-
-
-def test_rot_leaves_non_ascii_letters_alone():
-    assert rot("привет", 13) == "привет"
+@pytest.mark.parametrize(
+    "token, n, rotated",
+    [
+        ("rknzcyr.pbz", 13, "example.com"),
+        ("Abc-9.Xyz", 1, "Bcd-9.Yza"),  # case, digits and punctuation kept; z wraps to a
+        ("привет", 13, "привет"),
+    ],
+)
+def test_rot_moves_the_ascii_letters_and_nothing_else(token, n, rotated):
+    assert rot(token, n) == rotated
 
 
 def test_as_text_accepts_printable_ascii_only():
-    assert as_text(b"example.com") == "example.com"
-    assert as_text(b"") is None
-    assert as_text(b"exa\x00mple") is None
-    assert as_text(b"line\nbreak") is None
-    assert as_text("é".encode()) is None
+    assert as_text(b" example.com~") == " example.com~"  # bytes 32 and 126, the two ends
+    for raw in (b"", b"\x1fa", b"a\x7f", b"line\nbreak", "é".encode()):
+        assert as_text(raw) is None, raw
 
 
 # --------------------------------------------------------------------------
-# decode_pointer: every encoding finds a host and an IP
+# decode_pointer: every encoding finds the pointer
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("pointer", [HOST, IP])
-def test_decode_pointer_finds_base64(pointer):
-    token = base64.b64encode(pointer.encode()).decode()
-    assert decode_pointer(token, dotted) == [Decoded("base64", pointer)]
+@pytest.mark.parametrize(
+    "encoding, token",
+    [
+        ("base64", "czMucmVkYXJvZGFzLmNvbQ=="),  # the token in the actor's title
+        ("hex", HOST.encode().hex()),
+        ("base32", base64.b32encode(HOST.encode()).decode()),
+    ],
+)
+def test_decode_pointer_finds_each_plain_encoding_and_reports_it_once(encoding, token):
+    # Exactly one: XOR with key 0 would repeat the plain decoding
+    assert decode_pointer(token, dotted) == [Decoded(encoding, HOST)]
 
 
-@pytest.mark.parametrize("pointer", [HOST, IP])
-def test_decode_pointer_finds_hex(pointer):
-    assert Decoded("hex", pointer) in decode_pointer(pointer.encode().hex(), dotted)
-
-
-@pytest.mark.parametrize("pointer", [HOST, IP])
-def test_decode_pointer_finds_base32(pointer):
-    token = base64.b32encode(pointer.encode()).decode()
-    assert Decoded("base32", pointer) in decode_pointer(token, dotted)
-
-
-@pytest.mark.parametrize("n", [1, 5, 13, 25])
+# Both ends, the familiar one, and one of the other 22: an even one, because
+# trying every second rotation would still find 1, 13 and 25
+@pytest.mark.parametrize("n", [1, 8, 13, 25])
 def test_decode_pointer_finds_a_rotation(n):
     token = rot(HOST, 26 - n)
     assert decode_pointer(token, only(HOST)) == [Decoded(f"rot{n}", HOST)]
@@ -143,17 +136,13 @@ def test_decode_pointer_finds_a_rotation(n):
 
 @pytest.mark.parametrize("key", [0x01, 0x5A, 0xFF])
 def test_decode_pointer_finds_single_byte_xor_under_base64(key):
-    token = base64.b64encode(xored(HOST.encode(), key)).decode()
-    assert Decoded(f"base64+xor{key:02x}", HOST) in decode_pointer(token, only(HOST))
+    token = b64(xored(HOST.encode(), key))
+    assert decode_pointer(token, only(HOST)) == [Decoded(f"base64+xor{key:02x}", HOST)]
 
 
 def test_decode_pointer_finds_single_byte_xor_under_hex():
     token = xored(IP.encode(), 0x42).hex()
-    assert Decoded("hex+xor42", IP) in decode_pointer(token, only(IP))
-
-
-def test_the_actor_title_token_decodes_to_its_host():
-    assert decode_pointer("czMucmVkYXJvZGFzLmNvbQ==", dotted) == [Decoded("base64", HOST)]
+    assert decode_pointer(token, only(IP)) == [Decoded("hex+xor42", IP)]
 
 
 # --------------------------------------------------------------------------
@@ -161,20 +150,17 @@ def test_the_actor_title_token_decodes_to_its_host():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("token", ["dGViaQ==", "eWVsNA=="])
-def test_the_actor_short_fields_decode_to_words_and_are_rejected(token):
-    # "tebi" and "yel4": printable, but not pointers.
-    assert as_text(from_base64(token)) in ("tebi", "yel4")
-    assert decode_pointer(token, dotted) == []
-
-
-def test_a_pointer_with_text_around_it_is_not_whole():
-    token = base64.b64encode(b"go to s3.redarodas.com now").decode()
-    assert decode_pointer(token, dotted) == []
-
-
-@pytest.mark.parametrize("token", ["", "hello", "!!!", "2+2=", "привет", "SECRET{ab}"])
-def test_garbage_decodes_to_nothing(token):
+@pytest.mark.parametrize(
+    "token",
+    [
+        "",
+        "привет",
+        "2+2=",  # base64, but of bytes that are not text
+        "dGViaQ==",  # the actor's short field: "tebi", printable but no pointer
+        b64(b"go to s3.redarodas.com now"),  # a pointer with text around it
+    ],
+)
+def test_what_is_not_a_whole_pointer_decodes_to_nothing(token):
     assert decode_pointer(token, dotted) == []
 
 
@@ -185,33 +171,18 @@ def test_accept_never_sees_bytes_that_are_not_printable():
         seen.append(s)
         return False
 
-    decode_pointer(base64.b64encode(bytes(range(200, 216))).decode(), spy)
+    decode_pointer(b64(bytes(range(200, 216))), spy)
+    assert seen  # some keys do make these bytes printable
     assert all(s.isascii() and s.isprintable() for s in seen)
 
 
-def test_accept_decides_and_nothing_is_kept_when_it_says_no():
-    token = base64.b64encode(HOST.encode()).decode()
-    assert decode_pointer(token, lambda s: False) == []
-
-
-def test_xor_is_not_tried_on_short_byte_strings():
-    short = b"a.co"
-    assert len(short) < MIN_XOR_BYTES
-    token = base64.b64encode(xored(short, 0x5A)).decode()
-    assert decode_pointer(token, only("a.co")) == []
-
-
-def test_xor_is_tried_from_the_minimum_length_up():
-    exact = b"ab.cd.ef"
-    assert len(exact) == MIN_XOR_BYTES
-    token = base64.b64encode(xored(exact, 0x5A)).decode()
-    assert decode_pointer(token, only("ab.cd.ef")) == [Decoded("base64+xor5a", "ab.cd.ef")]
-
-
-def test_xor_key_zero_is_not_reported_twice():
-    # Key 0 would repeat the plain decoding.
-    token = base64.b64encode(HOST.encode()).decode()
-    assert decode_pointer(token, only(HOST)) == [Decoded("base64", HOST)]
+def test_xor_is_tried_from_eight_bytes_up():
+    # MIN_XOR_BYTES: seven bytes are left alone, eight are tried
+    seven, eight = "a.bc.de", "ab.cd.ef"
+    assert decode_pointer(b64(xored(seven.encode(), 0x5A)), only(seven)) == []
+    assert decode_pointer(b64(xored(eight.encode(), 0x5A)), only(eight)) == [
+        Decoded("base64+xor5a", eight)
+    ]
 
 
 def test_a_rotation_that_changes_nothing_is_not_a_decoding():
@@ -219,16 +190,16 @@ def test_a_rotation_that_changes_nothing_is_not_a_decoding():
     assert decode_pointer(IP, only(IP)) == []
 
 
-def test_oversized_tokens_are_skipped():
-    big = b"a" * (MAX_POINTER_BYTES + 1)
-    calls = []
-    decode_pointer(big.hex(), lambda s: calls.append(len(s)) or False)
-    assert MAX_POINTER_BYTES + 1 not in calls
+@pytest.mark.parametrize("decode", [decode_pointer, decode_base64_pointer])
+def test_a_pointer_may_be_255_bytes_and_no_longer(decode):
+    # MAX_POINTER_BYTES, in both decoders
+    fits, too_long = "a" * 255, "a" * 256
+    assert decode(b64(fits.encode()), only(fits)) == [Decoded("base64", fits)]
+    assert decode(b64(too_long.encode()), only(too_long)) == []
 
 
-def test_decode_pointer_returns_decoded_records():
-    result = decode_pointer(base64.b64encode(HOST.encode()).decode(), dotted)[0]
-    assert (result.encoding, result.value) == ("base64", HOST)
+def test_a_decoded_record_cannot_be_changed():
+    result = decode_pointer(b64(HOST.encode()), dotted)[0]
     with pytest.raises(AttributeError):
         result.value = "other"
 
@@ -241,17 +212,18 @@ UNPADDED_IP = "NDUuNzcuOTMuMTg3"  # 45.77.93.187: 12 bytes, so no padding
 
 
 def test_decode_base64_pointer_finds_an_unpadded_pointer():
-    assert base64.b64encode(IP.encode()).decode() == UNPADDED_IP
+    assert b64(IP.encode()) == UNPADDED_IP
     assert decode_base64_pointer(UNPADDED_IP, dotted) == [Decoded("base64", IP)]
 
 
-def test_decode_base64_pointer_also_reads_padded_tokens():
-    token = base64.b64encode(HOST.encode()).decode()
-    assert decode_base64_pointer(token, dotted) == [Decoded("base64", HOST)]
-
-
 @pytest.mark.parametrize(
-    "token", ["internationalization", "abcdefghijkl", "YztOEovieQIzZjY8", "", "!!!!"]
+    "token",
+    [
+        "internationalization",  # base64, but of bytes that are not text
+        "dGViaQ",  # "tebi": text, but no pointer
+        "",
+        "!!!!",
+    ],
 )
 def test_decode_base64_pointer_rejects_ordinary_words(token):
     assert decode_base64_pointer(token, dotted) == []
@@ -259,7 +231,7 @@ def test_decode_base64_pointer_rejects_ordinary_words(token):
 
 def test_decode_base64_pointer_does_not_try_xor():
     hidden = b"cdn.example.com"  # 15 bytes: unpadded
-    token = base64.b64encode(xored(hidden, 0x5A)).decode()
+    token = b64(xored(hidden, 0x5A))
     assert not token.endswith("=")
     assert decode_base64_pointer(token, only("cdn.example.com")) == []
     # the full decoder would have found it
@@ -267,10 +239,5 @@ def test_decode_base64_pointer_does_not_try_xor():
 
 
 def test_decode_base64_pointer_does_not_try_hex_or_rotations():
-    assert decode_base64_pointer(b"s3.redarodas.com".hex(), dotted) == []
+    assert decode_base64_pointer(HOST.encode().hex(), dotted) == []
     assert decode_base64_pointer(rot(HOST, 13), only(HOST)) == []
-
-
-def test_decode_base64_pointer_skips_oversized_tokens():
-    token = base64.b64encode(b"a" * (MAX_POINTER_BYTES + 1)).decode()
-    assert decode_base64_pointer(token, lambda s: True) == []

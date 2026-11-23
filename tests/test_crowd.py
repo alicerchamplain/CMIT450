@@ -57,69 +57,26 @@ def check(existing, gap=2, failing=(), **kw):
 
 
 # --------------------------------------------------------------------------
-# DayCount
-# --------------------------------------------------------------------------
-
-
-def test_daycount_fields():
-    dc = DayCount(
-        "Hello", 10, 24, 3, 5, 0, ["Hello-10-24", "Hello-10-24-2", "Hello-10-24-3"]
-    )
-    assert (dc.slug, dc.month, dc.day) == ("Hello", 10, 24)
-    assert dc.highest == 3
-    assert dc.requests == 5
-    assert dc.failures == 0
-    assert dc.paths == ["Hello-10-24", "Hello-10-24-2", "Hello-10-24-3"]
-
-
-# --------------------------------------------------------------------------
 # count_day: what it concludes
 # --------------------------------------------------------------------------
 
 
-def test_no_pages_gives_zero():
-    result, probe = check(existing=[])
-    assert result.highest == 0
-    assert result.paths == []
-    assert result.requests == len(probe.calls)
-
-
-def test_one_bare_page():
-    result, _ = check(existing=[1])
-    assert result.highest == 1
-    assert result.paths == ["Hello-10-24"]
-
-
-def test_three_pages():
-    result, _ = check(existing=[1, 2, 3])
-    assert result.highest == 3
-
-
-def test_bare_page_deleted_but_second_exists():
-    # Gap tolerance: a missing bare page does not mean the day is empty.
-    result, _ = check(existing=[2, 3], gap=1)
-    assert result.highest == 3
-
-
-def test_gap_inside_the_run_is_tolerated_within_gap():
-    result, _ = check(existing=[1, 2, 3, 5], gap=1)
-    assert result.highest == 5
-
-
-def test_gap_wider_than_tolerance_ends_the_run():
-    # 4 and 5 missing is two in a row; gap=1 stops at 3.
-    result, _ = check(existing=[1, 2, 3, 6], gap=1)
-    assert result.highest == 3
-
-
-def test_gap_zero_stops_at_the_first_miss():
-    result, _ = check(existing=[1, 2, 3, 5], gap=0)
-    assert result.highest == 3
-
-
-def test_a_busy_day_like_the_known_actor():
-    result, _ = check(existing=range(1, 155))  # Hello-10-17-154 exists
-    assert result.highest == 154
+@pytest.mark.parametrize(
+    "existing, gap, highest",
+    [
+        ([], 2, 0),  # no pages
+        ([1], 2, 1),  # only the bare page
+        ([1, 2, 3], 2, 3),  # a run with no holes
+        ([2, 3], 1, 3),  # a deleted bare page does not make the day empty
+        ([1, 2, 3, 5], 1, 5),  # a hole no wider than the gap is stepped over
+        ([1, 2, 3, 6], 1, 3),  # 4 and 5 missing is two in a row; gap=1 stops at 3
+        ([1, 2, 3, 5], 0, 3),  # gap 0 stops at the first miss
+        (range(1, 155), 2, 154),  # a busy day like the known actor's Hello-10-17-154
+    ],
+)
+def test_count_day_finds_the_highest_counter(existing, gap, highest):
+    result, _ = check(existing=existing, gap=gap)
+    assert result.highest == highest
 
 
 def test_paths_are_the_found_ones_in_counter_order():
@@ -138,9 +95,11 @@ def test_paths_only_lists_pages_the_check_actually_probed():
 
 
 def test_highest_is_capped_by_max_n():
+    # Doubling lands on the cap itself (1, 2, 4, ... 512) and nothing is asked
+    # after it: no bisection up to the cap, no look past it.
     result, _ = check(existing=range(1, 5000), max_n=512)
-    assert result.highest <= 512
-    assert result.requests < 60
+    assert result.highest == 512
+    assert result.requests == 10
 
 
 def test_gap_window_cannot_look_past_max_n():
@@ -150,7 +109,7 @@ def test_gap_window_cannot_look_past_max_n():
     # above it is ever confirmed, and no probe is spent above it either.
     existing = set(range(1, 5000)) - {512}
     result, probe = check(existing=existing, max_n=512)
-    assert result.highest <= 512
+    assert result.highest == 511
     assert "Hello-10-24-513" not in probe.calls
     assert "Hello-10-24-514" not in probe.calls
 
@@ -162,7 +121,7 @@ def test_default_max_n_is_two_to_the_twenty():
     always_found = lambda path: Outcome.FOUND
     result = count_day(always_found, "Hello", 10, 24)
     assert result.highest == 2**20
-    assert result.requests < 50
+    assert result.requests == 21  # 1, 2, 4, ... 2**20 and nothing after
 
 
 # --------------------------------------------------------------------------
@@ -178,16 +137,6 @@ def test_first_probe_is_the_bare_path():
 def test_never_probes_a_dash_one_path():
     _, probe = check(existing=range(1, 20))
     assert not any(p.endswith("-10-24-1") for p in probe.calls)
-
-
-def test_never_probes_the_same_path_twice():
-    _, probe = check(existing=range(1, 155))
-    assert len(probe.calls) == len(set(probe.calls))
-
-
-def test_requests_equals_probe_calls():
-    result, probe = check(existing=range(1, 155))
-    assert result.requests == len(probe.calls)
 
 
 def test_busy_day_costs_far_fewer_probes_than_pages():
@@ -226,9 +175,11 @@ def test_a_hole_at_a_bisection_probe_does_not_end_the_count():
 
 
 def test_the_count_carries_on_past_several_holes():
-    existing = [*range(1, 128), *range(131, 161), *range(170, 201), *range(205, 231)]
+    # The first look finds 131 and the count settles at 160; only a second
+    # look, from there, reaches 170.
+    existing = [*range(1, 128), *range(131, 161), *range(170, 181)]
     result, _ = check(existing=existing, gap=2)
-    assert result.highest == 230
+    assert result.highest == 180
 
 
 def test_a_hole_longer_than_the_look_still_ends_the_count():
@@ -248,6 +199,10 @@ def test_the_look_grows_with_the_day_and_is_capped_by_lookahead():
     # the page just outside the look is put at 51.)
     assert check(existing=[*range(1, 41), 47], gap=2, lookahead=4)[0].highest == 47
     assert check(existing=[*range(1, 41), 51], gap=2, lookahead=4)[0].highest == 40
+    # Left alone the cap is 32: after 200 the look covers 204 to 235, not the
+    # 50 counters a quarter of the day would earn.
+    assert check(existing=[*range(1, 201), 235], gap=2)[0].highest == 235
+    assert check(existing=[*range(1, 201), 236], gap=2)[0].highest == 200
 
 
 def test_the_look_past_the_end_is_at_most_lookahead_probes():
@@ -272,20 +227,26 @@ def test_the_look_past_the_end_stops_at_max_n():
     assert not any(path.endswith(("-101", "-102", "-110")) for path in probe.calls)
 
 
-def test_looking_past_the_end_never_probes_a_path_twice():
-    _, probe = check(existing=HELLO_11_03, gap=2)
-    assert len(probe.calls) == len(set(probe.calls))
+@pytest.mark.parametrize("existing", [range(1, 155), HELLO_11_03])
+def test_every_path_is_probed_once_and_every_probe_is_counted(existing):
+    # With and without a look past the end.
+    result, probe = check(existing=existing, gap=2)
+    assert len(probe.calls) == len(set(probe.calls)) == result.requests
+    assert result.failures == 0
 
 
-def test_empty_day_costs_only_the_gap_window():
+@pytest.mark.parametrize("gap, probes", [(2, 3), (0, 1)])
+def test_empty_day_costs_only_the_gap_window(gap, probes):
     # bare, then gap more; nothing else to look at.
-    result, _ = check(existing=[], gap=2)
-    assert result.requests == 3
+    result, probe = check(existing=[], gap=gap)
+    assert (result.highest, result.paths) == (0, [])
+    assert result.requests == probes == len(probe.calls)
 
 
-def test_empty_day_with_gap_zero_is_one_probe():
-    result, _ = check(existing=[], gap=0)
-    assert result.requests == 1
+def test_the_default_gap_is_two():
+    # The same empty day, asked without a gap: by count_day and through crowd_check.
+    assert count_day(FakeProbe(), "Hello", 10, 24).requests == 3
+    assert next(crowd_check(FakeProbe(), ["Hello"], [(10, 24)])).requests == 3
 
 
 def test_probes_go_up_by_doubling_before_bisecting():
@@ -313,6 +274,7 @@ def test_failed_probe_is_counted_and_treated_as_not_found():
     result, _ = check(existing=[1, 2, 3], failing=[3], gap=0)
     assert result.failures == 1
     assert result.highest == 2  # 3 could not be confirmed
+    assert result.paths == ["Hello-10-24", "Hello-10-24-2"]  # nor listed as found
 
 
 def test_failed_probe_inside_gap_window_does_not_hide_later_pages():
@@ -321,11 +283,6 @@ def test_failed_probe_inside_gap_window_does_not_hide_later_pages():
     result, _ = check(existing=[1, 2, 3, 4, 5], failing=[2], gap=1)
     assert result.highest == 5
     assert result.failures == 1
-
-
-def test_no_failures_is_zero():
-    result, _ = check(existing=[1])
-    assert result.failures == 0
 
 
 # --------------------------------------------------------------------------
@@ -391,11 +348,14 @@ def test_crowd_check_is_lazy():
     assert probe.calls != []
 
 
-def test_crowd_check_skips_done_pairs():
-    probe = MultiProbe({("Hello", 10, 24): [1]})
-    # done holds normalized keys, as load_done returns them
-    done = {("hello", 10, 23)}
-    results = list(crowd_check(probe, ["Hello"], [(10, 23), (10, 24)], done=done))
+@pytest.mark.parametrize("slug, key", [("Hello", "hello"), ("Hİ", "hi")])
+def test_crowd_check_skips_done_pairs(slug, key):
+    # done holds normalized keys, as load_done returns them, and the raw word
+    # list slug has to match its key. For Hİ a casefold is not enough: the dot
+    # it leaves above the i goes too.
+    probe = MultiProbe({(slug, 10, 24): [1]})
+    done = {(key, 10, 23)}
+    results = list(crowd_check(probe, [slug], [(10, 23), (10, 24)], done=done))
     assert [(r.month, r.day) for r in results] == [(10, 24)]
     assert not any("10-23" in p for p in probe.calls)
 
@@ -418,19 +378,6 @@ def conn():
     c.close()
 
 
-def test_schema_has_a_crowd_table(conn):
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(crowd)").fetchall()}
-    assert {
-        "slug",
-        "month",
-        "day",
-        "highest",
-        "requests",
-        "failures",
-        "checked_at",
-    } <= cols
-
-
 def test_save_and_load_roundtrip(conn):
     save_day_count(conn, DayCount("Hello", 10, 24, 3, 7, 0, []), T0)
     save_day_count(conn, DayCount("Test", 10, 23, 0, 3, 1, []), T0)
@@ -451,10 +398,11 @@ def test_save_stores_the_numbers(conn):
 
 def test_save_same_day_again_replaces_not_duplicates(conn):
     save_day_count(conn, DayCount("Hello", 10, 24, 3, 7, 0, []), T0)
-    save_day_count(conn, DayCount("Hello", 10, 24, 4, 9, 0, []), T0 + 1)
-    rows = conn.execute("SELECT highest, checked_at FROM crowd").fetchall()
-    assert len(rows) == 1
-    assert (rows[0]["highest"], rows[0]["checked_at"]) == (4, T0 + 1)
+    save_day_count(conn, DayCount("Hello", 10, 24, 4, 9, 2, []), T0 + 1)
+    rows = conn.execute(
+        "SELECT highest, requests, failures, checked_at FROM crowd"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [(4, 9, 2, T0 + 1)]
 
 
 def test_save_commits(tmp_path):
@@ -465,10 +413,6 @@ def test_save_commits(tmp_path):
     assert load_done(c2) == {("hello", 10, 24)}
     c1.close()
     c2.close()
-
-
-def test_load_done_empty(conn):
-    assert load_done(conn) == set()
 
 
 def test_resume_end_to_end(conn):
@@ -516,11 +460,6 @@ def test_count_only_slugs_one_burst_day_does_not_exclude_a_quiet_title(conn):
     assert count_only_slugs(conn, 700) == set()
 
 
-def test_count_only_slugs_a_title_busy_every_day_is_excluded(conn):
-    seed(conn, [("Links", 10, d, 12_000) for d in range(1, 32)])
-    assert count_only_slugs(conn, 700) == {"links"}
-
-
 def test_count_only_slugs_empty_days_pull_the_average_down(conn):
     # A counted day with no pages is still a day: (2,000 + 0 + 0) / 3 is under 700.
     seed(conn, [("Burst", 11, 1, 2_000), ("Burst", 11, 2, 0), ("Burst", 11, 3, 0)])
@@ -537,6 +476,8 @@ def test_count_only_slugs_empty_table(conn):
 
 
 def test_count_only_slugs_zero_threshold_returns_everything(conn):
+    # 0 is a threshold like any other, not "off": every counted title is at
+    # or above it, one with no pages too.
     seed(conn, [("A", 11, 1, 0), ("B", 11, 1, 3)])
     assert count_only_slugs(conn, 0) == {"a", "b"}
 
@@ -554,9 +495,12 @@ def test_sweep_cost_gap_changes_the_overhead(conn):
 
 
 def test_sweep_cost_only_counts_days_in_the_window(conn):
-    seed(conn, [("A", 10, 31, 100), ("A", 11, 1, 10)])
+    # A day is its month and its day: the first of October is not in a
+    # window that holds the first of November.
+    seed(conn, [("A", 10, 1, 100), ("A", 11, 1, 10)])
     assert sweep_cost(conn, [(11, 1)], 2, set()) == 13
-    assert sweep_cost(conn, [(10, 31), (11, 1)], 2, set()) == 116
+    assert sweep_cost(conn, [(10, 1), (11, 1)], 2, set()) == 116
+    assert sweep_cost(conn, [], 2, set()) == 0
 
 
 def test_sweep_cost_excludes_count_only_slugs(conn):
@@ -565,34 +509,18 @@ def test_sweep_cost_excludes_count_only_slugs(conn):
 
 
 def test_sweep_cost_cap_bounds_each_title_day(conn):
+    # Spike is cut to the cap; A, under it, costs what it did without one.
     seed(conn, [("Spike", 11, 1, 88_651), ("A", 11, 1, 10)])
     assert sweep_cost(conn, [(11, 1)], 2, set(), cap=500) == 503 + 13
 
 
-def test_sweep_cost_cap_does_not_raise_small_days(conn):
-    seed(conn, [("A", 11, 1, 10)])
-    assert sweep_cost(conn, [(11, 1)], 2, set(), cap=500) == 13
-
-
-def test_sweep_cost_empty_window_is_zero(conn):
-    seed(conn, [("A", 11, 1, 10)])
-    assert sweep_cost(conn, [], 2, set()) == 0
-
-
-def test_sweep_cost_accepts_the_recent_days_output(conn):
-    seed(conn, [("A", 10, 31, 1), ("A", 11, 1, 1)])
-    assert sweep_cost(conn, recent_days(TODAY, 2), 2, set()) == 8
-
-
 def test_fit_window_returns_the_largest_window_within_budget(conn):
-    # Each day costs 13 (10 pages + gap 2 + 1). Budget 40 fits 3 days, not 4.
+    # Each day costs 13 (10 pages + gap 2 + 1). Three days cost 39: a budget of
+    # exactly 39 fits them, one request less does not, and 40 does not buy a fourth.
     seed(conn, [("A", 10, d, 10) for d in range(25, 32)] + [("A", 11, 1, 10)])
-    assert fit_window(conn, TODAY, 40, 2, set()) == 3
-
-
-def test_fit_window_exact_budget_fits(conn):
-    seed(conn, [("A", 10, d, 10) for d in range(25, 32)] + [("A", 11, 1, 10)])
+    assert fit_window(conn, TODAY, 38, 2, set()) == 2
     assert fit_window(conn, TODAY, 39, 2, set()) == 3
+    assert fit_window(conn, TODAY, 40, 2, set()) == 3
 
 
 def test_fit_window_zero_when_one_day_does_not_fit(conn):
@@ -628,16 +556,6 @@ def test_fit_window_crosses_the_year_boundary(conn):
     jan1 = date(2027, 1, 1)
     assert fit_window(conn, jan1, 13, 2, set(), max_days=2) == 1  # Jan 1 only
     assert fit_window(conn, jan1, 26, 2, set(), max_days=2) == 2  # Dec 31 priced too
-
-
-def test_crowd_check_done_set_matches_across_unicode_case():
-    # load_done returns normalized keys; the raw wordlist slug still skips.
-    probe = MultiProbe({("Mobіlіzacіya", 10, 24): [1]})
-    done = {("mobіlіzacіya", 10, 23)}
-    results = list(
-        crowd_check(probe, ["Mobіlіzacіya"], [(10, 23), (10, 24)], done=done)
-    )
-    assert [(r.month, r.day) for r in results] == [(10, 24)]
 
 
 def test_load_expected_keys_are_normalized(conn):

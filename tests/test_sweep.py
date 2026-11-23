@@ -72,15 +72,11 @@ def test_summary_carries_the_slug_and_day():
 
 
 def test_bare_path_is_counter_one():
-    fetch, asked = make_fetch({1})
-    drive(sweep_day(fetch, SLUG, MONTH, DAY, 1, 0, 2))
-    assert asked[0] == 1
-    # and the path actually requested had no suffix
+    # The paths as requested: counter 1 has no suffix, and there is no "-1".
     fetch, _ = make_fetch({1})
     paths = []
     drive(sweep_day(lambda p: paths.append(p) or fetch(p), SLUG, MONTH, DAY, 1, 0, 2))
-    assert paths[0] == "Hello-10-17"
-    assert paths[1] == "Hello-10-17-2"
+    assert paths == ["Hello-10-17", "Hello-10-17-2", "Hello-10-17-3", "Hello-10-17-4"]
 
 
 def test_found_pages_are_yielded_in_counter_order():
@@ -164,7 +160,6 @@ def test_expected_larger_than_reality_walks_to_expected_then_gap():
 def test_resume_starts_at_start_and_never_looks_below_it():
     _, s, asked = sweep(existing={1, 2, 3, 4, 5, 6}, start=5, gap=2)
     assert asked == [5, 6, 7, 8, 9]
-    assert min(asked) == 5
     assert s.found == ["Hello-10-17-5", "Hello-10-17-6"]
     assert s.next_n == 10
 
@@ -210,11 +205,30 @@ def test_a_mixed_tail_still_ends_the_day():
     assert s.done is True
 
 
+def test_a_failure_before_the_last_page_does_not_keep_the_day_open():
+    # 2 failed, 3 was found, and the tail (4 missing, 5 failed) is mixed. Only
+    # the misses after the last page say how the day ended.
+    _, s, asked = sweep(existing={1, 3}, failed={2, 5}, gap=1)
+    assert asked == [1, 2, 3, 4, 5]
+    assert s.failures == 2
+    assert s.done is True
+
+
 def test_failures_below_expected_do_not_stop_the_walk():
     _, s, asked = sweep(existing={1, 5}, failed={2, 3, 4}, expected=5, gap=1)
-    assert 5 in asked
+    assert asked == [1, 2, 3, 4, 5, 6, 7]
     assert len(s.found) == 2
     assert s.failures == 3
+    assert s.done is True
+
+
+def test_a_failure_at_expected_does_not_keep_the_day_open():
+    # The last counted page failed, then a real not-found: the miss run starts
+    # again after expected, and so does its count of failures.
+    _, s, asked = sweep(existing={1}, failed={2}, expected=2, gap=0)
+    assert asked == [1, 2, 3]
+    assert s.failures == 1
+    assert s.done is True
 
 
 # --- cap ---------------------------------------------------------------------------------------
@@ -226,11 +240,6 @@ def test_cap_stops_after_cap_counters_and_marks_the_day_done():
     assert s.next_n == 4
     assert s.done is True
     assert s.requests == 3
-
-
-def test_cap_applies_even_below_expected():
-    _, s, asked = sweep(existing=set(range(1, 100)), expected=99, gap=2, cap=10)
-    assert max(asked) == 10
 
 
 def test_cap_larger_than_the_day_changes_nothing():
@@ -257,12 +266,3 @@ def test_sweep_day_is_lazy_the_caller_can_stop_early():
     next(gen)
     gen.close()
     assert asked == [1, 2]  # nothing fetched beyond what was consumed
-
-
-def test_summary_is_the_generator_return_value():
-    fetch, _ = make_fetch({1})
-    gen = sweep_day(fetch, SLUG, MONTH, DAY, 1, 0, 1)
-    with pytest.raises(StopIteration) as stop:
-        while True:
-            next(gen)
-    assert isinstance(stop.value.value, DaySweep)

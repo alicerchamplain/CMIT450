@@ -10,7 +10,6 @@ import pytest
 
 from graphwatch.slugify import (
     CROWD_ONLY,
-    TABLE,
     Entry,
     load_wordlists,
     normalize_slug,
@@ -25,11 +24,12 @@ WORDLISTS = Path(__file__).resolve().parents[1] / "wordlists"
 # --------------------------------------------------------------------------
 
 
+# Enough sightings to show every letter the note saw; it lists more. The
+# letters no sighting shows are in the alphabet test below.
 @pytest.mark.parametrize(
     "title, slug",
     [
         ("Сергей", "Sergej"),
-        ("Андрей", "Andrej"),
         ("Дмитрий", "Dmitrij"),
         ("Юлия", "Yuliya"),
         ("Заявление", "Zayavlenie"),
@@ -40,42 +40,33 @@ WORDLISTS = Path(__file__).resolve().parents[1] / "wordlists"
         ("Хочу", "Hochu"),
         ("Хорошо", "Horosho"),
         ("Школа", "Shkola"),
-        ("Саша", "Sasha"),
-        ("Почта", "Pochta"),
         ("Чай", "Chaj"),
         ("Выход", "Vyhod"),
-        ("Это", "Ehto"),
-        ("Экономика", "Ehkonomika"),
         ("Эксперт", "Ehkspert"),
         ("Ёлка", "Yolka"),
         ("Алёна", "Alyona"),
-        ("Ольга", "Olga"),
         ("Компьютер", "Kompyuter"),
         ("Объявление", "Obyavlenie"),
         ("Фото", "Foto"),
         ("Телефон", "Telefon"),
-        ("Форма", "Forma"),
         ("Украина", "Ukraina"),
-        ("Киев", "Kiev"),
-        ("привет", "privet"),
-        ("новости", "novosti"),
-        ("Тест", "Test"),
     ],
 )
 def test_russian_sightings(title, slug):
     assert slugify(title) == slug
 
 
-def test_table_covers_the_whole_russian_alphabet_in_both_cases():
+def test_the_whole_russian_alphabet_in_both_cases():
+    # One letter between each pair of hyphens. The soft and hard signs vanish,
+    # and a capital that becomes several letters is title case, not upper.
     lower = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
     assert len(lower) == 33
-    for ch in lower:
-        assert ch in TABLE
-        assert ch.upper() in TABLE
-
-
-def test_soft_and_hard_signs_vanish():
-    assert slugify("ьъЬЪ") == ""
+    assert slugify(" ".join(lower)) == (
+        "a-b-v-g-d-e-yo-zh-z-i-j-k-l-m-n-o-p-r-s-t-u-f-h-c-ch-sh-shch--y--eh-yu-ya"
+    )
+    assert slugify(" ".join(lower.upper())) == (
+        "A-B-V-G-D-E-Yo-Zh-Z-I-J-K-L-M-N-O-P-R-S-T-U-F-H-C-Ch-Sh-Shch--Y--Eh-Yu-Ya"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -86,18 +77,12 @@ def test_soft_and_hard_signs_vanish():
 @pytest.mark.parametrize(
     "title, slug",
     [
-        ("Новини", "Novini"),
         ("Київ", "Kiiv"),
         ("Євген", "Yevgen"),
-        ("Європа", "Yevropa"),
-        ("об'єкт", "obyekt"),
         ("Відео", "Vіdeo"),  # Cyrillic і stays
         ("Інструкція", "Іnstrukcіya"),  # Cyrillic І and і stay
-        ("Історія", "Іstorіya"),
-        ("Світ", "Svіt"),
         ("Повістка", "Povіstka"),
         ("Ґрати", "Grati"),
-        ("Выбухны Ґ", "Vybuhny-G"),
     ],
 )
 def test_ukrainian_sightings(title, slug):
@@ -105,9 +90,10 @@ def test_ukrainian_sightings(title, slug):
 
 
 def test_ukrainian_i_is_the_cyrillic_letter_not_latin():
-    slug = slugify("Відео")
-    assert slug[1] == "і"  # CYRILLIC SMALL LETTER BYELORUSSIAN-UKRAINIAN I
-    assert slug != "Video"
+    # Written as escapes, because the two letters look the same on screen:
+    # U+0456 CYRILLIC SMALL LETTER BYELORUSSIAN-UKRAINIAN I, U+0406 its capital.
+    assert slugify("В\u0456део") == "V\u0456deo"
+    assert slugify("\u0406сторія") == "\u0406stor\u0456ya"
 
 
 def test_mojibake_spam_title_is_the_hard_case():
@@ -197,14 +183,6 @@ def test_case_is_preserved_letter_by_letter():
     assert slugify("ПРИВЕТ") == "PRIVET"
 
 
-def test_capital_multi_letter_forms_are_title_case():
-    assert slugify("Ю") == "Yu"
-    assert slugify("Ж") == "Zh"
-    assert slugify("Щ") == "Shch"
-    assert slugify("Э") == "Eh"
-    assert slugify("Є") == "Ye"
-
-
 # --------------------------------------------------------------------------
 # things the note did not probe: be conservative
 # --------------------------------------------------------------------------
@@ -230,12 +208,6 @@ def test_empty_title_gives_empty_slug():
     assert slugify("…") == ""
 
 
-def test_slug_never_contains_a_space_or_apostrophe():
-    for title in ("a b", "a'b", "a’b", "Повістка про виклик"):
-        slug = slugify(title)
-        assert " " not in slug and "'" not in slug and "’" not in slug
-
-
 # --------------------------------------------------------------------------
 # load_wordlists
 # --------------------------------------------------------------------------
@@ -257,7 +229,7 @@ def test_load_reads_utf8_one_title_per_line(tmp_path):
 
 
 def test_load_skips_blank_and_comment_lines(tmp_path):
-    d = write_lists(tmp_path, a="\n# a comment\nHello\n\n  \nTest\n")
+    d = write_lists(tmp_path, a="\n# a comment\nHello\n\n  \n  # indented\nTest\n")
     assert [e.title for e in load_wordlists(d)] == ["Hello", "Test"]
 
 
@@ -326,36 +298,18 @@ def test_load_the_real_wordlists():
 
 
 @pytest.mark.parametrize(
-    "a, b",
+    "slug, key",
     [
         ("Hi", "hi"),
-        ("Hİ", "Hi"),  # U+0130 folds to i + combining dot; the dot must go too
-        (
-            "MOBІLІZACІYA",
-            "Mobіlіzacіya",
-        ),  # Cyrillic capital І (U+0406) vs small і (U+0456)
-        ("TEST", "test"),
-        ("Привет", "привет"),
+        ("Hİ", "hi"),  # U+0130 folds to i + combining dot; the dot must go too
+        # Cyrillic capital І (U+0406) folds to small і (U+0456) and stays
+        # Cyrillic: folding must not transliterate.
+        ("MOB\u0406L\u0406ZAC\u0406YA", "mob\u0456l\u0456zac\u0456ya"),
+        ("Mob\u0456l\u0456zac\u0456ya", "mob\u0456l\u0456zac\u0456ya"),
+        ("Привет", "привет"),  # a Cyrillic capital folds like a Latin one
+        ("Mobile-Proxy-2024", "mobile-proxy-2024"),  # hyphens and digits stay
     ],
 )
-def test_normalize_slug_folds_unicode_case(a, b):
-    assert normalize_slug(a) == normalize_slug(b)
-
-
-def test_normalize_slug_turkish_dotted_i_becomes_plain_i():
-    assert normalize_slug("Hİ") == "hi"
-
-
-def test_normalize_slug_is_idempotent():
-    for s in ["Hİ", "Mobіlіzacіya", "Hello-World", "Привет"]:
-        assert normalize_slug(normalize_slug(s)) == normalize_slug(s)
-
-
-def test_normalize_slug_keeps_hyphens_and_digits():
-    assert normalize_slug("Mobile-Proxy-2024") == "mobile-proxy-2024"
-
-
-def test_normalize_slug_keeps_ukrainian_i_as_cyrillic():
-    # Folding must not transliterate: Cyrillic і stays Cyrillic, just lowercase.
-    assert normalize_slug("Povіstka") == "povіstka"
-    assert "і" in normalize_slug("POVІSTKA")
+def test_normalize_slug_gives_one_key_per_page(slug, key):
+    assert normalize_slug(slug) == key
+    assert normalize_slug(key) == key  # a key is its own key

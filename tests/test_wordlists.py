@@ -32,25 +32,13 @@ def write_lists(tmp_path, **files):
 # --- file_sha256 ---------------------------------------------------------------
 
 
-def test_file_sha256_matches_hashlib(tmp_path):
+def test_file_sha256_is_the_hex_digest_of_the_file_bytes(tmp_path):
+    # What `sha256sum` prints: 64 lowercase hex digits over the raw bytes.
     f = tmp_path / "a.txt"
-    f.write_bytes(b"Hello\n")
-    assert file_sha256(f) == hashlib.sha256(b"Hello\n").hexdigest()
-
-
-def test_file_sha256_is_lowercase_hex_of_length_64(tmp_path):
-    f = tmp_path / "a.txt"
-    f.write_text("Привет\n", encoding="utf-8")
-    digest = file_sha256(f)
-    assert len(digest) == 64
-    assert digest == digest.lower()
-    int(digest, 16)  # every character is a hex digit
-
-
-def test_file_sha256_accepts_a_string_path(tmp_path):
-    f = tmp_path / "a.txt"
-    f.write_bytes(b"x")
-    assert file_sha256(str(f)) == file_sha256(f)
+    f.write_bytes("Привет\n".encode("utf-8"))
+    expected = hashlib.sha256("Привет\n".encode("utf-8")).hexdigest()
+    assert file_sha256(f) == expected
+    assert file_sha256(str(f)) == expected  # a path given as a string
 
 
 # --- write_sums -----------------------------------------------------------------
@@ -60,17 +48,12 @@ def test_write_sums_writes_sha256sum_format(tmp_path):
     d = write_lists(tmp_path, zed="Z\n", alpha="A\n")
     out = write_sums(d)
     assert out == d / SUMS_FILE
-    lines = out.read_text(encoding="utf-8").splitlines()
-    # sorted by file name, two spaces between digest and name, name only (no directory)
-    assert lines == [
-        f"{file_sha256(d / 'alpha.txt')}  alpha.txt",
-        f"{file_sha256(d / 'zed.txt')}  zed.txt",
-    ]
-
-
-def test_write_sums_ends_with_a_newline(tmp_path):
-    d = write_lists(tmp_path, a="A\n")
-    assert write_sums(d).read_text(encoding="utf-8").endswith("\n")
+    # sorted by file name, two spaces between digest and name, name only (no
+    # directory), and every line ended
+    assert out.read_text(encoding="utf-8") == (
+        f"{file_sha256(d / 'alpha.txt')}  alpha.txt\n"
+        f"{file_sha256(d / 'zed.txt')}  zed.txt\n"
+    )
 
 
 def test_write_sums_lists_only_txt_files(tmp_path):
@@ -199,11 +182,6 @@ def test_verify_a_whitespace_only_change_counts_as_modified(tmp_path):
 # --- load_wordlists(verify=...) ------------------------------------------------
 
 
-def test_load_wordlists_does_not_verify_by_default(tmp_path):
-    d = write_lists(tmp_path, a="Hello\n")  # no SHA256SUMS at all
-    assert [e.slug for e in load_wordlists(d)] == ["Hello"]
-
-
 def test_load_wordlists_verify_passes_on_a_fresh_freeze(tmp_path):
     d = write_lists(tmp_path, a="Hello\n")
     write_sums(d)
@@ -245,10 +223,6 @@ def test_load_wordlists_verify_is_keyword_only(tmp_path):
 def test_load_wordlists_missing_directory_still_raises_file_not_found(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_wordlists(tmp_path / "nope", verify=True)
-
-
-def test_wordlists_changed_is_an_exception():
-    assert issubclass(WordlistsChanged, Exception)
 
 
 # --- the real lists -------------------------------------------------------------

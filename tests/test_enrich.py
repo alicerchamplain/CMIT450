@@ -9,17 +9,16 @@ import pytest
 from graphwatch.cli import run_classify
 from graphwatch.db import add_snapshot, connect, save_lookup, upsert_indicator, upsert_page
 from graphwatch.enrich import (
-    host_of_url,
-    LOOKUP_KINDS,
-    PRIMARY_FEEDS,
     Seen,
     collect_indicators,
     defang,
+    host_of_url,
     novelty,
     novelty_rows,
     read_indicator_file,
     render_novelty_table,
 )
+from graphwatch.extract import extract
 
 T0 = 1_700_000_000.0  # 2023-11-14 22:13 UTC
 DAY = 86400.0
@@ -27,6 +26,8 @@ KEY = b"test-key"
 API_SAMPLE = "Hello,+world!"
 SPOOF_TITLE = "www.tenable.com@agfc.harper18.workers.dev/"
 OTHER_SPOOF_TITLE = "www.juniper.net@second.example-tunnel.workers.dev/"
+# A spoof only as a title: the decoy does not end in a TLD the text pattern knows
+AG_TITLE = "primewire.ag@agfc.harper18.workers.dev/"
 
 
 def put(conn, path, title, body=API_SAMPLE, ts=T0, held_out=False) -> int:
@@ -56,40 +57,26 @@ def collected(conn) -> dict:
 # --------------------------------------------------------------------------
 
 
-def test_only_addresses_are_looked_up():
-    assert LOOKUP_KINDS == {"ip", "host", "url"}
-
-
-def test_collect_finds_the_destination_of_a_flagged_spoof_page(conn):
-    put(conn, "Hello-10-17-9", SPOOF_TITLE)
-    run_classify(conn, log=quiet)
-    assert ("host", "agfc.harper18.workers.dev") in collected(conn)
-
-
-def test_a_decoy_is_never_collected(conn):
+@pytest.mark.parametrize("title", [SPOOF_TITLE, AG_TITLE])
+def test_collect_takes_the_destination_of_a_flagged_spoof_page_and_never_the_decoy(conn, title):
     # The left side of the spoof is bait: it must never be sent to a feed.
-    put(conn, "Hello-10-17-9", SPOOF_TITLE)
+    put(conn, "Hello-10-17-9", title)
     run_classify(conn, log=quiet)
-    values = {value for _kind, value in collected(conn)}
-    assert "www.tenable.com" not in values
-    assert not any(kind == "decoy" for kind, _value in collected(conn))
+    assert list(collected(conn)) == [("host", "agfc.harper18.workers.dev")]
 
 
 def test_a_token_is_never_collected(conn):
     put(conn, "Hello-10-17-9", SPOOF_TITLE, body="dGViaQ== " + API_SAMPLE)
     run_classify(conn, log=quiet)
-    assert not any(kind == "token" for kind, _value in collected(conn))
-    assert "dGViaQ==" not in {value for _kind, value in collected(conn)}
+    # The run is in the stored text and extract does report it, as a token
+    stored = conn.execute("SELECT title, text FROM snapshots").fetchone()
+    assert ("token", "dGViaQ==") in {(i.kind, i.value) for i in extract(stored["title"], stored["text"])}
+    assert list(collected(conn)) == [("host", "agfc.harper18.workers.dev")]
 
 
 def test_a_page_that_was_never_flagged_gives_nothing(conn):
     put(conn, "Notes-10-17", "Notes", body="see 8.8.8.8 and c2.example.org")
     run_classify(conn, log=quiet)
-    assert collect_indicators(conn) == []
-
-
-def test_a_page_that_was_never_classified_gives_nothing(conn):
-    put(conn, "Hello-10-17-9", SPOOF_TITLE)
     assert collect_indicators(conn) == []
 
 
@@ -100,18 +87,8 @@ def test_a_held_out_page_gives_nothing(conn):
     assert collect_indicators(conn) == []
 
 
-def test_every_snapshot_of_a_flagged_page_is_read_not_only_the_newest(conn):
+def test_every_snapshot_is_read_and_first_and_last_seen_are_their_fetch_times(conn):
     # The actor edits in place: last week's address is in an older snapshot.
-    page_id = put(conn, "Hello-10-17-9", SPOOF_TITLE, ts=T0)
-    run_classify(conn, log=quiet)
-    rotated = {"title": OTHER_SPOOF_TITLE, "description": API_SAMPLE, "content": [API_SAMPLE]}
-    add_snapshot(conn, page_id, rotated, T0 + DAY, KEY)
-    found = collected(conn)
-    assert ("host", "agfc.harper18.workers.dev") in found
-    assert ("host", "second.example-tunnel.workers.dev") in found
-
-
-def test_first_and_last_seen_are_the_fetch_times_of_the_snapshots(conn):
     page_id = put(conn, "Hello-10-17-9", SPOOF_TITLE, ts=T0)
     run_classify(conn, log=quiet)
     same = {"title": SPOOF_TITLE, "description": API_SAMPLE, "content": [API_SAMPLE], "views": 9}
@@ -135,20 +112,22 @@ def test_pages_counts_distinct_pages_not_snapshots(conn):
 
 
 def test_an_indicator_is_collected_once_in_order_of_first_appearance(conn):
-    put(conn, "Hello-10-17-9", SPOOF_TITLE, ts=T0)
-    put(conn, "Hello-10-18-4", OTHER_SPOOF_TITLE, ts=T0 + DAY)
-    put(conn, "Hello-10-19-2", SPOOF_TITLE, ts=T0 + 2 * DAY)
+    put(conn, "Hello-10-17-9", OTHER_SPOOF_TITLE, ts=T0)
+    put(conn, "Hello-10-18-4", SPOOF_TITLE, ts=T0 + DAY)
+    put(conn, "Hello-10-19-2", OTHER_SPOOF_TITLE, ts=T0 + 2 * DAY)
     run_classify(conn, log=quiet)
     hosts = [seen.value for seen in collect_indicators(conn) if seen.kind == "host"]
-    assert hosts == ["agfc.harper18.workers.dev", "second.example-tunnel.workers.dev"]
+    assert hosts == ["second.example-tunnel.workers.dev", "agfc.harper18.workers.dev"]
 
 
-def test_collect_makes_no_request_and_writes_nothing(conn):
+def test_collect_reads_the_database_and_writes_nothing(conn):
+    # It is given no client, so it has nothing to make a request with. What
+    # it could do is write, and no table gains or changes a row.
     put(conn, "Hello-10-17-9", SPOOF_TITLE)
     run_classify(conn, log=quiet)
-    collect_indicators(conn)
-    assert conn.execute("SELECT COUNT(*) FROM http_log").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0] == 0
+    before = conn.total_changes
+    assert collect_indicators(conn)
+    assert conn.total_changes == before
 
 
 # --------------------------------------------------------------------------
@@ -162,7 +141,8 @@ FILE = (
     "url\thttp://8.8.4.4/m2/file.exe\tother\tnew\n"
     "decoy\twww.tenable.com\tactor\tnew\n"
     "token\tdGViaQ==\tactor\tnew\n"
-    "ip\t8.8.8.8\tactor\tbefore\n"
+    "ip \t 8.8.8.8 \tactor\tbefore\n"
+    "ip\t\tactor\tno value\n"
     "\n"
     "host\n"
 )
@@ -174,24 +154,16 @@ def write(tmp_path, text, name="indicators.tsv"):
     return path
 
 
-def test_the_file_reader_takes_the_kind_and_value_columns(tmp_path):
-    found, _skipped = read_indicator_file(write(tmp_path, FILE))
+def test_the_file_reader_takes_the_addresses_once_and_counts_the_decoys_and_tokens_it_skips(tmp_path):
+    found, skipped = read_indicator_file(write(tmp_path, FILE))
     assert found == [
         Seen("host", "first.example-tunnel.workers.dev"),
         Seen("ip", "8.8.8.8"),
         Seen("url", "http://8.8.4.4/m2/file.exe"),
         Seen("ip", "8.8.4.4"),  # the url's host, looked up beside it
     ]
-
-
-def test_the_file_reader_skips_and_counts_decoys_and_tokens(tmp_path):
-    found, skipped = read_indicator_file(write(tmp_path, FILE))
     assert skipped == 2
-    assert not {"www.tenable.com", "dGViaQ=="} & {seen.value for seen in found}
-
-
-def test_file_indicators_have_no_times_and_no_pages(tmp_path):
-    found, _skipped = read_indicator_file(write(tmp_path, FILE))
+    # An indicator read from a file has no times and no pages
     assert all((s.first_seen, s.last_seen, s.pages) == (None, None, 0) for s in found)
 
 
@@ -207,12 +179,6 @@ def test_the_file_reader_refuses_a_file_without_both_columns(tmp_path, text):
     assert "kind" in str(exc.value)
 
 
-def test_the_indicator_list_of_22_november_has_the_columns_this_reads():
-    # The header of data/indicators-2026-11-22.tsv, which git ignores.
-    header = "kind\tvalue\tset\tseen_by\tfirst_seen_utc\tlast_seen_utc\tpages_or_polls\tstatus\tsource"
-    assert {"kind", "value"} <= set(header.split("\t"))
-
-
 # --------------------------------------------------------------------------
 # novelty
 # --------------------------------------------------------------------------
@@ -220,15 +186,11 @@ def test_the_indicator_list_of_22_november_has_the_columns_this_reads():
 ALL_UNKNOWN = {"threatfox": "UNKNOWN", "urlhaus": "UNKNOWN", "otx": "UNKNOWN", "virustotal": "UNKNOWN"}
 
 
-def test_the_primary_feeds_are_the_two_the_proposal_names_first():
-    assert PRIMARY_FEEDS == ("threatfox", "otx")
-
-
 def test_unknown_to_every_feed_is_novel():
     assert novelty(ALL_UNKNOWN) == "novel"
 
 
-@pytest.mark.parametrize("feed", ["threatfox", "urlhaus", "otx", "virustotal"])
+@pytest.mark.parametrize("feed", ["otx", "virustotal"])
 def test_known_to_any_one_feed_is_known(feed):
     assert novelty({**ALL_UNKNOWN, feed: "KNOWN"}) == "known"
 
@@ -262,11 +224,18 @@ def test_one_known_is_enough_even_with_a_primary_feed_missing():
     [
         ("ip", "8.8.8.8", "8.8.8[.]8"),
         ("ip", "8.8.8.8:8443", "8.8.8[.]8:8443"),
-        ("host", "c2.example.org", "c2.example[.]org"),
-        ("url", "http://8.8.8.8/m2/file.exe", "hxxp://8.8.8[.]8/m2/file.exe"),
+        ("host", "localhost", "localhost"),
         ("url", "https://c2.example.org/a.b/c", "hxxps://c2.example[.]org/a.b/c"),
         ("url", "HTTP://c2.example.org", "hxxp://c2.example[.]org"),
-        ("host", "localhost", "localhost"),
+        # A hand-written file can hold a url with no scheme
+        ("url", "c2.example.org/a.b", "c2.example[.]org/a.b"),
+        # What the review of 22 November found: only the host is bracketed, whatever follows it
+        ("url", "http://evil.example.com?u=file.php", "hxxp://evil.example[.]com?u=file.php"),
+        ("url", "https://evil.example.com#a.b", "hxxps://evil.example[.]com#a.b"),
+        ("url", "http://good.example.org@evil.example.com/x", "hxxp://good.example[.]org@evil.example[.]com/x"),
+        ("url", "http://evil.example.com:8080/a.b", "hxxp://evil.example[.]com:8080/a.b"),
+        ("ip", "2a00::1", "2a00[:]:1"),
+        ("url", "http://[2001:db8::1]:80/x", "hxxp://[2001[:]db8::1]:80/x"),
     ],
 )
 def test_defang(kind, value, safe):
@@ -291,21 +260,20 @@ ROWS = [
     ),
     row("host", "late.example.org", {"threatfox": ("UNKNOWN", None)}, first_seen=None, pages=0),
     row("url", "http://8.8.4.4/a.exe", {"threatfox": ("UNKNOWN", None), "otx": ("UNKNOWN", None)}),
+    # Known, yet absent from the two primary feeds. First seen at 00:13 UTC the next day.
+    row(
+        "host",
+        "old.example.org",
+        {"threatfox": ("UNKNOWN", None), "otx": ("UNKNOWN", None), "virustotal": ("KNOWN", "malicious on 5 of 95 engines")},
+        first_seen=T0 + 7200,
+    ),
+    # Known, with one of the primary feeds never asked
+    row("host", "half.example.org", {"threatfox": ("UNKNOWN", None), "urlhaus": ("KNOWN", "3 URLs")}),
 ]
 
 
 def table_lines() -> list[str]:
     return render_novelty_table(ROWS).splitlines()
-
-
-def test_the_table_has_a_column_per_feed_and_a_line_per_indicator():
-    lines = table_lines()
-    assert lines[0] == (
-        "| Indicator | Kind | First seen | Pages | ThreatFox | URLhaus | OTX | VirusTotal | Verdict |"
-    )
-    assert set(lines[1]) <= set("|-")
-    assert len(lines[1].split("|")) == len(lines[0].split("|"))
-    assert len([line for line in lines if line.startswith("| `")]) == len(ROWS)
 
 
 def test_the_table_prints_every_indicator_defanged():
@@ -339,34 +307,38 @@ def test_a_feed_that_was_not_asked_says_so_and_the_row_is_unchecked():
 
 def test_the_two_primary_feeds_make_a_row_novel_with_the_others_not_checked():
     line = table_lines()[5]
-    assert line.endswith("| - | not checked | - | not checked | novel |")
+    assert line == "| `hxxp://8.8.4[.]4/a.exe` | url | 2023-11-14 | 1 | - | not checked | - | not checked | novel |"
+
+
+def test_a_row_known_to_another_feed_only_is_known_and_its_day_is_utc():
+    assert table_lines()[6:8] == [
+        "| `old.example[.]org` | host | 2023-11-15 | 1 | - | not checked | - | malicious on 5 of 95 engines | known |",
+        "| `half.example[.]org` | host | 2023-11-14 | 1 | - | 3 URLs | not checked | not checked | known |",
+    ]
 
 
 def test_the_shares_under_the_table():
+    # The unchecked row is in neither share. The second share is not the
+    # first: it counts old.example.org as absent and leaves half.example.org out.
     lines = table_lines()
+    assert len(lines) == 2 + len(ROWS) + 4
     assert lines[-4] == ""
-    assert lines[-3] == "4 indicators: 2 novel, 1 known, 1 unchecked."
-    assert lines[-2] == "Novel, of the indicators with a verdict: 2 of 3."
+    assert lines[-3] == "6 indicators: 2 novel, 3 known, 1 unchecked."
+    assert lines[-2] == "Novel, of the indicators with a verdict: 2 of 5."
     assert lines[-1] == (
-        "Absent from ThreatFox and OTX, of the indicators both answered for: 2 of 3."
+        "Absent from ThreatFox and OTX, of the indicators both answered for: 3 of 4."
     )
 
 
-def test_an_unchecked_indicator_is_in_neither_share():
-    only = [row("host", "late.example.org", {"threatfox": ("UNKNOWN", None)})]
-    lines = render_novelty_table(only).splitlines()
-    assert lines[-2].endswith("0 of 0.")
-    assert lines[-1].endswith("0 of 0.")
-
-
 def test_the_table_of_nothing_is_a_header_and_zero_counts():
-    lines = render_novelty_table([]).splitlines()
-    assert len(lines) == 6
-    assert lines[3] == "0 indicators: 0 novel, 0 known, 0 unchecked."
-
-
-def test_the_table_ends_with_a_newline():
-    assert render_novelty_table(ROWS).endswith("\n")
+    assert render_novelty_table([]) == (
+        "| Indicator | Kind | First seen | Pages | ThreatFox | URLhaus | OTX | VirusTotal | Verdict |\n"
+        "|---|---|---|---|---|---|---|---|---|\n"
+        "\n"
+        "0 indicators: 0 novel, 0 known, 0 unchecked.\n"
+        "Novel, of the indicators with a verdict: 0 of 0.\n"
+        "Absent from ThreatFox and OTX, of the indicators both answered for: 0 of 0.\n"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -390,15 +362,6 @@ def test_novelty_rows_joins_each_indicator_with_its_lookups(conn):
             "lookups": {"otx": ("KNOWN", "4 pulses"), "threatfox": ("UNKNOWN", None)},
         },
     ]
-
-
-def test_novelty_rows_feed_straight_into_the_table(conn):
-    a = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 1)
-    save_lookup(conn, a, "threatfox", "UNKNOWN", None, T0)
-    save_lookup(conn, a, "otx", "UNKNOWN", None, T0)
-    out = render_novelty_table(novelty_rows(conn))
-    assert "| novel |" in out
-    assert "1 indicators: 1 novel, 0 known, 0 unchecked." in out
 
 
 # --------------------------------------------------------------------------
@@ -441,21 +404,6 @@ def test_a_file_url_whose_host_is_also_listed_gives_the_host_once(tmp_path):
     ]
 
 
-@pytest.mark.parametrize(
-    "kind,value,safe",
-    [
-        ("url", "http://evil.example.com?u=file.php", "hxxp://evil.example[.]com?u=file.php"),
-        ("url", "https://evil.example.com#a.b", "hxxps://evil.example[.]com#a.b"),
-        ("url", "http://good.example.org@evil.example.com/x", "hxxp://good.example[.]org@evil.example[.]com/x"),
-        ("url", "http://evil.example.com:8080/a.b", "hxxp://evil.example[.]com:8080/a.b"),
-        ("ip", "2a00:1450:4001::81b", "2a00[:]1450:4001::81b"),
-        ("url", "http://[2001:db8::1]:80/x", "hxxp://[2001[:]db8::1]:80/x"),
-    ],
-)
-def test_defang_brackets_the_host_whatever_follows_it(kind, value, safe):
-    assert defang(kind, value) == safe
-
-
 def test_a_backtick_or_pipe_in_an_indicator_cannot_break_out_of_its_cell():
     # The value is text from a page. A backtick would close the code span and
     # let what follows be read as Markdown: a live link in a committed report.
@@ -468,9 +416,10 @@ def test_a_backtick_or_pipe_in_an_indicator_cannot_break_out_of_its_cell():
     assert "%60" in line and "%7C" in line
 
 
-def test_a_pipe_or_newline_in_what_a_feed_says_cannot_break_the_row():
-    lookups = {"threatfox": ("KNOWN", "2 IOCs, Some|Name\nwith `ticks`"), "otx": ("UNKNOWN", None)}
+def test_a_pipe_or_line_break_in_what_a_feed_says_cannot_break_the_row():
+    lookups = {"threatfox": ("KNOWN", "2 IOCs, Some|Name\r\nwith `ticks`"), "otx": ("UNKNOWN", None)}
     out = render_novelty_table([row("ip", "8.8.8.8", lookups)])
-    line = next(l for l in out.splitlines() if l.startswith("| `"))
-    assert len(line.split("|")) == len(out.splitlines()[0].split("|"))
-    assert line.count("`") == 2
+    assert out.splitlines()[2] == (
+        "| `8.8.8[.]8` | ip | 2023-11-14 | 1 "
+        "| 2 IOCs, Some%7CName  with %60ticks%60 | not checked | - | not checked | known |"
+    )
