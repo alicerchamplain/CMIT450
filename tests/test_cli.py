@@ -23,6 +23,7 @@ from graphwatch.cli import (
     require_key,
     run_classify,
     run_crowd,
+    run_enrich,
     run_explain,
     run_meta,
     run_resweep,
@@ -30,6 +31,7 @@ from graphwatch.cli import (
 )
 from graphwatch.config import CONFIG
 from graphwatch.crowd import DayCount, save_day_count
+from graphwatch.enrich import novelty, novelty_rows
 from graphwatch.db import (
     add_snapshot,
     connect,
@@ -37,12 +39,15 @@ from graphwatch.db import (
     latest_snapshots,
     load_progress,
     resweep_paths,
+    save_lookup,
     save_score,
+    upsert_indicator,
     upsert_page,
 )
+from graphwatch.feeds import FeedClient
 from graphwatch.rules import RULES, apply_rules
 from graphwatch.slugify import Entry
-from graphwatch.telegraph import Outcome, TelegraphClient
+from graphwatch.telegraph import BudgetExceeded, Outcome, TelegraphClient
 
 FIXTURES = Path(__file__).resolve().parents[1] / "plan" / "fixtures"
 FOUND_BODY = (FIXTURES / "Vizit-12-28.json").read_bytes()
@@ -2158,7 +2163,238 @@ def test_main_sweep_without_the_flag_does_not_resweep(workdir, monkeypatch, caps
     assert "Resweep" not in capsys.readouterr().out
 
 
+# --------------------------------------------------------------------------
+# enrich (issues #38 and #39): run_enrich, the command, the novelty table
+# (plan/enrichment-plan-2026-11-22.md)
+# --------------------------------------------------------------------------
+
+FEED_KEYS = {
+    "threatfox": "abuse-key-made-up",
+    "urlhaus": "abuse-key-made-up",
+    "otx": "otx-key-made-up",
+    "virustotal": "vt-key-made-up",
+}
+FEED_HOST = {
+    "threatfox": "threatfox-api.abuse.ch",
+    "urlhaus": "urlhaus-api.abuse.ch",
+    "otx": "otx.alienvault.com",
+    "virustotal": "www.virustotal.com",
+}
+
+
+def feed_miss(feed) -> bytes:
+    answers = {
+        "threatfox": {"query_status": "no_result"},
+        "urlhaus": {"query_status": "no_results"},
+        "otx": {"pulse_info": {"count": 0}},
+        "virustotal": {"data": {"attributes": {"last_analysis_stats": {"malicious": 0, "harmless": 9}}}},
+    }
+    return json.dumps(answers[feed]).encode("utf-8")
+
+
+def feed_hit(feed, value) -> bytes:
+    answers = {
+        "threatfox": {"query_status": "ok", "data": [{"ioc": f"{value}:443", "malware_printable": "Made-up RAT"}]},
+        "urlhaus": {"query_status": "ok", "url_count": "2"},
+        "otx": {"pulse_info": {"count": 3}},
+        "virustotal": {"data": {"attributes": {"last_analysis_stats": {"malicious": 5, "harmless": 4}}}},
+    }
+    return json.dumps(answers[feed]).encode("utf-8")
+
+
+class FeedResp:
+    def __init__(self, status, content):
+        self.status_code = status
+        self.content = content
+
+
+class EnrichSession:
+    """Answers every feed with a miss, except a hit for the (feed, value)
+    pairs in `known` and the given status for the feeds in `broken`."""
+
+    def __init__(self, known=(), broken=None):
+        self.known = set(known)
+        self.broken = dict(broken or {})
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        feed = next(name for name, host in FEED_HOST.items() if host in url)
+        sent = json.dumps([url, kwargs.get("json"), kwargs.get("data")])
+        self.calls.append((feed, sent))
+        if feed in self.broken:
+            return FeedResp(self.broken[feed], b"{}")
+        for known_feed, value in self.known:
+            if known_feed == feed and value in sent:
+                return FeedResp(200, feed_hit(feed, value))
+        return FeedResp(200, feed_miss(feed))
+
+    def asked(self, feed) -> int:
+        return sum(1 for name, _sent in self.calls if name == feed)
+
+
+def make_feed_client(known=(), broken=None, keys=FEED_KEYS, **kwargs):
+    session = EnrichSession(known, broken)
+    client = FeedClient(keys, session=session, sleep=lambda s: None, **kwargs)
+    return client, session
+
+
+@pytest.fixture
+def indicators(conn):
+    """Two stored indicators, an address and a host, with nothing looked up yet."""
+    upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 4)
+    upsert_indicator(conn, "ip", "9.9.9.9", "pages", T0 + 60, T0 + 60, 1)
+    return conn
+
+
+def stored_lookups(conn):
+    sql = """
+    SELECT i.value, l.feed, l.verdict FROM feed_lookups l
+    JOIN indicators i ON i.id = l.indicator_id ORDER BY i.value, l.feed
+    """
+    return [tuple(r) for r in conn.execute(sql)]
+
+
+def test_run_enrich_asks_every_feed_about_every_indicator(indicators):
+    client, session = make_feed_client()
+    counts = run_enrich(indicators, client, log=quiet)
+    assert counts == {"looked_up": 8, "cached": 0, "known": 0, "unknown": 8, "failed": 0}
+    assert {feed: session.asked(feed) for feed in FEED_KEYS} == dict.fromkeys(FEED_KEYS, 2)
+    assert len(stored_lookups(indicators)) == 8
+
+
+def test_run_enrich_stores_and_logs_a_known_indicator(indicators):
+    client, _ = make_feed_client(known={("threatfox", "8.8.8.8"), ("otx", "8.8.8.8")})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert (counts["known"], counts["unknown"]) == (2, 6)
+    assert ("8.8.8.8", "threatfox", "KNOWN") in stored_lookups(indicators)
+    assert ("9.9.9.9", "threatfox", "UNKNOWN") in stored_lookups(indicators)
+    assert lines == [
+        "8.8.8.8: known to threatfox (1 IOCs, Made-up RAT)",
+        "8.8.8.8: known to otx (3 pulses)",
+    ]
+
+
+def test_run_enrich_does_not_ask_again_for_a_stored_answer(indicators):
+    client, session = make_feed_client()
+    run_enrich(indicators, client, log=quiet)
+    session.calls.clear()
+    counts = run_enrich(indicators, client, log=quiet)
+    assert session.calls == []
+    assert counts == {"looked_up": 0, "cached": 8, "known": 0, "unknown": 0, "failed": 0}
+
+
+def test_run_enrich_keeps_the_answer_and_the_day_it_was_given(indicators):
+    # Novelty is measured on the day the indicator was found.
+    client, _ = make_feed_client()
+    run_enrich(indicators, client, log=quiet)
+    before = [tuple(r) for r in indicators.execute("SELECT * FROM feed_lookups ORDER BY rowid")]
+    later, _ = make_feed_client(known={("threatfox", "8.8.8.8")})
+    run_enrich(indicators, later, log=quiet)
+    assert [tuple(r) for r in indicators.execute("SELECT * FROM feed_lookups ORDER BY rowid")] == before
+
+
+def test_run_enrich_refresh_asks_again_and_replaces_the_answer(indicators):
+    client, _ = make_feed_client()
+    run_enrich(indicators, client, log=quiet)
+    later, session = make_feed_client(known={("threatfox", "8.8.8.8")})
+    counts = run_enrich(indicators, later, refresh=True, log=quiet)
+    assert counts["looked_up"] == 8
+    assert len(session.calls) == 8
+    assert ("8.8.8.8", "threatfox", "KNOWN") in stored_lookups(indicators)
+    assert len(stored_lookups(indicators)) == 8
+
+
+def test_run_enrich_only_asks_the_feeds_it_has_a_key_for(indicators):
+    client, session = make_feed_client(keys={"threatfox": "a", "otx": "o"})
+    counts = run_enrich(indicators, client, log=quiet)
+    assert counts["looked_up"] == 4
+    assert {feed for feed, _sent in session.calls} == {"threatfox", "otx"}
+
+
+def test_run_enrich_a_feed_added_later_is_asked_about_the_old_indicators(indicators):
+    first, _ = make_feed_client(keys={"threatfox": "a", "otx": "o"})
+    run_enrich(indicators, first, log=quiet)
+    full, session = make_feed_client()
+    counts = run_enrich(indicators, full, log=quiet)
+    assert (counts["looked_up"], counts["cached"]) == (4, 4)
+    assert {feed for feed, _sent in session.calls} == {"urlhaus", "virustotal"}
+
+
+def test_run_enrich_a_failed_lookup_stores_nothing_and_is_tried_again(indicators):
+    client, _ = make_feed_client(broken={"urlhaus": 500})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert (counts["failed"], counts["unknown"]) == (2, 6)
+    assert not any(feed == "urlhaus" for _value, feed, _verdict in stored_lookups(indicators))
+    assert sum(line.startswith("urlhaus ") for line in lines) == 2
+    mended, session = make_feed_client()
+    counts = run_enrich(indicators, mended, log=quiet)
+    assert (counts["looked_up"], counts["cached"]) == (2, 6)
+    assert session.asked("urlhaus") == 2
+
+
+def test_run_enrich_a_failure_never_becomes_a_verdict(indicators):
+    client, _ = make_feed_client(broken=dict.fromkeys(FEED_KEYS, 500))
+    run_enrich(indicators, client, log=quiet)
+    assert stored_lookups(indicators) == []
+    verdicts = {row["value"]: novelty({f: v for f, (v, _d) in row["lookups"].items()})
+                for row in novelty_rows(indicators)}
+    assert set(verdicts.values()) == {"unchecked"}
+
+
+def test_run_enrich_leaves_a_feed_alone_once_its_quota_is_spent(indicators):
+    client, session = make_feed_client(broken={"virustotal": 429})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert session.asked("virustotal") == 1  # not once per indicator
+    assert lines == ["virustotal: quota spent, left for the next run"]
+    assert counts["failed"] == 1
+    assert session.asked("threatfox") == 2  # the other feeds carry on
+
+
+def test_run_enrich_budget_exceeded_is_logged_and_what_was_asked_is_kept(indicators):
+    client, session = make_feed_client(budget=3)
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert lines[-1] == "budget exceeded"
+    assert counts["looked_up"] == 3
+    assert len(stored_lookups(indicators)) == 3
+    rest, session = make_feed_client()
+    counts = run_enrich(indicators, rest, log=quiet)
+    assert (counts["looked_up"], counts["cached"]) == (5, 3)
+
+
+def test_run_enrich_with_no_indicators_makes_no_request(conn):
+    client, session = make_feed_client()
+    counts = run_enrich(conn, client, log=quiet)
+    assert session.calls == []
+    assert counts["looked_up"] == 0
+
+
+def test_run_enrich_logs_every_request_and_no_key(indicators):
+    client, _ = make_feed_client(log=http_logger(indicators))
+    run_enrich(indicators, client, log=quiet)
+    rows = [tuple(r) for r in indicators.execute("SELECT path, outcome, error FROM http_log")]
+    assert len(rows) == 8
+    assert ("threatfox:8.8.8.8", "UNKNOWN", None) in rows
+    for key in set(FEED_KEYS.values()):
+        assert key not in json.dumps(rows)
+
+
 # --- the command ---
+
+
+def test_parse_args_enrich_defaults():
+    args = parse_args(["enrich"])
+    assert args.command == "enrich"
+    assert args.db == Path("data/graphwatch.sqlite")
+    assert (args.file, args.refresh, args.budget, args.table) == (None, False, None, False)
+
+
+def test_parse_args_enrich_options():
+    args = parse_args(["enrich", "--file", "x.tsv", "--refresh", "--budget", "40", "--table"])
+    assert (args.file, args.refresh, args.budget, args.table) == (Path("x.tsv"), True, 40, True)
 
 
 @pytest.fixture
@@ -2169,8 +2405,135 @@ def no_feed_network(monkeypatch):
     monkeypatch.setattr("graphwatch.cli.FeedClient", refuse)
 
 
+def test_main_enrich_table_prints_the_stored_table_and_makes_no_request(tmp_path, capsys, no_feed_network):
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    indicator_id = upsert_indicator(c, "ip", "8.8.8.8", "pages", T0, T0, 4)
+    save_lookup(c, indicator_id, "threatfox", "UNKNOWN", None, T0)
+    save_lookup(c, indicator_id, "otx", "UNKNOWN", None, T0)
+    c.close()
+    main(["--config", str(tmp_path / "missing.env"), "enrich", "--db", str(db), "--table"])
+    out = capsys.readouterr().out
+    assert out.startswith("| Indicator | Kind | First seen | Pages | ThreatFox |")
+    assert "| `8.8.8[.]8` | ip |" in out
+    assert "1 indicators: 1 novel, 0 known, 0 unchecked." in out
+    assert "8.8.8.8" not in out
+
+
+def test_main_enrich_without_a_config_file_exits_naming_the_path(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        main(["--config", str(tmp_path / "missing.env"), "enrich", "--db", str(tmp_path / "g.sqlite")])
+    assert "missing.env" in str(exc.value)
+
+
+def test_main_enrich_without_any_feed_key_exits_naming_the_keys(tmp_path, no_feed_network):
+    config = tmp_path / "config.env"
+    config.write_text("HMAC_KEY=00ff\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        main(["--config", str(config), "enrich", "--db", str(tmp_path / "g.sqlite")])
+    for name in ("ABUSE_CH_KEY", "OTX_KEY", "VT_KEY"):
+        assert name in str(exc.value)
+    assert "00ff" not in str(exc.value)
+
+
+@pytest.fixture
+def enrich_workdir(tmp_path, monkeypatch):
+    """A database with one flagged spoof page, a config with two feed keys, and
+    main's FeedClient swapped for one on a fake session."""
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    put(c, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    run_classify(c, log=quiet)
+    c.close()
+    config = tmp_path / "config.env"
+    config.write_text("ABUSE_CH_KEY=abuse-key-made-up\nOTX_KEY=otx-key-made-up\n", encoding="utf-8")
+    session = EnrichSession()
+
+    def fake_client(keys, **kwargs):
+        return FeedClient(keys, session=session, sleep=lambda s: None, **kwargs)
+
+    monkeypatch.setattr("graphwatch.cli.FeedClient", fake_client)
+    return tmp_path, session
+
+
 def enrich_argv(workdir, *extra):
     return ["--config", str(workdir / "config.env"), "enrich", "--db", str(workdir / "g.sqlite"), *extra]
+
+
+def test_main_enrich_looks_up_the_flagged_pages_indicators(enrich_workdir, capsys):
+    workdir, session = enrich_workdir
+    main(enrich_argv(workdir))
+    out = capsys.readouterr().out
+    assert "1 indicators from flagged pages, 0 from the file, feeds: threatfox, urlhaus, otx" in out
+    assert "no key for virustotal (VT_KEY), skipped" in out
+    assert "looked up 3, cached 0, known 0, unknown 3, failed 0, 4 requests" in out
+    assert "1 indicators: 1 novel, 0 known, 0 unchecked" in out
+    sent = " ".join(sent for _feed, sent in session.calls)
+    assert "agfc.harper18.workers.dev" in sent
+    assert "tenable" not in sent  # the decoy is never looked up
+
+
+def test_main_enrich_never_prints_a_key(enrich_workdir, capsys):
+    workdir, _session = enrich_workdir
+    main(enrich_argv(workdir))
+    captured = capsys.readouterr()
+    assert "made-up" not in captured.out + captured.err
+
+
+def test_main_enrich_a_second_run_asks_nothing(enrich_workdir, capsys):
+    workdir, session = enrich_workdir
+    main(enrich_argv(workdir))
+    session.calls.clear()
+    main(enrich_argv(workdir))
+    assert session.calls == []
+    assert "looked up 0, cached 3" in capsys.readouterr().out
+
+
+def test_main_enrich_file_adds_its_indicators_and_skips_its_decoys(enrich_workdir, capsys):
+    workdir, session = enrich_workdir
+    listed = workdir / "indicators-2026-11-22.tsv"
+    listed.write_text(
+        "kind\tvalue\tset\n"
+        "host\tprobe-only.trycloudflare.com\tactor\n"
+        "host\tagfc.harper18.workers.dev\tactor\n"
+        "decoy\twww.juniper.net\tactor\n",
+        encoding="utf-8",
+    )
+    main(enrich_argv(workdir, "--file", str(listed)))
+    out = capsys.readouterr().out
+    assert "1 rows of indicators-2026-11-22.tsv are not an ip, host or url, skipped" in out
+    assert "1 indicators from flagged pages, 2 from the file" in out
+    assert "2 indicators: 2 novel" in out
+    sent = " ".join(sent for _feed, sent in session.calls)
+    assert "probe-only.trycloudflare.com" in sent
+    assert "juniper" not in sent
+    c = connect(workdir / "g.sqlite")
+    sources = {r["value"]: r["source"] for r in c.execute("SELECT value, source FROM indicators")}
+    c.close()
+    assert sources == {
+        "agfc.harper18.workers.dev": "pages",
+        "probe-only.trycloudflare.com": "indicators-2026-11-22.tsv",
+    }
+
+
+def test_main_enrich_then_table_reads_what_the_run_stored(enrich_workdir, capsys):
+    workdir, _session = enrich_workdir
+    main(enrich_argv(workdir))
+    capsys.readouterr()
+    main(enrich_argv(workdir, "--table"))
+    out = capsys.readouterr().out
+    assert "| `agfc.harper18.workers[.]dev` | host |" in out
+    assert "| - | - | - | not checked | novel |" in out
+
+
+def test_main_enrich_builds_no_telegraph_client(enrich_workdir, monkeypatch, capsys):
+    def refuse(*args, **kwargs):
+        raise AssertionError("enrich must not build a Telegraph client")
+
+    monkeypatch.setattr("graphwatch.cli.TelegraphClient", refuse)
+    workdir, _session = enrich_workdir
+    main(enrich_argv(workdir))
+    assert "looked up 3" in capsys.readouterr().out
 
 
 # --- the re-poll every ten minutes, and what the review of 22 November found ---
@@ -2297,6 +2660,40 @@ def test_pages_never_flagged_are_not_rescored(swept):
     add_snapshot(swept, page_id, {"title": "Notes", "description": "", "content": ["second version of the notes"]}, T0 + 60, KEY)
     counts = run_classify(swept, log=quiet)
     assert counts["rescored"] == 0
+
+
+# --- enrich drops what no flagged page holds any more ---
+
+
+def test_main_enrich_drops_an_indicator_whose_page_is_no_longer_flagged(enrich_workdir, capsys):
+    workdir, session = enrich_workdir
+    main(enrich_argv(workdir))
+    c = connect(workdir / "g.sqlite")
+    c.execute("UPDATE scores SET flagged = 0")  # as after a rule fix and a classify rerun
+    c.commit()
+    c.close()
+    capsys.readouterr()
+    main(enrich_argv(workdir))
+    out = capsys.readouterr().out
+    assert "1 indicators are on no flagged page any more, dropped" in out
+    assert "0 indicators: 0 novel" in out
+    c = connect(workdir / "g.sqlite")
+    assert c.execute("SELECT COUNT(*) FROM indicators").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM feed_lookups").fetchone()[0] == 0
+    c.close()
+
+
+def test_main_enrich_keeps_a_file_indicator_between_runs(enrich_workdir, capsys):
+    workdir, session = enrich_workdir
+    listed = workdir / "indicators.tsv"
+    listed.write_text("kind\tvalue\nhost\tprobe-only.trycloudflare.com\n", encoding="utf-8")
+    main(enrich_argv(workdir, "--file", str(listed)))
+    main(enrich_argv(workdir))  # the file is not passed this time
+    out = capsys.readouterr().out
+    assert "dropped" not in out
+    c = connect(workdir / "g.sqlite")
+    assert c.execute("SELECT COUNT(*) FROM indicators").fetchone()[0] == 2
+    c.close()
 
 
 # --- the rules read link targets (decided 22 November) ---
@@ -2468,3 +2865,24 @@ def test_run_resweep_counts_a_page_nested_too_deep_as_failed_and_goes_on(stored)
     assert lines == ["Hello-10-17-1: nested too deep to redact, not stored"]
     assert last_seen(stored, "Hello-10-17-1") == T0
     assert len(snapshots_of(stored, "Hello-10-17-1")) == 1
+
+
+def test_main_enrich_gives_a_file_indicator_back_to_the_file_when_no_page_holds_it(enrich_workdir, capsys):
+    workdir, _session = enrich_workdir
+    listed = workdir / "indicators.tsv"
+    listed.write_text("kind\tvalue\nhost\tagfc.harper18.workers.dev\n", encoding="utf-8")
+    main(enrich_argv(workdir, "--file", str(listed)))
+    c = connect(workdir / "g.sqlite")
+    assert c.execute("SELECT source, pages FROM indicators").fetchone()[:] == ("pages", 1)
+    c.execute("UPDATE scores SET flagged = 0")  # as after a rule fix and a classify rerun
+    c.commit()
+    c.close()
+    capsys.readouterr()
+    main(enrich_argv(workdir, "--file", str(listed)))
+    out = capsys.readouterr().out
+    assert "dropped" not in out
+    c = connect(workdir / "g.sqlite")
+    row = c.execute("SELECT source, first_seen, last_seen, pages FROM indicators").fetchone()
+    assert tuple(row) == ("indicators.tsv", None, None, 0)
+    assert c.execute("SELECT COUNT(*) FROM feed_lookups").fetchone()[0] == 3  # its answers are kept
+    c.close()

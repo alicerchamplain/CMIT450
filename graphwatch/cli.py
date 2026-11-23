@@ -27,9 +27,13 @@ from graphwatch.crowd import (
     sweep_cost,
 )
 from graphwatch.db import (
+    cached_feeds,
     connect,
+    delete_stale_indicators,
+    release_indicator_to_file,
     explain_rows,
     http_logger,
+    indicator_rows,
     label_rows,
     latest_snapshots,
     load_progress,
@@ -39,15 +43,25 @@ from graphwatch.db import (
     resweep_cost,
     resweep_paths,
     save_labels,
+    save_lookup,
     save_progress,
     save_score,
     stale_pages,
     store_fetch,
     store_meta,
     superseded_flagged_snapshots,
+    upsert_indicator,
     upsert_title,
 )
+from graphwatch.enrich import (
+    collect_indicators,
+    novelty,
+    novelty_rows,
+    read_indicator_file,
+    render_novelty_table,
+)
 from graphwatch.extract import extract
+from graphwatch.feeds import FEEDS, KEY_NAMES, FeedClient, Verdict, feed_keys
 from graphwatch.rules import (
     CATEGORIES,
     RULES,
@@ -626,6 +640,65 @@ def run_explain(conn: Connection, path: str, log=print) -> bool:
     return True
 
 
+def run_enrich(
+    conn: Connection, client: FeedClient, refresh: bool = False, log=print
+) -> dict:
+    """Function to look every stored indicator up in every feed the client has a key for
+
+    An answer that is already stored is not asked for again unless refresh
+    is set, so a run that was cut off picks up where it stopped. A failed
+    lookup stores nothing and is tried again next run. A feed that answers
+    429 has run out of quota and is left alone for the rest of the run.
+
+    Args:
+        conn (Connection): SQL db connection
+        client (FeedClient): the feed client
+        refresh (bool, optional): ask again for answers that are already
+            stored. Defaults to False.
+        log (optional): Logging function. Defaults to print.
+
+    Returns:
+        dict: counts of looked_up, cached, known, unknown and failed
+    """
+    counts = {"looked_up": 0, "cached": 0, "known": 0, "unknown": 0, "failed": 0}
+    spent = set()
+    try:
+        for indicator in indicator_rows(conn):
+            cached = set() if refresh else cached_feeds(conn, indicator["id"])
+            for feed in client.feeds():
+                if feed in cached:
+                    counts["cached"] += 1
+                    continue
+                if feed in spent:
+                    continue
+                lookup = client.lookup(feed, indicator["kind"], indicator["value"])
+                counts["looked_up"] += 1
+                if lookup.verdict is Verdict.FAILED:
+                    counts["failed"] += 1
+                    if lookup.status == 429:
+                        spent.add(feed)
+                        log(f"{feed}: quota spent, left for the next run")
+                    else:
+                        log(f"{feed} {indicator['value']}: {lookup.detail}")
+                    continue
+                save_lookup(
+                    conn,
+                    indicator["id"],
+                    feed,
+                    lookup.verdict.name,
+                    lookup.detail,
+                    time.time(),
+                )
+                if lookup.verdict is Verdict.KNOWN:
+                    counts["known"] += 1
+                    log(f"{indicator['value']}: known to {feed} ({lookup.detail})")
+                else:
+                    counts["unknown"] += 1
+    except BudgetExceeded:
+        log("budget exceeded")
+    return counts
+
+
 def parse_args(argv: list[str]):
     """Parse the command line
 
@@ -705,6 +778,18 @@ def parse_args(argv: list[str]):
     classify.add_argument(
         "--explain", metavar="PATH", help="show one page's stored score and hits"
     )
+    enrich = sub.add_parser("enrich", help="look indicators up in the public feeds")
+    enrich.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
+    enrich.add_argument(
+        "--file", type=Path, default=None, help="TSV of more indicators: kind, value"
+    )
+    enrich.add_argument(
+        "--refresh", action="store_true", help="ask again for stored answers"
+    )
+    enrich.add_argument("--budget", type=int, default=None)
+    enrich.add_argument(
+        "--table", action="store_true", help="print the novelty table and exit"
+    )
 
     return parser.parse_args(argv)
 
@@ -733,6 +818,75 @@ def main(argv: list[str] | None = None):
         for value, pages in sorted(counts["scores"].items()):
             print(f"  score {value:+d}: {pages:,}", flush=True)
         print(f"{time.time() - started:.0f}s", flush=True)
+        return
+    if args.command == "enrich":
+        conn = connect(args.db)
+        if args.table:
+            # No client is built: the table is read from what is stored.
+            print(render_novelty_table(novelty_rows(conn)), end="", flush=True)
+            return
+        try:
+            keys = feed_keys(load_config(args.config))
+        except FileNotFoundError:
+            raise SystemExit(f"Config file not found: {args.config}")
+        if not keys:
+            names = ", ".join(sorted(set(KEY_NAMES.values())))
+            raise SystemExit(f"no feed key set in {args.config}: {names}")
+        out = lambda s: print(s, flush=True)  # noqa: E731
+        for feed in FEEDS:
+            if feed not in keys:
+                out(f"no key for {feed} ({KEY_NAMES[feed]}), skipped")
+        found = collect_indicators(conn)
+        for seen in found:
+            upsert_indicator(
+                conn,
+                seen.kind,
+                seen.value,
+                "pages",
+                seen.first_seen,
+                seen.last_seen,
+                seen.pages,
+            )
+        listed = []
+        if args.file is not None:
+            listed, skipped = read_indicator_file(args.file)
+            for seen in listed:
+                upsert_indicator(conn, seen.kind, seen.value, args.file.name)
+            if skipped:
+                out(f"{skipped} rows of {args.file.name} are not an ip, host or url, skipped")
+        # A file's indicator that a flagged page once held and holds no more
+        # is the file's again
+        on_pages = {(seen.kind, seen.value) for seen in found}
+        for seen in listed:
+            if (seen.kind, seen.value) not in on_pages:
+                release_indicator_to_file(conn, seen.kind, seen.value, args.file.name)
+        # What an earlier run found on pages that are no longer flagged, or
+        # that the extractor no longer reports, leaves the table
+        current = {(seen.kind, seen.value) for seen in (*found, *listed)}
+        dropped = delete_stale_indicators(conn, current)
+        if dropped:
+            out(f"{dropped} indicators are on no flagged page any more, dropped")
+        out(
+            f"{len(found)} indicators from flagged pages, {len(listed)} from the file, "
+            f"feeds: {', '.join(feed for feed in FEEDS if feed in keys)}"
+        )
+        client = FeedClient(keys, budget=args.budget, log=http_logger(conn))
+        started = time.time()
+        counts = run_enrich(conn, client, args.refresh, log=out)
+        out(
+            f"looked up {counts['looked_up']:,}, cached {counts['cached']:,}, "
+            f"known {counts['known']:,}, unknown {counts['unknown']:,}, "
+            f"failed {counts['failed']:,}, {client.requests_made:,} requests, "
+            f"{time.time() - started:.0f}s"
+        )
+        verdicts = Counter(
+            novelty({feed: verdict for feed, (verdict, _detail) in row["lookups"].items()})
+            for row in novelty_rows(conn)
+        )
+        out(
+            f"{sum(verdicts.values())} indicators: {verdicts['novel']} novel, "
+            f"{verdicts['known']} known, {verdicts['unchecked']} unchecked"
+        )
         return
     if args.command == "sweep":
         key = require_key(args.config)

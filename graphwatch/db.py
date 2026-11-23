@@ -140,6 +140,26 @@ CREATE TABLE IF NOT EXISTS views (
     views       INTEGER,
     PRIMARY KEY (page_id, fetched_at)
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS indicators (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT    NOT NULL,
+    value       TEXT    NOT NULL,
+    source      TEXT    NOT NULL,  -- 'pages' or the name of the file it came from
+    first_seen  REAL,              -- fetch time of the first snapshot that held it
+    last_seen   REAL,
+    pages       INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (kind, value)
+);
+
+CREATE TABLE IF NOT EXISTS feed_lookups (
+    indicator_id INTEGER NOT NULL REFERENCES indicators(id),
+    feed         TEXT    NOT NULL,
+    verdict      TEXT    NOT NULL,  -- KNOWN or UNKNOWN; a FAILED lookup is not stored
+    detail       TEXT,
+    checked_at   REAL    NOT NULL,
+    PRIMARY KEY (indicator_id, feed)
+);
 """
 
 
@@ -1013,3 +1033,210 @@ def explain_rows(
     """
     hits = conn.execute(hit_select, (row["snapshot_id"],)).fetchall()
     return row, hits
+
+
+def upsert_indicator(
+    conn: Connection,
+    kind: str,
+    value: str,
+    source: str,
+    first_seen: float | None = None,
+    last_seen: float | None = None,
+    pages: int = 0,
+) -> int:
+    """Update and insert (upsert) an indicator in the db
+
+    A second call for the same kind and value keeps the row and its id, so
+    the lookups stored against it stay. A call with source 'pages' sets
+    first_seen, last_seen and pages to what the flagged pages say in this
+    run. A call from a file changes nothing on a row that exists, so an
+    indicator found on pages keeps the source 'pages' and its times.
+
+    Args:
+        conn (Connection): SQL db connection
+        kind (str): ip, host or url
+        value (str): the indicator itself
+        source (str): 'pages', or the name of the file it came from
+        first_seen (float | None, optional): fetch time of the first snapshot
+            that held it. Defaults to None.
+        last_seen (float | None, optional): fetch time of the last snapshot
+            that held it. Defaults to None.
+        pages (int, optional): how many pages held it. Defaults to 0.
+
+    Returns:
+        int: indicator id
+    """
+    select = "SELECT * FROM indicators WHERE kind = ? AND value = ?"
+    existing = conn.execute(select, (kind, value)).fetchone()
+    if existing is None:
+        insert = """
+        INSERT INTO indicators (kind, value, source, first_seen, last_seen, pages)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        cur = conn.execute(insert, (kind, value, source, first_seen, last_seen, pages))
+        conn.commit()
+        return cur.lastrowid
+    if source != "pages":
+        # A file names an indicator and says nothing about where it was seen
+        return existing["id"]
+    # What the flagged pages say now replaces what they said last run: after
+    # a rule fix fewer pages may hold the indicator, and later ones
+    update = """
+    UPDATE indicators SET source = ?, first_seen = ?, last_seen = ?, pages = ?
+    WHERE id = ?
+    """
+    conn.execute(update, ("pages", first_seen, last_seen, pages, existing["id"]))
+    conn.commit()
+    return existing["id"]
+
+
+def release_indicator_to_file(conn: Connection, kind: str, value: str, source: str) -> None:
+    """Give an indicator back to the file that names it
+
+    An indicator that a file names and that a flagged page also held has the
+    source 'pages'. When no flagged page holds it any more the file still
+    names it, so it becomes the file's again: no times and no pages, and
+    delete_stale_indicators leaves it alone.
+
+    Args:
+        conn (Connection): SQL db connection
+        kind (str): ip, host or url
+        value (str): the indicator itself
+        source (str): the name of the file that names it
+    """
+    sql = """
+    UPDATE indicators SET source = ?, first_seen = NULL, last_seen = NULL, pages = 0
+    WHERE kind = ? AND value = ? AND source = 'pages'
+    """
+    conn.execute(sql, (source, kind, value))
+    conn.commit()
+
+
+def delete_stale_indicators(conn: Connection, current: set[tuple[str, str]]) -> int:
+    """Function to drop the indicators that no flagged page holds any more
+
+    An indicator found on pages stays in the table only while a flagged page
+    still gives it. After a rule fix, or a fix to the extractor, the pages
+    that gave it may no longer be flagged, and the novelty table must not
+    keep counting it. Indicators that came from a file are the author's own
+    list and are left alone.
+
+    Args:
+        conn (Connection): SQL db connection
+        current (set[tuple[str, str]]): the (kind, value) pairs found on
+            flagged pages, or named in a file, in this run
+
+    Returns:
+        int: how many indicators were deleted, with their stored lookups
+    """
+    rows = conn.execute("SELECT id, kind, value FROM indicators WHERE source = 'pages'").fetchall()
+    stale = [row["id"] for row in rows if (row["kind"], row["value"]) not in current]
+    for indicator_id in stale:
+        conn.execute("DELETE FROM feed_lookups WHERE indicator_id = ?", (indicator_id,))
+        conn.execute("DELETE FROM indicators WHERE id = ?", (indicator_id,))
+    conn.commit()
+    return len(stale)
+
+
+def save_lookup(
+    conn: Connection,
+    indicator_id: int,
+    feed: str,
+    verdict: str,
+    detail: str | None,
+    ts: float,
+) -> None:
+    """Function to store what one feed said about one indicator
+
+    A second call for the same indicator and feed replaces the first, which
+    is what --refresh is for.
+
+    Args:
+        conn (Connection): SQL db connection
+        indicator_id (int): The indicator that was looked up
+        feed (str): The feed that answered
+        verdict (str): KNOWN or UNKNOWN
+        detail (str | None): what the feed holds, in a few words
+        ts (float): Timestamp of the lookup
+    """
+    sql = """
+    INSERT INTO feed_lookups (indicator_id, feed, verdict, detail, checked_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(indicator_id, feed) DO UPDATE SET
+    verdict    = excluded.verdict,
+    detail     = excluded.detail,
+    checked_at = excluded.checked_at
+    """
+    conn.execute(sql, (indicator_id, feed, verdict, detail, ts))
+    conn.commit()
+
+
+def cached_feeds(conn: Connection, indicator_id: int) -> set[str]:
+    """Fetch the feeds that have already answered for an indicator
+
+    Args:
+        conn (Connection): SQL db connection
+        indicator_id (int): The indicator to look up
+
+    Returns:
+        set[str]: feed names with a stored verdict
+    """
+    sql = "SELECT feed FROM feed_lookups WHERE indicator_id = ?"
+    return {row["feed"] for row in conn.execute(sql, (indicator_id,))}
+
+
+def indicator_rows(conn: Connection) -> list[sqlite3.Row]:
+    """Fetch every stored indicator, in the order the novelty table lists them
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        list[sqlite3.Row]: indicator rows, by kind and then by first_seen,
+            with the ones that have no first_seen last
+    """
+    sql = """
+    SELECT id, kind, value, source, first_seen, last_seen, pages FROM indicators
+    ORDER BY kind, first_seen IS NULL, first_seen, value
+    """
+    return conn.execute(sql).fetchall()
+
+
+def lookup_rows(conn: Connection, indicator_id: int) -> list[sqlite3.Row]:
+    """Fetch the stored verdicts for one indicator
+
+    Args:
+        conn (Connection): SQL db connection
+        indicator_id (int): The indicator to look up
+
+    Returns:
+        list[sqlite3.Row]: rows of feed, verdict, detail and checked_at
+    """
+    sql = """
+    SELECT feed, verdict, detail, checked_at FROM feed_lookups
+    WHERE indicator_id = ? ORDER BY feed
+    """
+    return conn.execute(sql, (indicator_id,)).fetchall()
+
+
+def flagged_page_snapshots(conn: Connection) -> sqlite3.Cursor:
+    """Function to read every snapshot of every page the classifier has flagged
+
+    Every snapshot, not only the newest: the actor edits pages in place, so
+    the address a page held last week is in an older snapshot. Held-out
+    pages are left out.
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        sqlite3.Cursor: rows of page_id, fetched_at, title and text, oldest first
+    """
+    sql = """
+    SELECT s.page_id, s.fetched_at, s.title, s.text
+    FROM snapshots s JOIN pages p ON p.id = s.page_id
+    WHERE p.held_out = 0
+      AND EXISTS (SELECT 1 FROM scores sc WHERE sc.page_id = p.id AND sc.flagged = 1)
+    ORDER BY s.fetched_at, s.id
+    """
+    return conn.execute(sql)

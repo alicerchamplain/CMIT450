@@ -15,10 +15,13 @@ from graphwatch.db import (
     SCHEMA,
     add_event,
     add_snapshot,
+    cached_feeds,
     connect,
     explain_rows,
+    flagged_page_snapshots,
     held_out_paths,
     http_logger,
+    indicator_rows,
     is_gone,
     label_rows,
     latest_snapshots,
@@ -26,17 +29,21 @@ from graphwatch.db import (
     parse_path,
     refresh_snapshot,
     superseded_flagged_snapshots,
+    delete_stale_indicators,
     BUSY_TIMEOUT_S,
     load_progress,
+    lookup_rows,
     mark_gone,
     resweep_cost,
     resweep_paths,
     stale_pages,
     save_labels,
+    save_lookup,
     save_progress,
     save_score,
     store_fetch,
     store_meta,
+    upsert_indicator,
     upsert_page,
     upsert_title,
 )
@@ -1673,6 +1680,179 @@ def test_a_rotation_writes_one_content_changed_event_at_the_fetch_time(conn):
 
 
 # --------------------------------------------------------------------------
+# indicators and feed_lookups (issue #38, plan/enrichment-plan-2026-11-22.md)
+# --------------------------------------------------------------------------
+
+
+def indicator(conn, indicator_id: int) -> dict:
+    return dict(conn.execute("SELECT * FROM indicators WHERE id = ?", (indicator_id,)).fetchone())
+
+
+def test_connect_creates_the_enrichment_tables(conn):
+    assert {"indicators", "feed_lookups"} <= tables(conn)
+    assert columns(conn, "indicators") == {
+        "id", "kind", "value", "source", "first_seen", "last_seen", "pages",
+    }
+    assert columns(conn, "feed_lookups") == {
+        "indicator_id", "feed", "verdict", "detail", "checked_at",
+    }
+
+
+def test_upsert_indicator_stores_a_new_indicator(conn):
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0 + 60, 4)
+    assert indicator(conn, indicator_id) == {
+        "id": indicator_id,
+        "kind": "ip",
+        "value": "8.8.8.8",
+        "source": "pages",
+        "first_seen": T0,
+        "last_seen": T0 + 60,
+        "pages": 4,
+    }
+
+
+def test_upsert_indicator_from_a_file_has_no_times_and_no_pages(conn):
+    indicator_id = upsert_indicator(conn, "host", "c2.example.org", "indicators.tsv")
+    row = indicator(conn, indicator_id)
+    assert (row["source"], row["first_seen"], row["last_seen"], row["pages"]) == (
+        "indicators.tsv", None, None, 0,
+    )
+
+
+def test_upsert_indicator_twice_keeps_one_row_and_its_id(conn):
+    first = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 1)
+    second = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 1)
+    assert first == second
+    assert conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0] == 1
+
+
+def test_the_same_value_under_two_kinds_is_two_indicators(conn):
+    a = upsert_indicator(conn, "host", "8.8.8.8", "pages")
+    b = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    assert a != b
+
+
+def test_upsert_indicator_from_pages_stores_what_the_pages_say_now(conn):
+    # collect_indicators reads every snapshot of every flagged page each run,
+    # so its answer is the whole truth: after a rule fix fewer pages may hold
+    # the indicator, and the first of them may be a later one.
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0 + 200, 5)
+    upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0 + 50, T0 + 150, 2)
+    row = indicator(conn, indicator_id)
+    assert (row["first_seen"], row["last_seen"], row["pages"]) == (T0 + 50, T0 + 150, 2)
+
+
+def test_upsert_indicator_does_not_lose_times_to_a_file_row(conn):
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0 + 60, 3)
+    upsert_indicator(conn, "ip", "8.8.8.8", "indicators.tsv")
+    row = indicator(conn, indicator_id)
+    assert (row["source"], row["first_seen"], row["last_seen"], row["pages"]) == (
+        "pages", T0, T0 + 60, 3,
+    )
+
+
+def test_a_file_indicator_later_found_on_pages_becomes_a_pages_indicator(conn):
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "indicators.tsv")
+    upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 2)
+    row = indicator(conn, indicator_id)
+    assert (row["source"], row["first_seen"], row["pages"]) == ("pages", T0, 2)
+
+
+def test_upsert_indicator_keeps_the_lookups_stored_against_it(conn):
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 1)
+    save_lookup(conn, indicator_id, "otx", "UNKNOWN", None, T0)
+    upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0 + 60, 2)
+    assert cached_feeds(conn, indicator_id) == {"otx"}
+
+
+def test_save_lookup_round_trip(conn):
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    save_lookup(conn, indicator_id, "threatfox", "KNOWN", "2 IOCs", T0 + 5)
+    save_lookup(conn, indicator_id, "otx", "UNKNOWN", None, T0 + 6)
+    assert [tuple(r) for r in lookup_rows(conn, indicator_id)] == [
+        ("otx", "UNKNOWN", None, T0 + 6),
+        ("threatfox", "KNOWN", "2 IOCs", T0 + 5),
+    ]
+
+
+def test_save_lookup_twice_replaces_the_answer_for_that_feed(conn):
+    # What --refresh does: the newer answer and its time win.
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    save_lookup(conn, indicator_id, "otx", "UNKNOWN", None, T0)
+    save_lookup(conn, indicator_id, "otx", "KNOWN", "1 pulses", T0 + 99)
+    assert [tuple(r) for r in lookup_rows(conn, indicator_id)] == [
+        ("otx", "KNOWN", "1 pulses", T0 + 99)
+    ]
+
+
+def test_cached_feeds_names_the_feeds_that_answered_for_one_indicator(conn):
+    a = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    b = upsert_indicator(conn, "ip", "9.9.9.9", "pages")
+    save_lookup(conn, a, "otx", "UNKNOWN", None, T0)
+    save_lookup(conn, a, "virustotal", "KNOWN", "x", T0)
+    save_lookup(conn, b, "threatfox", "UNKNOWN", None, T0)
+    assert cached_feeds(conn, a) == {"otx", "virustotal"}
+    assert cached_feeds(conn, b) == {"threatfox"}
+
+
+def test_cached_feeds_is_empty_for_an_indicator_never_looked_up(conn):
+    assert cached_feeds(conn, upsert_indicator(conn, "ip", "8.8.8.8", "pages")) == set()
+
+
+def test_a_lookup_survives_closing_the_database(tmp_path):
+    # The cache is what lets a run that was cut off pick up where it stopped.
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    indicator_id = upsert_indicator(c, "ip", "8.8.8.8", "pages")
+    save_lookup(c, indicator_id, "otx", "UNKNOWN", None, T0)
+    c.close()
+    c = connect(db)
+    assert cached_feeds(c, indicator_id) == {"otx"}
+    c.close()
+
+
+def test_indicator_rows_is_by_kind_then_first_seen_with_untimed_ones_last(conn):
+    upsert_indicator(conn, "ip", "9.9.9.9", "pages", T0 + 60, T0 + 60, 1)
+    upsert_indicator(conn, "ip", "1.1.1.1", "indicators.tsv")
+    upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 1)
+    upsert_indicator(conn, "host", "c2.example.org", "pages", T0 + 600, T0 + 600, 1)
+    assert [(r["kind"], r["value"]) for r in indicator_rows(conn)] == [
+        ("host", "c2.example.org"),
+        ("ip", "8.8.8.8"),
+        ("ip", "9.9.9.9"),
+        ("ip", "1.1.1.1"),
+    ]
+
+
+def test_flagged_page_snapshots_reads_every_snapshot_of_a_flagged_page(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    flag(conn, a, True)
+    add_snapshot(conn, a, {"title": "t", "content": ["rotated"]}, T0 + 60, KEY)
+    rows = flagged_page_snapshots(conn).fetchall()
+    assert [(r["page_id"], r["fetched_at"]) for r in rows] == [(a, T0), (a, T0 + 60)]
+    assert set(rows[0].keys()) == {"page_id", "fetched_at", "title", "text"}
+
+
+def test_flagged_page_snapshots_leaves_out_unflagged_and_held_out_pages(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    b = seen_page(conn, "Hello-10-17-2", T0)
+    seen_page(conn, "Hello-10-17-3", T0)  # never classified
+    known = upsert_page(conn, "Known-01-02", T0, held_out=True)
+    add_snapshot(conn, known, {"title": "k", "content": ["x"]}, T0, KEY)
+    flag(conn, a, True)
+    flag(conn, b, False)
+    flag(conn, known, True)
+    assert [r["page_id"] for r in flagged_page_snapshots(conn)] == [a]
+
+
+def test_flagged_page_snapshots_reads_no_author_field(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    flag(conn, a, True)
+    row = flagged_page_snapshots(conn).fetchone()
+    assert not {"author_name", "author_url"} & set(row.keys())
+
+
+# --------------------------------------------------------------------------
 # the ten-minute re-poll: a snapshot only on change, views kept apart, and
 # two writers that wait for each other (decided 22 November)
 # --------------------------------------------------------------------------
@@ -1816,6 +1996,26 @@ def test_a_flagged_page_with_one_snapshot_has_nothing_superseded(conn):
     a = seen_page(conn, "Hello-10-17-1", T0)
     flag(conn, a, True)
     assert superseded_flagged_snapshots(conn) == []
+
+
+def test_delete_stale_indicators_drops_page_indicators_that_are_not_current(conn):
+    keep = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 1)
+    gone = upsert_indicator(conn, "host", "old.example.org", "pages", T0, T0, 1)
+    listed = upsert_indicator(conn, "host", "probe.example.org", "indicators.tsv")
+    for indicator_id in (keep, gone, listed):
+        save_lookup(conn, indicator_id, "otx", "UNKNOWN", None, T0)
+    assert delete_stale_indicators(conn, {("ip", "8.8.8.8")}) == 1
+    assert [(r["kind"], r["value"]) for r in indicator_rows(conn)] == [
+        ("host", "probe.example.org"),
+        ("ip", "8.8.8.8"),
+    ]
+    assert conn.execute("SELECT COUNT(*) FROM feed_lookups").fetchone()[0] == 2
+    assert cached_feeds(conn, keep) == {"otx"}
+
+
+def test_delete_stale_indicators_with_everything_current_deletes_nothing(conn):
+    upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 1)
+    assert delete_stale_indicators(conn, {("ip", "8.8.8.8"), ("ip", "9.9.9.9")}) == 0
 
 
 # --- what the second review of 22 November found -------------------------------------
