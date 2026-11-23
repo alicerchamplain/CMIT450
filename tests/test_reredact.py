@@ -14,8 +14,17 @@ import pytest
 
 from graphwatch.cli import run_classify
 from graphwatch.db import add_snapshot, connect, fingerprint, resweep_paths, save_labels, save_score, upsert_page
-from graphwatch.redact import hash_secret, redact_page
-from graphwatch.reredact import SCHEMES, main, reredact, reredact_snapshot, restore_schemes, scheme_hashes
+from graphwatch.redact import BARE_LOGIN_PASSWORD_PATTERN, hash_secret, redact_page
+from graphwatch.reredact import (
+    SCHEMES,
+    main,
+    port_hashes,
+    reredact,
+    reredact_snapshot,
+    restore_ports,
+    restore_schemes,
+    scheme_hashes,
+)
 from graphwatch.telegraph import page_text
 
 T0 = 1_700_000_000.0
@@ -437,6 +446,127 @@ def test_a_hashed_scheme_with_no_secret_behind_it_is_put_back_too(conn):
     snapshot_id = store_raw(conn, "x-11-10", "t", as_stored_since_6_november(raw))
     assert reredact(conn, KEY, log=lambda s: None)["changed"] == 1
     assert rewritten(snapshot(conn, snapshot_id)) == as_ingested_today(page_of("t", raw))
+
+
+# --- a proxy line stored with its port hashed and its password in clear ------------------
+
+PROXY_LINE = "proxy.example.org:8080:bob:hunter2pw"
+
+
+def as_stored_until_23_november(line: str) -> str:
+    """A host:port:user:password line as it was stored: the port hashed, as the
+    password of a login called proxy.example.org, and the password in clear."""
+    host, port, rest = line.split(":", 2)
+    return f"{host}:{hash_secret(port, KEY)}:{rest}"
+
+
+def test_the_bare_login_pattern_hashes_the_port_of_a_proxy_line_and_nothing_else():
+    # Why the rows below look as they do: as_stored_until_23_november has to
+    # agree with the pattern, which is the same one today.
+    then = BARE_LOGIN_PASSWORD_PATTERN.sub(
+        lambda m: m.group(0)[: m.start(3) - m.start()] + hash_secret(m.group(3), KEY), PROXY_LINE
+    )
+    assert then == as_stored_until_23_november(PROXY_LINE)
+    assert then == f"proxy.example.org:{hash_secret('8080', KEY)}:bob:hunter2pw"
+
+
+def test_port_hashes_covers_every_string_of_one_to_five_digits():
+    hashes = port_hashes(KEY)
+    assert len(hashes) == 10 + 100 + 1000 + 10000 + 100000
+    for digits in ("0", "80", "8080", "65535", "99999", "00080"):
+        assert hashes[hash_secret(digits, KEY)] == digits
+    assert hash_secret("100000", KEY) not in hashes
+    # Worked out once for a key and kept
+    assert port_hashes(KEY) is hashes
+    assert hash_secret("8080", KEY) not in port_hashes(b"another-key" * 3)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        PROXY_LINE,
+        "PX-1.Example-Host.ORG:8080:bob:hunter2pw",  # in any case, with hyphens
+        "a.b2:00080:u:p",  # labels of one character, a digit in the last, a port with zeros in front
+        "proxy.xn--p1ai:8080:bob:hunter2pw",  # a hyphen in the last label
+        'proxy.example.org:8080:bo"b:hunter2pw',  # a quote in the user, which a title can hold
+    ],
+)
+def test_restore_ports_puts_the_port_back_whatever_the_host_is_called(line):
+    assert restore_ports(as_stored_until_23_november(line), KEY) == line
+
+
+def test_restore_ports_puts_the_port_of_a_proxy_line_back_and_touches_nothing_else():
+    stored = as_stored_until_23_november(PROXY_LINE)
+    assert restore_ports(f"use {stored} today", KEY) == f"use {PROXY_LINE} today"
+    assert restore_ports(None, KEY) is None
+    assert restore_ports("plain text", KEY) == "plain text"
+    # It needs the key the sweep used
+    assert restore_ports(stored, b"another-key" * 3) == stored
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        # A password, not a port: only the hash of one to five digits is put back
+        f"first.last:{hash_secret('hunter2', KEY)}:First:Last",
+        f"first.last:{hash_secret('123456', KEY)}:First:Last",
+        # A hashed port with no user and password after it is not a proxy line,
+        # and put back it would only be hashed again
+        f"proxy.example.org:{hash_secret('8080', KEY)}",
+        f"proxy.example.org:{hash_secret('8080', KEY)}:bob",
+        f"proxy.example.org:{hash_secret('8080', KEY)} bob:x",
+        # One label is not a host
+        f"port:{hash_secret('8080', KEY)}:bob:hunter2pw",
+    ],
+)
+def test_restore_ports_leaves_any_other_hash_where_it_is(stored):
+    assert restore_ports(stored, KEY) == stored
+
+
+@pytest.mark.parametrize(
+    "raw, secret",
+    [
+        (PROXY_LINE, "hunter2pw"),
+        ("free: proxy.example.org:8080:bob:hunter2pw and px2.example.org:00080:amy:other-pw-2", "other-pw-2"),
+        ('say "proxy.example.org:8080:bob:hunter2pw" twice', "hunter2pw"),  # quotes are escaped in the content column
+        # An address has no letter, so nothing was hashed in this line at all
+        ("203.0.113.7:8080:bob:hunter2pw", "hunter2pw"),
+    ],
+)
+def test_a_proxy_line_stored_with_its_password_in_clear_comes_out_as_a_fresh_fetch_would(conn, raw, secret):
+    stored = re.sub(r"[\w.-]+\.org:\d+:\S+", lambda m: as_stored_until_23_november(m.group(0)), raw)
+    assert secret in stored
+    snapshot_id = store_raw(conn, "x-11-10", stored, stored)
+    counts = reredact(conn, KEY, log=lambda s: None)
+    assert counts == {"snapshots": 1, "changed": 1, "pages": 1, "hashed_schemes": 0}
+    row = snapshot(conn, snapshot_id)
+    assert secret not in "".join(row[column] for column in REWRITTEN)
+    assert rewritten(row) == as_ingested_today(page_of(raw, raw))
+    assert reredact(conn, KEY, log=lambda s: None)["changed"] == 0
+
+
+def test_a_hashed_password_in_front_of_two_more_fields_is_not_taken_for_a_port(conn):
+    stored = f"first.last:{hash_secret('hunter2', KEY)}:First:Last"
+    snapshot_id = store_raw(conn, "x-11-10", "t", stored)
+    before = rewritten(snapshot(conn, snapshot_id))
+    assert reredact(conn, KEY, log=lambda s: None)["changed"] == 0
+    assert rewritten(snapshot(conn, snapshot_id)) == before
+
+
+HASHED_FIELD = hash_secret("8080", KEY)
+LONG_STORED_RUNS = {
+    "hashed fields": ("a.b:" + HASHED_FIELD + ":") * 800,
+    "dotted labels and a hash": "ab.cd-" * 10000 + ":" + HASHED_FIELD + ":u:p",
+    "hosts with no hash": "a.b:" * 15000,
+    "dotted labels and no hash": "ab.cd-" * 10000 + " " + HASHED_FIELD,
+    "a hash and a long user": "a.b:" + HASHED_FIELD + ":" + "u" * 60000,
+}
+
+
+@pytest.mark.parametrize("text", LONG_STORED_RUNS.values(), ids=LONG_STORED_RUNS.keys())
+def test_restore_ports_is_quick_on_a_long_run(text, laptop_seconds):
+    port_hashes(KEY)  # not what is timed: it is worked out once for a run
+    assert laptop_seconds(lambda: restore_ports(text, KEY)) < 1.0
 
 
 @pytest.mark.parametrize(

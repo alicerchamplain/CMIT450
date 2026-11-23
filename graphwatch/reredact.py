@@ -20,6 +20,12 @@ scheme before the snapshot is redacted again; the pattern no longer takes a
 scheme for a password. What comes out is what a fresh fetch of the same page
 would store.
 
+A second thing is undone the same way. A proxy listed as host:port:user:password
+was stored as host:SECRET{...}:user:password: the same pattern took the host
+for a login and hashed the port, and nothing hashed the password. The pattern
+for that line needs to see the port, and a port is one of 111,110 strings of
+one to five digits, so its hash is put back to the port first.
+
 The hits and labels of a rewritten snapshot are deleted, because a stored hit
 quotes the old text as evidence. Its score row is kept, so a page that was
 flagged stays on the re-poll's list. Run classify afterwards.
@@ -29,6 +35,7 @@ not match the same secret hashed in October. Back up the database first (#41).
 """
 
 import argparse
+import functools
 import json
 import re
 import sqlite3
@@ -83,6 +90,24 @@ SCHEMES = (
 # ://                      : where a scheme stands
 HASHED_SCHEME_PATTERN = re.compile(r"SECRET\{[0-9a-f]{64}\}://")
 
+# Regex for the hashed port of a proxy line, host:SECRET{...}:user:password
+# (?<![\w.:-])                             : negative lookbehind, this is the first char of the host
+# ((?:[a-z0-9-]{1,63}\.)+[a-z0-9-]{1,63}:) : group 1, the host and the colon after it
+# (SECRET\{[0-9a-f]{64}\})                 : group 2, a hash where the port stood
+# (?=:[^\s:]+:[^\s:])                      : positive lookahead, a user and the start of a password
+#                                            follow. In content, which is JSON here, that can
+#                                            run past the end of a text node; a port put back
+#                                            where it was not needed is hashed again as it was
+# re.IGNORECASE                            : tells the python regex to ignore upper vs lowercase
+HASHED_PORT_PATTERN = re.compile(
+    r"(?<![\w.:-])((?:[a-z0-9-]{1,63}\.)+[a-z0-9-]{1,63}:)(SECRET\{[0-9a-f]{64}\})"
+    r"(?=:[^\s:]+:[^\s:])",
+    re.IGNORECASE,
+)
+
+# A port as redact.py's proxy line pattern reads one: one to five digits
+PORT_DIGITS = 5
+
 
 def scheme_hashes(key: bytes) -> dict[str, str]:
     """Function to work out what each scheme looks like after the old pattern hashed it
@@ -118,6 +143,49 @@ def restore_schemes(s: str | None, hashes: dict[str, str]) -> str | None:
     return s
 
 
+@functools.lru_cache(maxsize=1)
+def port_hashes(key: bytes) -> dict[str, str]:
+    """Function to work out what every port looks like after it was hashed
+
+    Worked out once for a key and kept: it is 111,110 hashes.
+
+    Args:
+        key (bytes): The hmac key for redactions
+
+    Returns:
+        dict[str, str]: "SECRET{...}" to the digits, for every string of one
+            to PORT_DIGITS digits, 0 and 00080 included
+    """
+    hashes = {}
+    for width in range(1, PORT_DIGITS + 1):
+        for number in range(10**width):
+            digits = f"{number:0{width}d}"
+            hashes[hash_secret(digits, key)] = digits
+    return hashes
+
+
+def restore_ports(s: str | None, key: bytes) -> str | None:
+    """Function to put the hashed port of a proxy line back
+
+    Only in host:SECRET{...}:user:password, and only when the hash is the
+    hash of one to five digits. A hash of anything else stays: it is a
+    password, as in first.last:SECRET{...}:First:Last.
+
+    Args:
+        s (str | None): stored text: a title, a description, or content as JSON
+        key (bytes): The hmac key for redactions
+
+    Returns:
+        str | None: the text with host:SECRET{...}:user:password read host:8080:user:password again
+    """
+    if s is None or HASHED_PORT_PATTERN.search(s) is None:
+        return s
+    ports = port_hashes(key)
+    return HASHED_PORT_PATTERN.sub(
+        lambda m: m.group(1) + ports.get(m.group(2), m.group(2)), s
+    )
+
+
 def reredact_snapshot(
     row: sqlite3.Row, key: bytes, hashes: dict[str, str] | None = None
 ) -> dict | None:
@@ -141,9 +209,9 @@ def reredact_snapshot(
         "content": json.loads(row["content"]),
     }
     restored = {
-        "title": restore_schemes(row["title"], hashes),
-        "description": restore_schemes(row["description"], hashes),
-        "content": json.loads(restore_schemes(row["content"], hashes)),
+        "title": restore_ports(restore_schemes(row["title"], hashes), key),
+        "description": restore_ports(restore_schemes(row["description"], hashes), key),
+        "content": json.loads(restore_ports(restore_schemes(row["content"], hashes), key)),
     }
     page = redact_page(restored, key)
     if page == stored:

@@ -579,6 +579,7 @@ def test_a_password_beside_an_already_hashed_user_is_hashed():
         "https://www.tenable.com@agfc.harper18.workers.dev/",
         # A server and its port, with an @ somewhere after them
         "socks5://proxy.example.org:1080@elsewhere",
+        "socks5://8.8.8.8:1080@a@elsewhere",  # and with a second @ after them
         "socks5://8.8.8.8:10800?owner=a@b.example.org",
         "socks5://8.8.8.8:10800#owner@b.example.org",
         "trojan://vpn.example.org/a@b",
@@ -592,6 +593,105 @@ def test_a_password_beside_an_already_hashed_user_is_hashed():
 )
 def test_a_url_with_no_login_in_front_of_its_host_is_left_alone(s):
     assert redact_text(s, KEY) == s
+
+
+def test_a_url_password_with_no_user_in_front_of_it_is_hashed():
+    # redis://:password@host is how a store with a password and no user is
+    # written. The user had to be one character at least, so nothing matched,
+    # and the email pattern then read password@host:6379 and hashed the port.
+    out = redact_text("cache redis://:hunter2pw@db.example.org:6379/0 up", KEY)
+    assert out == "cache redis://:" + hash_secret("hunter2pw", KEY) + "@db.example.org:6379/0 up"
+
+
+def test_a_url_password_with_an_at_sign_in_it_is_hashed_to_the_last_at_sign():
+    # The host starts after the last @. Cut at the first one, the tail of the
+    # password stayed in clear and was read as the host.
+    out = redact_text("ftp://bob:hun@ter2pw@files.example.org/x", KEY)
+    assert out == "ftp://" + hash_secret("bob:hun@ter2pw", KEY) + "@files.example.org/x"
+
+
+@pytest.mark.parametrize(
+    "s",
+    [
+        "redis://:hunter2pw@db.example.org:6379/0",
+        "ftp://bob:hun@ter2pw@files.example.org/x",
+    ],
+)
+def test_a_url_login_of_either_new_shape_is_hashed_in_a_link_target_and_only_once(s):
+    once = redact_text(s, KEY, link=True)
+    assert once == redact_text(s, KEY)
+    assert len(tokens(once)) == 1
+    assert redact_text(once, KEY, link=True) == once
+
+
+# --- a proxy on one line: address:port:user:password --------------------------------
+
+
+@pytest.mark.parametrize(
+    "line, password",
+    [
+        ("203.0.113.7:8080:bob:hunter2pw", "hunter2pw"),
+        ("use 203.0.113.7:8080:bob:hunter2pw today", "hunter2pw"),
+        ("203.0.113.7:8080:bob:654321", "654321"),  # all digits, and the last thing in the text
+        ("socks5://203.0.113.7:1080:bob:hunter2pw", "hunter2pw"),
+        ("203.0.113.7:8080:bob:hunter2pw:US", "hunter2pw"),  # a fifth field is not part of it
+        ("0.0.0.0:1:u:p", "p"),  # the shortest port, user and password
+        ("203.0.113.7:65535:bob:hunter2pw", "hunter2pw"),  # five digits of port
+        ("//PX-1.Example-Host.ORG:8080:bob:hunter2pw", "hunter2pw"),  # a name, in any case, with hyphens
+        ("//a.b:8080:bob:hunter2pw", "hunter2pw"),  # labels of one character
+        ("//proxy.xn--p1ai:8080:bob:hunter2pw", "hunter2pw"),  # a hyphen in the last label
+    ],
+)
+def test_the_password_of_a_proxy_line_is_hashed_and_the_rest_of_the_line_kept(line, password):
+    # Nothing hashed it: the user comes right after a colon, where a bare
+    # login cannot start, and an IP address has no letter to be a login.
+    assert redact_text(line, KEY) == hashed(line, password)
+    assert redact_text(line, KEY, link=True) == hashed(line, password)
+
+
+def test_every_line_of_a_list_of_proxies_is_hashed():
+    lines = [f"203.0.113.{n}:8080:user{n}:made-up-{n}-pw" for n in range(1, 13)]
+    expected = [hashed(line, f"made-up-{n}-pw") for n, line in enumerate(lines, start=1)]
+    assert redact_text("\n".join(lines), KEY) == "\n".join(expected)
+
+
+def test_a_proxy_line_with_a_host_name_has_its_password_hashed_and_loses_its_port():
+    # proxy.example.org:8080 is also a login and a numeric password, and
+    # nothing tells the two apart, so the bare login pattern goes on hashing
+    # the port as it did. Until 23 November that was all it hashed.
+    line = "proxy.example.org:8080:bob:hunter2pw"
+    assert redact_text(line, KEY) == hashed(line, "8080", "hunter2pw")
+    # In a link target the bare login pattern does not run, so the port stays
+    assert redact_text(line, KEY, link=True) == hashed(line, "hunter2pw")
+
+
+def test_a_proxy_line_behind_a_label_has_its_password_hashed():
+    # socks5:address:port:user:password. The bare login pattern reads the
+    # label as a login and hashes the address as its password, as it always
+    # did; until 23 November the password stayed.
+    line = "socks5:203.0.113.7:1080:bob:hunter2pw"
+    assert redact_text(line, KEY) == hashed(line, "203.0.113.7", "hunter2pw")
+    assert redact_text(line, KEY, link=True) == hashed(line, "hunter2pw")
+
+
+@pytest.mark.parametrize(
+    "s",
+    [
+        "203.0.113.7:8080",
+        "203.0.113.7:8080:bob",  # no password field
+        "203.0.113.7:8080::x",  # no user
+        "203.0.113.7:8080:not a:proxy",  # a space in the user field
+        "ftp://bob:@files.example.org/x",  # a URL login with no password
+        "203.0.113.7:8080:bob:",  # an empty one
+        "203.0.113.7:808080:bob:hunter2pw",  # six digits are not a port
+        "203.0.113.7::bob:hunter2pw",
+        "x203.0.113.7:8080:bob:" + MARKER + "0" * 64 + "}",  # hashed already
+        "meet 12:30:45:10",  # one label is not an address
+        "http://localhost:3000:a:b",
+    ],
+)
+def test_a_line_that_is_not_address_port_user_password_is_left_alone(s):
+    assert redact_text(s, KEY, link=True) == s
 
 
 # --- secrets in the parameters of a link ----------------------------------------
@@ -784,6 +884,12 @@ def test_every_line_of_a_long_list_of_logins_is_hashed():
         "bob@mail.example.com:https://d.example/in?token=abcdefghijklmnopqrstuvwx",
         "link:https://d.example/in?token=abcdefghijklmnopqrstuvwx",
         "pass:word user:name key:value 12:30",
+        "203.0.113.7:8080:bob:hunter2pw",
+        "socks5:203.0.113.7:1080:bob:hunter2pw",
+        "proxy.example.org:8080:bob:hunter2pw",
+        "first.last:12345:First:Last",  # the bare login pattern and the proxy line pattern both have a say
+        "redis://:hunter2pw@db.example.org:6379/0",
+        "ftp://bob:hun@ter2pw@files.example.org/x",
     ],
 )
 def test_redact_text_twice_is_redact_text_once(s):
@@ -1372,6 +1478,12 @@ LONG_RUNS = {
     "a label and spaces": "password:" + " " * 64000,
     "dots in front of a scheme": "a.a." * 16000 + "://x:y@z",
     "token parameters": "?token=" * 9000,
+    "proxy lines with no password": "1.2.3.4:80:a:" * 5000,
+    "a dotted run and then a port": "ab.cd-" * 10000 + ":80:a:b",
+    "addresses and ports": "a.b:1:" * 10000,
+    "a url login and a long password with no @": "a://b:" + "x" * 60000,
+    "a url login and a password of @ signs": "a://b:" + "x@" * 30000,
+    "url logins with no user": "a://:x" * 10000,
     "short parameters": "#a=" * 20000,
 }
 

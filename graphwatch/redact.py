@@ -178,20 +178,39 @@ PROXY_ENDPOINT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# A proxy written on one line as address:port:user:password, the way sellers list them.
+# No other pattern sees its password: the user comes right after a colon, where a bare
+# login cannot start, and an IP address has no letter in it to be a login itself.
+#
+# (?<![\w.-])                               : negative lookbehind, this is the first char of the address.
+#                                             A colon may stand in front, as in socks5:8.8.8.8:1080:user:password
+# ((?:[a-z0-9-]{1,63}\.)+[a-z0-9-]{1,63}    : group 1 starts, the address: two or more labels with dots
+#                                             between them, so 8.8.8.8 and proxy.site.com both fit
+#  :\d{1,5}                                 : the port
+#  :[^\s:]+:)                               : the user, between two colons; group 1 ends
+# ([^\s:]+)                                 : group 2, the password up to the next whitespace or colon
+# re.IGNORECASE                             : tells the python regex to ignore upper vs lowercase
+PROXY_LOGIN_PATTERN = re.compile(
+    r"(?<![\w.-])((?:[a-z0-9-]{1,63}\.)+[a-z0-9-]{1,63}:\d{1,5}:[^\s:]+:)([^\s:]+)",
+    re.IGNORECASE,
+)
+
 # \b                        : word boundary, so it does not start mid-word
 # ([a-z][a-z0-9+.-]{1,15})  : group 1, any scheme: http, https, socks5 and the rest.
 #                             At most 16 characters, so a long dotted run is not read
 #                             again from every dot
 # (://)                     : group 2, the scheme separator
-# ([^\s/@:?#]+             : group 3, the user: no slash, ? or #, so this is still the
-#                             part of the URL before its path and query
+# ([^\s/@:?#]*)             : group 3, the user: no slash, ? or #, so this is still the
+#                             part of the URL before its path and query. It can be
+#                             empty, redis://:password@host has no user
 # (:)                       : group 4, the colon that makes it credentials and not the
 #                             decoy of a spoof, www.site.com@other.site
-# ([^\s/@?#]+)              : group 5, the password
+# ([^\s/?#]+)               : group 5, the password. It may hold an @ of its own: the
+#                             host starts after the last @, as a browser reads it
 # (?=@)                     : positive lookahead, the @ must follow but stays in the text
 # re.IGNORECASE             : tells the python regex to ignore upper vs lowercase
 URL_CREDENTIALS_PATTERN = re.compile(
-    r"\b([a-z][a-z0-9+.-]{1,15})(://)([^\s/@:?#]+)(:)([^\s/@?#]+)(?=@)",
+    r"\b([a-z][a-z0-9+.-]{1,15})(://)([^\s/@:?#]*)(:)([^\s/?#]+)(?=@)",
     re.IGNORECASE,
 )
 
@@ -454,15 +473,22 @@ def redact_text(
         user, password = m.group(3), m.group(5)
         if password.startswith(MARKER):
             return m.group(0)
-        # 8.8.8.8:8080 in front of an @ further on is a server, not a login
-        if PROXY_ENDPOINT_PATTERN.fullmatch(user + ":" + password):
+        # 8.8.8.8:8080 in front of an @ further on is a server, not a login.
+        # Up to the first @, which is where the password ended before it
+        # could hold one: what was a server then is a server now
+        if PROXY_ENDPOINT_PATTERN.fullmatch(user + ":" + password.partition("@")[0]):
             return m.group(0)
         head = m.group(1) + m.group(2)
-        if user.startswith(MARKER):
-            # An earlier pattern hashed the user, an access key id say; the
-            # password beside it still has to go
+        if user.startswith(MARKER) or not user:
+            # An earlier pattern hashed the user, an access key id say, or
+            # there is no user at all; the password still has to go
             return head + user + ":" + hash_secret(password, key)
         return head + hash_secret(user + ":" + password, key)
+
+    def _hash_proxy_login(m: re.Match) -> str:
+        if m.group(2).startswith(MARKER):
+            return m.group(0)
+        return m.group(1) + hash_secret(m.group(2), key)
 
     def _hash_proxy_userinfo(m: re.Match) -> str:
         # socks5://8.8.8.8:1080 in front of an @ further on is the server
@@ -495,6 +521,10 @@ def redact_text(
         s = NEWLINE_PASSWORD_PATTERN.sub(_hash_labelled, s)
         s = EMAIL_AND_PASSWORD_PATTERN.sub(_hash_email_password, s)
         s = CREDIT_CARD_PATTERN.sub(_hash_card, s)
+        # Before the bare login pattern, which reads proxy.site.com:8080 as a
+        # login and a password and hashes the port: this one needs the port
+        # still there to know the line for a proxy
+        s = PROXY_LOGIN_PATTERN.sub(_hash_proxy_login, s)
         # In a link target word:word is the URL itself, mailto:bob@host or
         # https://site/page:section, so the bare login pattern stays out of it
         if not link:
