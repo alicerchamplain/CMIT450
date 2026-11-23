@@ -684,13 +684,9 @@ ADVERSARIAL_PAGES = {
 
 
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL_PAGES))
-def test_classifying_one_crafted_page_takes_well_under_a_second(name):
+def test_classifying_one_crafted_page_takes_well_under_a_second(name, laptop_seconds):
     # A page is up to 64 KB and whoever posts it chooses every character. The
     # first shape took 54 seconds at 4,000 characters before 22 November, and
     # the next four about ten seconds each at this size.
-    import time
-
     body = ADVERSARIAL_PAGES[name]
-    started = time.perf_counter()
-    classify("Title", body, description=body[:300])
-    assert time.perf_counter() - started < 1.0, name
+    assert laptop_seconds(lambda: classify("Title", body, description=body[:300])) < 1.0, name

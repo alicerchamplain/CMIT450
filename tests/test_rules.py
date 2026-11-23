@@ -1171,21 +1171,16 @@ LONG_RUNS = {
 
 
 @pytest.mark.parametrize("name", sorted(LONG_RUNS))
-def test_no_category_rule_is_slow_on_a_long_unbroken_run(name):
+def test_no_category_rule_is_slow_on_a_long_unbroken_run(name, laptop_seconds):
     # A page is up to 64 KB and whoever posts it chooses the text. A pattern
     # that restarts from every character of a long run takes seconds on one
     # page; these finish in milliseconds. The resolver rules are left out:
     # they are unchanged, and timed in the nightly run since 14 November.
-    import time
-
     text = LONG_RUNS[name]
     for r in RULES:
         if r.pattern is None or r.category == "resolver":
             continue
-        started = time.perf_counter()
-        for _match in r.pattern.finditer(text):
-            pass
-        assert time.perf_counter() - started < 1.0, (r.name, name)
+        assert laptop_seconds(lambda: list(r.pattern.finditer(text))) < 1.0, (r.name, name)
 
 
 # --------------------------------------------------------------------------
@@ -1400,18 +1395,13 @@ def test_a_spoof_url_behind_a_link_does_not_move_the_resolver_score():
 # --- what the second review of 22 November found ---
 
 
-def test_the_email_pattern_reads_a_run_of_plus_signs_once():
+def test_the_email_pattern_reads_a_run_of_plus_signs_once(laptop_seconds):
     # The one resolver pattern that restarted inside a run: + is a local-part
     # character and was not in the lookbehind.
-    import time
-
     from graphwatch.rules import EMAIL_PATTERN
 
     for text in ("+" * 64000, "a+" * 32000, "a+" * 32000 + "@x.com"):
-        started = time.perf_counter()
-        for _match in EMAIL_PATTERN.finditer(text):
-            pass
-        assert time.perf_counter() - started < 1.0
+        assert laptop_seconds(lambda: list(EMAIL_PATTERN.finditer(text))) < 1.0
 
 
 @pytest.mark.parametrize(
@@ -1446,15 +1436,11 @@ def test_a_token_is_decoded_once_however_often_a_page_repeats_it():
     assert (info.misses, info.hits) == (1, 499)
 
 
-def test_a_page_packed_with_one_padded_token_is_quick():
-    import time
-
+def test_a_page_packed_with_one_padded_token_is_quick(laptop_seconds):
     decodes_to_pointer.cache_clear()
     text = "t\n\n" + (HIDDEN_HOST + " ") * 2500
-    started = time.perf_counter()
-    hits = apply_rules("t", "", text)
-    assert time.perf_counter() - started < 1.0
-    assert "encoded_pointer" in names(hits)
+    assert laptop_seconds(lambda: apply_rules("t", "", text)) < 1.0
+    assert "encoded_pointer" in names(apply_rules("t", "", text))
 
 
 @pytest.mark.parametrize("closer", ["»", "”", "’", "…", "*", "“"])

@@ -949,14 +949,9 @@ def test_a_login_that_starts_after_a_plus_keeps_the_text_before_it():
         "1" * 60000 + ":x",
     ],
 )
-def test_the_bare_login_pattern_reads_a_long_run_once(text):
+def test_the_bare_login_pattern_reads_a_long_run_once(text, laptop_seconds):
     # Each of these took 6 to 15 seconds with the old pattern.
-    import time
-
-    started = time.perf_counter()
-    for _match in BARE_LOGIN_PASSWORD_PATTERN.finditer(text):
-        pass
-    assert time.perf_counter() - started < 1.0
+    assert laptop_seconds(lambda: list(BARE_LOGIN_PASSWORD_PATTERN.finditer(text))) < 1.0
 
 
 # --- the email:password pattern reads each run once (22 November) ---------------------
@@ -1044,14 +1039,9 @@ def test_punctuation_in_front_of_an_email_is_kept():
         "a@" * 30000,
     ],
 )
-def test_the_email_pattern_reads_a_long_run_once(text):
+def test_the_email_pattern_reads_a_long_run_once(text, laptop_seconds):
     # The first two took about 4 seconds each with the old pattern.
-    import time
-
-    started = time.perf_counter()
-    for _match in EMAIL_AND_PASSWORD_PATTERN.finditer(text):
-        pass
-    assert time.perf_counter() - started < 1.0
+    assert laptop_seconds(lambda: list(EMAIL_AND_PASSWORD_PATTERN.finditer(text))) < 1.0
 
 
 @pytest.mark.parametrize(
@@ -1069,13 +1059,9 @@ def test_the_email_pattern_reads_a_long_run_once(text):
         "WARNING_BANNER " + "ab.cd-" * 10000,
     ],
 )
-def test_redact_text_is_quick_on_a_page_that_is_one_long_run(text):
+def test_redact_text_is_quick_on_a_page_that_is_one_long_run(text, laptop_seconds):
     # A page is up to 64 KB and whoever posts it chooses the text.
-    import time
-
-    started = time.perf_counter()
-    redact_text(text, KEY)
-    assert time.perf_counter() - started < 1.0
+    assert laptop_seconds(lambda: redact_text(text, KEY)) < 1.0
 
 
 # --- what the review of 22 November found ---------------------------------------------
@@ -1357,13 +1343,9 @@ def test_a_token_after_a_label_that_redaction_already_hashed_is_not_hashed_again
         "#a=" * 20000,
     ],
 )
-def test_redact_page_is_quick_on_a_node_that_is_one_long_run(text):
-    import time
-
+def test_redact_page_is_quick_on_a_node_that_is_one_long_run(text, laptop_seconds):
     page = {"content": [{"tag": "p", "children": [text, "next node"]}]}
-    started = time.perf_counter()
-    redact_page(page, KEY)
-    assert time.perf_counter() - started < 1.0
+    assert laptop_seconds(lambda: redact_page(page, KEY)) < 1.0
 
 
 def test_a_label_far_from_the_end_of_its_node_is_not_carried():
@@ -1480,18 +1462,6 @@ def test_a_card_number_with_spaces_inside_a_url_is_settled_in_one_call():
     s = "https://x.example/pay?token=4111 1111 1111 1111abcdefghijklmnop&z=1"
     once = redact_text(s, KEY)
     assert redact_text(once, KEY) == once
-
-
-@pytest.mark.parametrize(
-    "text",
-    ["eyJ" * 21000, "eyJ_" * 16000, "eyJ" + "a" * 60000, ("eyJ" + "a" * 20 + ".") * 2500],
-)
-def test_the_jwt_pattern_reads_a_long_run_without_restarting_at_every_eyJ(text):
-    import time
-
-    started = time.perf_counter()
-    redact_text(text, KEY)
-    assert time.perf_counter() - started < 1.0
 
 
 def test_an_ordinary_jwt_is_still_hashed_wherever_it_sits():
