@@ -28,7 +28,7 @@ def main(argv: list[str]) -> None:
     raw_dir = Path(argv[0])
     try:
         key = hmac_key(load_config())
-    except (FileNotFoundError, KeyError) as e:
+    except (FileNotFoundError, KeyError, ValueError) as e:
         raise SystemExit(f"HMAC_KEY not available: {e}")
     for raw_file in sorted(raw_dir.glob("*.json")):
         page = json.loads(raw_file.read_text(encoding="utf-8"))

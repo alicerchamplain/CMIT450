@@ -23,7 +23,7 @@ def workdir(tmp_path):
     (lists / "greetings.txt").write_text("Hello\n", encoding="utf-8")
     digest = hashlib.sha256((lists / "greetings.txt").read_bytes()).hexdigest()
     (lists / SUMS_FILE).write_text(f"{digest}  greetings.txt\n", encoding="utf-8")
-    (tmp_path / "config.env").write_text("HMAC_KEY=00ff\n", encoding="utf-8")
+    (tmp_path / "config.env").write_text("HMAC_KEY=" + "00ff" * 16 + "\n", encoding="utf-8")
     return tmp_path
 
 

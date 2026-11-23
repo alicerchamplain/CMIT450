@@ -251,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyError:
         print(f"HMAC_KEY not set in {args.config}", file=sys.stderr)
         return 2
+    except ValueError as too_short:
+        print(f"{too_short}: {args.config}", file=sys.stderr)
+        return 2
     if args.dry_run:
         # Read-only: a dry run must not even add the tables a real run would
         # as_uri quotes the path: a # or a ? in it would otherwise cut the URI short

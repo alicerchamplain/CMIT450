@@ -8,7 +8,7 @@ import logging
 
 import pytest
 
-from graphwatch.config import CONFIG, hmac_key, load_config
+from graphwatch.config import CONFIG, MIN_KEY_BYTES, hmac_key, load_config
 
 
 def write(tmp_path, text: str):
@@ -87,8 +87,7 @@ def test_load_config_does_not_print_or_log_values(tmp_path, capsys, caplog):
 
 
 # Every value below makes a key of 32 bytes or more. The rows are about how
-# the value is read. hmac_key has no minimum length today; if it is given
-# one, none of these should turn red for being short.
+# the value is read; the tests of a key that is too short come after them.
 @pytest.mark.parametrize(
     "value, key",
     [
@@ -103,6 +102,29 @@ def test_load_config_does_not_print_or_log_values(tmp_path, capsys, caplog):
 )
 def test_hmac_key_is_hex_decoded_or_else_the_utf8_passphrase(value, key):
     assert hmac_key({"HMAC_KEY": value}) == key
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "00ff",  # 2 bytes: hex is counted after it is decoded
+        "00ff" * 15 + "00",  # 31 bytes
+        "passphrase " * 2 + "too short",  # 31 bytes
+        "пароль" * 2 + "abcdefg",  # 31 bytes, not 19 characters
+    ],
+)
+def test_hmac_key_refuses_a_key_shorter_than_32_bytes_and_says_nothing_about_it(value):
+    assert MIN_KEY_BYTES == 32
+    with pytest.raises(ValueError) as error:
+        hmac_key({"HMAC_KEY": value})
+    # Neither the key nor its length: the message ends up in a log
+    assert str(error.value) == "HMAC_KEY is shorter than 32 bytes"
+
+
+@pytest.mark.parametrize("value", ["00ff" * 16, "passphrase " * 2 + "is enough."])
+def test_hmac_key_accepts_a_key_of_exactly_32_bytes(value):
+    assert len(hmac_key({"HMAC_KEY": value})) == 32
 
 
 def test_hmac_key_missing_raises_key_error():

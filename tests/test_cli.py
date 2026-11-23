@@ -269,16 +269,27 @@ def test_parse_args_requires_a_command_and_meta_requires_stale(argv):
 # --------------------------------------------------------------------------
 
 
+# The key every config file in this module holds: 32 bytes, the shortest
+# hmac_key accepts, written as hex the way secrets.token_hex(32) gives it
+CONFIG_KEY = b"\x00\xff" * 16
+CONFIG_LINE = "HMAC_KEY=" + "00ff" * 16 + "\n"
+
+
 def test_require_key_returns_the_key_bytes_and_prints_nothing(tmp_path, capsys):
     cfg = tmp_path / "config.env"
-    cfg.write_text("HMAC_KEY=00ff\n", encoding="utf-8")
-    assert require_key(cfg) == b"\x00\xff"
+    cfg.write_text(CONFIG_LINE, encoding="utf-8")
+    assert require_key(cfg) == CONFIG_KEY
     assert capsys.readouterr() == ("", "")
 
 
 @pytest.mark.parametrize(
     "content, message",
-    [(None, "Config file not found: {}"), ("OTHER=1\n", "HMAC_KEY not set in {}")],
+    [
+        (None, "Config file not found: {}"),
+        ("OTHER=1\n", "HMAC_KEY not set in {}"),
+        ("HMAC_KEY=\n", "HMAC_KEY is shorter than 32 bytes: {}"),
+        ("HMAC_KEY=" + "00ff" * 15 + "00\n", "HMAC_KEY is shorter than 32 bytes: {}"),  # 31 bytes
+    ],
 )
 def test_require_key_exits_naming_the_file_and_what_is_wrong_with_it(tmp_path, content, message):
     cfg = tmp_path / "config.env"
@@ -588,7 +599,7 @@ def workdir(tmp_path):
     digest = hashlib.sha256((tmp_path / "wordlists" / "greetings.txt").read_bytes()).hexdigest()
     (tmp_path / "wordlists" / "SHA256SUMS").write_text(f"{digest}  greetings.txt\n", encoding="utf-8")
     cfg = tmp_path / "config.env"
-    cfg.write_text("HMAC_KEY=00ff\n", encoding="utf-8")
+    cfg.write_text(CONFIG_LINE, encoding="utf-8")
     return tmp_path
 
 
@@ -650,6 +661,7 @@ def test_python_m_graphwatch_cli_runs_main_on_the_command_line(tmp_path, monkeyp
     [
         (None, [], "Config file not found: {}"),
         ("OTHER=1\n", [], "HMAC_KEY not set in {}"),
+        ("HMAC_KEY=short\n", [], "HMAC_KEY is shorter than 32 bytes: {}"),
         # a re-sweep hashes what it fetches, so it needs the key as well
         (None, ["--resweep"], "Config file not found: {}"),
     ],
@@ -760,7 +772,7 @@ def test_main_sweep_hands_run_sweep_the_word_list_the_key_and_its_options(workdi
     assert sweep_call == {
         "slugs": ["Hello"],
         "days": [(11, 1)],
-        "key": b"\x00\xff",
+        "key": CONFIG_KEY,
         "gap": 1,
         "cap": 200,
         "exclude": set(),
@@ -1932,7 +1944,7 @@ def test_main_resweep_hands_run_resweep_the_filtered_work_list_and_the_key(
     main(resweep_argv(stored_file, *filters))
     header, summary = capsys.readouterr().out.splitlines()
     assert header == f"Resweep: {window}, Pages: {len(paths)}, Older than: 20h, Budget: 0"
-    assert resweep_call == {"paths": paths, "key": b"\x00\xff"}
+    assert resweep_call == {"paths": paths, "key": CONFIG_KEY}
     assert summary.startswith("refreshed 1 pages, 1 changed, 0 gone, 0 failed, 0 requests, ")
 
 
@@ -2166,7 +2178,7 @@ def test_main_enrich_without_a_config_file_exits_naming_the_path(tmp_path):
 
 def test_main_enrich_without_any_feed_key_exits_naming_the_keys(tmp_path, no_network):
     config = tmp_path / "config.env"
-    config.write_text("HMAC_KEY=00ff\n", encoding="utf-8")
+    config.write_text(CONFIG_LINE, encoding="utf-8")
     with pytest.raises(SystemExit) as exc:
         main(["--config", str(config), "enrich", "--db", str(tmp_path / "g.sqlite")])
     for name in ("ABUSE_CH_KEY", "OTX_KEY", "VT_KEY"):

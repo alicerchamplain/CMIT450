@@ -95,6 +95,7 @@ def require_key(path: Path) -> bytes:
     Raises:
         SystemExit: Exit if config file not found
         SystemExit: Exit if HMAC_KEY is not set in the config file
+        SystemExit: Exit if HMAC_KEY is too short
 
     Returns:
         bytes: The bytes of the HMAC_KEY
@@ -105,6 +106,8 @@ def require_key(path: Path) -> bytes:
         raise SystemExit(f"Config file not found: {path}")
     except KeyError:
         raise SystemExit(f"HMAC_KEY not set in {path}")
+    except ValueError as too_short:
+        raise SystemExit(f"{too_short}: {path}")
 
 
 def load_frozen(directory: Path, unfrozen: bool = False) -> list[Entry]:

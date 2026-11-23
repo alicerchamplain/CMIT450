@@ -19,7 +19,8 @@ from graphwatch.reredact import SCHEMES, main, reredact, reredact_snapshot, rest
 from graphwatch.telegraph import page_text
 
 T0 = 1_700_000_000.0
-KEY = b"test-key"
+# 32 bytes, the shortest key hmac_key accepts, because main reads it from a config file
+KEY = b"test-key" * 4
 UUID = "0f1e2d3c-4b5a-6978-8695-a4b3c2d1e0f9"
 PROXY = f"vless://{UUID}@vpn.example.org:443"
 TOKEN = "a1b2c3d4e5f6a7b8c9d0"
@@ -210,7 +211,7 @@ def test_each_batch_is_committed_so_a_stopped_run_can_be_started_again(conn, mon
 # --- the command ---------------------------------------------------------------
 
 
-def write_config(tmp_path, text="HMAC_KEY=test-key\n"):
+def write_config(tmp_path, text="HMAC_KEY=" + KEY.decode() + "\n"):
     path = tmp_path / "config.env"
     path.write_text(text, encoding="utf-8")
     return path
@@ -325,6 +326,16 @@ def test_main_refuses_without_the_key_and_never_prints_one(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "HMAC_KEY not set" in captured.err
     assert "sensitive-value" not in captured.out + captured.err
+
+
+def test_main_refuses_a_key_that_is_too_short_and_never_prints_it(tmp_path, capsys):
+    db = file_db(tmp_path)
+    config = write_config(tmp_path, "HMAC_KEY=short-sensitive-value\n")
+    assert main([str(db), "--config", str(config)]) == 2
+    captured = capsys.readouterr()
+    assert "HMAC_KEY is shorter than 32 bytes" in captured.err
+    assert "short-sensitive-value" not in captured.out + captured.err
+    assert UUID in texts(db)[0]
 
 
 def test_run_as_a_module_it_exits_with_what_main_returns(tmp_path, monkeypatch):
