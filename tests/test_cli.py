@@ -8,6 +8,7 @@ of existing paths.
 
 import hashlib
 import json
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -31,13 +32,15 @@ from graphwatch.crowd import DayCount, save_day_count
 from graphwatch.db import (
     add_snapshot,
     connect,
+    http_logger,
     latest_snapshots,
     load_progress,
+    save_score,
     upsert_page,
 )
-from graphwatch.rules import apply_rules
+from graphwatch.rules import RULES, apply_rules
 from graphwatch.slugify import Entry
-from graphwatch.telegraph import BudgetExceeded, Outcome, TelegraphClient
+from graphwatch.telegraph import Outcome, TelegraphClient
 
 FIXTURES = Path(__file__).resolve().parents[1] / "plan" / "fixtures"
 FOUND_BODY = (FIXTURES / "Vizit-12-28.json").read_bytes()
@@ -1053,12 +1056,21 @@ def score_of(conn, path):
     return tuple(conn.execute(sql, (path,)).fetchone())
 
 
-def hit_names(conn, path):
+RESOLVER_RULES = {r.name for r in RULES if r.category == "resolver"}
+COMPUTED_RULES = {r.name for r in RULES if r.where == "computed"}
+
+
+def all_hit_names(conn, path):
     sql = """
     SELECT h.rule FROM hits h JOIN scores sc ON sc.snapshot_id = h.snapshot_id
     JOIN pages p ON p.id = sc.page_id WHERE p.path = ? ORDER BY h.id
     """
     return [r["rule"] for r in conn.execute(sql, (path,))]
+
+
+def hit_names(conn, path):
+    """The resolver rules stored for a page; the category rules are tested below."""
+    return [name for name in all_hit_names(conn, path) if name in RESOLVER_RULES]
 
 
 @pytest.fixture
@@ -1142,7 +1154,7 @@ def test_run_classify_stores_evidence_with_each_hit(swept):
     JOIN pages p ON p.id = sc.page_id WHERE p.path = ? ORDER BY h.id
     """
     rows = [tuple(r) for r in swept.execute(sql, ("Hello-10-17-9",))]
-    assert rows == [
+    assert [row for row in rows if row[0] in RESOLVER_RULES] == [
         ("userinfo_spoof", 5, "www.tenable.com@agfc.harper18.workers.dev", 1),
         ("api_sample_body", 1, API_SAMPLE, 1),
     ]
@@ -1157,7 +1169,10 @@ def test_run_classify_stores_how_often_each_rule_matched(swept):
     JOIN pages p ON p.id = sc.page_id WHERE p.path = ? ORDER BY h.id
     """
     rows = [tuple(r) for r in swept.execute(sql, ("Mimikatz-10-17",))]
-    assert rows == [("telegram_link", 3), ("templated_body", 1)]
+    assert [row for row in rows if row[0] in RESOLVER_RULES] == [
+        ("telegram_link", 3),
+        ("templated_body", 1),
+    ]
     assert score_of(swept, "Mimikatz-10-17") == (-3, 0)  # counted, not scored
 
 
@@ -1168,7 +1183,7 @@ def test_run_classify_stores_a_hit_for_every_rule_that_fired(swept):
     checked = 0
     for row in latest_snapshots(swept).fetchall():
         fired = apply_rules(row["title"], row["description"], row["text"])
-        stored = [n for n in hit_names(swept, row["path"]) if n != "templated_body"]
+        stored = [n for n in all_hit_names(swept, row["path"]) if n not in COMPUTED_RULES]
         assert stored == [hit.rule.name for hit in fired], row["path"]
         checked += len(fired)
     assert checked >= 10
@@ -1178,12 +1193,15 @@ def test_run_classify_stores_a_hit_for_every_rule_that_fired(swept):
 
 def test_run_classify_scores_are_the_sum_of_their_stored_hits(swept):
     run_classify(swept, log=quiet)
-    sql = """
+    # The score is the resolver score, so only the resolver rules' hits add up to it.
+    marks = ", ".join("?" for _ in RESOLVER_RULES)
+    sql = f"""
     SELECT sc.score, COALESCE(SUM(h.weight), 0) AS total
-    FROM scores sc LEFT JOIN hits h ON h.snapshot_id = sc.snapshot_id
+    FROM scores sc LEFT JOIN hits h
+        ON h.snapshot_id = sc.snapshot_id AND h.rule IN ({marks})
     GROUP BY sc.snapshot_id
     """
-    rows = swept.execute(sql).fetchall()
+    rows = swept.execute(sql, tuple(RESOLVER_RULES)).fetchall()
     assert len(rows) == 8
     assert all(row["score"] == row["total"] for row in rows)
 
@@ -1276,9 +1294,9 @@ def test_run_explain_prints_the_score_and_one_line_per_hit(swept):
     assert run_explain(swept, "Hello-10-17-9", log=lines.append) is True
     assert lines[0] == "Hello-10-17-9: score 6, flagged"
     assert SPOOF_TITLE in lines[1]
-    assert "+5 userinfo_spoof" in lines[2]
-    assert "www.tenable.com@agfc.harper18.workers.dev" in lines[2]
-    assert "+1 api_sample_body" in lines[3]
+    spoof = next(line for line in lines if "+5 userinfo_spoof" in line)
+    assert "www.tenable.com@agfc.harper18.workers.dev" in spoof
+    assert any("+1 api_sample_body" in line for line in lines)
 
 
 def test_run_explain_shows_negative_weights_signed(swept):
@@ -1397,3 +1415,463 @@ def test_run_explain_lists_no_indicators_for_a_held_out_page(swept):
     lines = []
     run_explain(swept, "Known-01-02", log=lines.append)
     assert not any("workers.dev" in line for line in lines)
+
+
+# --------------------------------------------------------------------------
+# classify by category: labels, the per-category summary, --explain
+# (plan/classification-plan-2026-11-15.md)
+# --------------------------------------------------------------------------
+
+HASHED = "SECRET{" + "ab" * 32 + "}"
+COMBO_BODY = "\n".join(f"user{n}@mail.example.com:hunter{n}pass" for n in range(4))
+PROXY_BODY = "fresh today:\n8.8.8.8:1080\n1.1.1.1:3128\n9.9.9.9:8080"
+PLAIN_BODY = "We met on Tuesday and agreed to meet again next week."
+
+
+def labels_of(conn, path):
+    """(category, score, assigned, is_primary) rows for a page's newest snapshot."""
+    sql = """
+    SELECT l.category, l.score, l.assigned, l.is_primary FROM labels l
+    JOIN pages p ON p.id = l.page_id WHERE p.path = ? ORDER BY l.rowid
+    """
+    return [tuple(r) for r in conn.execute(sql, (path,))]
+
+
+def assigned_labels(conn, path):
+    return [row[0] for row in labels_of(conn, path) if row[2]]
+
+
+def primary_of(conn, path):
+    primaries = [row[0] for row in labels_of(conn, path) if row[3]]
+    assert len(primaries) <= 1
+    return primaries[0] if primaries else None
+
+
+@pytest.fixture
+def mixed(swept):
+    """The small sweep plus one page for each of three more categories and a plain one."""
+    put(swept, "Accounts-10-17", "Accounts", "", COMBO_BODY)
+    put(swept, "Proxy-10-17", "Proxy", "", PROXY_BODY)
+    put(swept, "Notes-10-17", "Notes", "", PLAIN_BODY)
+    return swept
+
+
+def test_the_combo_body_is_stored_hashed_before_the_rules_see_it(mixed):
+    text = mixed.execute(
+        "SELECT s.text FROM snapshots s JOIN pages p ON p.id = s.page_id WHERE p.path = ?",
+        ("Accounts-10-17",),
+    ).fetchone()[0]
+    assert "hunter0pass" not in text
+    assert text.count("SECRET{") == 4
+
+
+def test_run_classify_labels_each_page_with_its_categories(mixed):
+    run_classify(mixed, log=quiet)
+    assert assigned_labels(mixed, "Accounts-10-17") == ["leaked_credentials"]
+    assert assigned_labels(mixed, "Proxy-10-17") == ["proxy_list"]
+    assert assigned_labels(mixed, "Mimikatz-10-17") == ["template_spam"]
+    assert assigned_labels(mixed, "Notes-10-17") == []
+
+
+def test_run_classify_marks_one_primary_label_per_labelled_page(mixed):
+    run_classify(mixed, log=quiet)
+    # The spoof page is a resolver, a pointer (its tunnel host) and a placeholder.
+    assert assigned_labels(mixed, "Hello-10-17-9") == ["resolver", "pointer", "placeholder"]
+    assert primary_of(mixed, "Hello-10-17-9") == "resolver"
+    assert primary_of(mixed, "Accounts-10-17") == "leaked_credentials"
+    assert primary_of(mixed, "Notes-10-17") is None
+    two_primaries = mixed.execute(
+        "SELECT COUNT(*) FROM (SELECT snapshot_id FROM labels GROUP BY snapshot_id "
+        "HAVING SUM(is_primary) > 1)"
+    ).fetchone()[0]
+    assert two_primaries == 0
+
+
+def test_the_primary_label_is_always_an_assigned_one(mixed):
+    run_classify(mixed, log=quiet)
+    bad = mixed.execute(
+        "SELECT COUNT(*) FROM labels WHERE is_primary = 1 AND assigned = 0"
+    ).fetchone()[0]
+    assert bad == 0
+
+
+def test_run_classify_stores_near_misses_and_no_zero_scores(mixed):
+    run_classify(mixed, log=quiet)
+    # The squatter advert: an invite link is +2 towards telegram_funnel.
+    rows = {row[0]: row for row in labels_of(mixed, "Mimikatz-10-17")}
+    assert rows["telegram_funnel"][1:] == (2, 0, 0)
+    assert rows["resolver"][1:] == (-3, 0, 0)
+    assert mixed.execute("SELECT COUNT(*) FROM labels WHERE score = 0").fetchone()[0] == 0
+    assert labels_of(mixed, "Notes-10-17") == []
+
+
+def test_the_resolver_label_row_agrees_with_the_scores_table(mixed):
+    run_classify(mixed, log=quiet)
+    sql = """
+    SELECT sc.score, sc.flagged, l.score AS label_score, l.assigned
+    FROM scores sc JOIN labels l ON l.snapshot_id = sc.snapshot_id
+    WHERE l.category = 'resolver'
+    """
+    rows = mixed.execute(sql).fetchall()
+    assert len(rows) >= 5
+    for row in rows:
+        assert row["score"] == row["label_score"]
+        assert row["flagged"] == row["assigned"]
+
+
+def test_the_categories_do_not_move_the_resolver_verdict(mixed):
+    counts = run_classify(mixed, log=quiet)
+    assert counts["flagged"] == 2
+    assert score_of(mixed, "Hello-10-17-9") == (6, 1)
+    # A combo list scores on its email address and nothing else, as before.
+    assert score_of(mixed, "Accounts-10-17") == (1, 0)
+    assert score_of(mixed, "Mimikatz-10-17") == (-3, 0)
+
+
+def test_run_classify_twice_replaces_the_labels(mixed):
+    run_classify(mixed, log=quiet)
+    before = mixed.execute("SELECT COUNT(*) FROM labels").fetchone()[0]
+    run_classify(mixed, log=quiet)
+    assert mixed.execute("SELECT COUNT(*) FROM labels").fetchone()[0] == before
+
+
+def test_the_threshold_argument_applies_to_every_category(mixed):
+    run_classify(mixed, threshold=2, log=quiet)
+    assert "telegram_funnel" in assigned_labels(mixed, "Mimikatz-10-17")
+    run_classify(mixed, threshold=5, log=quiet)
+    assert assigned_labels(mixed, "Mimikatz-10-17") == []
+
+
+def test_run_classify_counts_labels_per_category(mixed):
+    counts = run_classify(mixed, log=quiet)
+    assert counts["labelled"]["resolver"] == 2
+    assert counts["labelled"]["template_spam"] == 3
+    assert counts["labelled"]["leaked_credentials"] == 1
+    assert counts["labelled"]["proxy_list"] == 1
+    assert counts["primary"]["template_spam"] == 3
+    assert counts["category_near_miss"]["telegram_funnel"] == 3
+
+
+def test_every_page_is_counted_once_as_a_primary_label_or_as_unlabelled(mixed):
+    counts = run_classify(mixed, log=quiet)
+    assert sum(counts["primary"].values()) + counts["unlabelled"] == counts["pages"]
+    assert counts["unlabelled"] >= 1  # Notes-10-17 at least
+
+
+def test_a_labelled_page_is_not_also_a_near_miss_of_that_category(mixed):
+    counts = run_classify(mixed, log=quiet)
+    assert counts["category_near_miss"]["template_spam"] == 0
+    assert counts["category_near_miss"]["leaked_credentials"] == 0
+
+
+def test_run_classify_logs_one_line_per_category_after_the_summary(mixed):
+    lines = []
+    run_classify(mixed, log=lines.append)
+    assert "classified 11 pages" in lines[0]
+    assert lines[1].startswith("held-out:")
+    category_lines = lines[2:16]
+    assert [line.split()[0] for line in category_lines] == [
+        "resolver",
+        "template_spam",
+        "pointer",
+        "leaked_credentials",
+        "proxy_list",
+        "malware_delivery",
+        "fraud_market",
+        "crypto_lure",
+        "phishing",
+        "doxx",
+        "telegram_funnel",
+        "seo_spam",
+        "placeholder",
+        "prose",
+    ]
+    for line in category_lines:
+        assert "labelled" in line and "primary" in line and "near misses" in line
+
+
+def test_the_category_lines_carry_the_counts(mixed):
+    lines = []
+    counts = run_classify(mixed, log=lines.append)
+    line = next(l for l in lines if l.split()[0] == "template_spam")
+    assert line.split() == [
+        "template_spam", "labelled", "3,", "primary", "3,", "near", "misses", "0",
+    ]
+    line = next(l for l in lines if l.split()[0] == "telegram_funnel")
+    assert line.split()[-1] == str(counts["category_near_miss"]["telegram_funnel"])
+
+
+def test_run_classify_reports_the_unlabelled_share(mixed):
+    lines = []
+    counts = run_classify(mixed, log=lines.append)
+    last = lines[-1]
+    assert last.split()[0] == "unlabelled"
+    assert f"{counts['unlabelled']:,}" in last
+    assert f"({counts['unlabelled'] / counts['pages']:.1%} of pages)" in last
+
+
+def test_the_unlabelled_share_of_an_empty_database_is_zero(conn):
+    lines = []
+    run_classify(conn, log=lines.append)
+    assert "(0.0% of pages)" in lines[-1]
+
+
+def test_held_out_pages_are_left_out_of_every_category_count(mixed):
+    before = run_classify(mixed, log=quiet)
+    put(mixed, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
+    put(mixed, "Known-01-03", "Accounts", "", COMBO_BODY, held_out=True)
+    lines = []
+    after = run_classify(mixed, log=lines.append)
+    for name in ("labelled", "primary", "category_near_miss"):
+        assert after[name] == before[name], name
+    assert after["unlabelled"] == before["unlabelled"]
+    assert after["held_out"] == 2
+    out = "\n".join(lines)
+    assert "held-out: 1/2 flagged" in out
+    assert "Known-01" not in out
+
+
+def test_run_classify_with_categories_still_writes_nothing_to_the_http_log(mixed):
+    run_classify(mixed, log=quiet)
+    assert mixed.execute("SELECT COUNT(*) FROM http_log").fetchone()[0] == 0
+
+
+# --- --explain ---
+
+
+def explain(conn, path) -> list[str]:
+    lines = []
+    assert run_explain(conn, path, log=lines.append) is True
+    return lines
+
+
+def test_run_explain_prints_the_labels_with_the_primary_marked(mixed):
+    run_classify(mixed, log=quiet)
+    lines = explain(mixed, "Hello-10-17-9")
+    assert lines[2] == "  labels: resolver (primary), pointer, placeholder"
+
+
+def test_run_explain_says_none_for_a_page_with_no_label(mixed):
+    run_classify(mixed, log=quiet)
+    lines = explain(mixed, "Notes-10-17")
+    assert lines[0] == "Notes-10-17: score 0, not flagged"
+    assert lines[2] == "  labels: none"
+    assert len(lines) == 3
+
+
+def test_run_explain_groups_the_hits_by_category_in_category_order(mixed):
+    run_classify(mixed, log=quiet)
+    lines = explain(mixed, "Hello-10-17-9")
+    headings = [line for line in lines if line.startswith("  ") and not line.startswith("   ")]
+    assert headings[2:5] == ["  resolver +6", "  pointer +4", "  placeholder +4"]
+    resolver_at = lines.index("  resolver +6")
+    pointer_at = lines.index("  pointer +4")
+    spoof_at = next(i for i, line in enumerate(lines) if "+5 userinfo_spoof" in line)
+    tunnel_at = next(i for i, line in enumerate(lines) if "+3 tunnel_host" in line)
+    assert resolver_at < spoof_at < pointer_at < tunnel_at
+
+
+def test_run_explain_shows_a_near_miss_category_with_its_score(mixed):
+    run_classify(mixed, log=quiet)
+    lines = explain(mixed, "Mimikatz-10-17")
+    assert "  resolver -3" in lines
+    assert "  template_spam +4" in lines
+    assert "  telegram_funnel +2" in lines
+    assert lines[2] == "  labels: template_spam (primary)"
+
+
+def test_run_explain_shows_the_evidence_of_a_category_hit(mixed):
+    run_classify(mixed, log=quiet)
+    lines = explain(mixed, "Proxy-10-17")
+    line = next(l for l in lines if "ip_port_list" in l)
+    assert line.strip().startswith("+4 ip_port_list")
+    assert line.endswith("8.8.8.8:1080 x3")
+
+
+def test_run_explain_never_prints_a_clear_password(mixed):
+    run_classify(mixed, log=quiet)
+    out = "\n".join(explain(mixed, "Accounts-10-17"))
+    assert "combo_lines" in out
+    assert "hunter" not in out
+
+
+def test_run_explain_lists_a_hit_of_a_rule_no_longer_in_the_table_as_retired(mixed):
+    run_classify(mixed, log=quiet)
+    snapshot_id = mixed.execute(
+        "SELECT sc.snapshot_id FROM scores sc JOIN pages p ON p.id = sc.page_id WHERE p.path = ?",
+        ("Notes-10-17",),
+    ).fetchone()[0]
+    mixed.execute(
+        "INSERT INTO hits (snapshot_id, rule, weight, evidence, matches) VALUES (?, ?, ?, ?, ?)",
+        (snapshot_id, "old_rule", 2, "something", 1),
+    )
+    lines = explain(mixed, "Notes-10-17")
+    assert lines[-2] == "  retired rule"
+    assert lines[-1].strip() == "+2 old_rule               something"
+
+
+def test_run_explain_shows_only_the_resolver_score_of_a_held_out_page(mixed):
+    # Synthetic held-out rows: one resolver shape and one combo list.
+    put(mixed, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
+    put(mixed, "Known-01-03", "Accounts", "", COMBO_BODY, held_out=True)
+    run_classify(mixed, log=quiet)
+    for path, first in (
+        ("Known-01-02", "Known-01-02: score 6, flagged"),
+        ("Known-01-03", "Known-01-03: score 1, not flagged"),
+    ):
+        lines = explain(mixed, path)
+        assert lines == [first, "held-out page: evidence withheld"]
+
+
+def test_run_explain_names_no_label_or_category_for_a_held_out_page(mixed):
+    put(mixed, "Known-01-03", "Accounts", "", COMBO_BODY, held_out=True)
+    run_classify(mixed, log=quiet)
+    out = "\n".join(explain(mixed, "Known-01-03"))
+    for word in ("labels", "leaked_credentials", "combo_lines", "example.com"):
+        assert word not in out
+
+
+def test_main_classify_prints_the_category_lines(tmp_path, capsys, no_network):
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    put(c, "Proxy-10-17", "Proxy", "", PROXY_BODY)
+    put(c, "Notes-10-17", "Notes", "", PLAIN_BODY)
+    c.close()
+    main(["--config", str(tmp_path / "missing.env"), "classify", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert "classified 2 pages" in out
+    proxy = next(line for line in out.splitlines() if line.split()[:1] == ["proxy_list"])
+    assert proxy.split()[2] == "1,"
+    assert "unlabelled" in out
+    assert "(50.0% of pages)" in out
+
+
+def test_main_classify_explain_prints_the_labels(tmp_path, capsys, no_network):
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    put(c, "Proxy-10-17", "Proxy", "", PROXY_BODY)
+    c.close()
+    main(["classify", "--db", str(db)])
+    capsys.readouterr()
+    main(["classify", "--db", str(db), "--explain", "Proxy-10-17"])
+    out = capsys.readouterr().out
+    assert "labels: proxy_list (primary)" in out
+    assert "proxy_list +5" in out
+
+
+# --- the command ---
+
+
+def resweep_argv(workdir, *extra):
+    return [
+        "--config",
+        str(workdir / "config.env"),
+        "sweep",
+        "--db",
+        str(workdir / "g.sqlite"),
+        "--wordlists",
+        str(workdir / "no-such-directory"),
+        "--budget",
+        "0",
+        "--resweep",
+        *extra,
+    ]
+
+
+# --- the command ---
+
+
+@pytest.fixture
+def no_feed_network(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("this command must not build a feed client")
+
+    monkeypatch.setattr("graphwatch.cli.FeedClient", refuse)
+
+
+def enrich_argv(workdir, *extra):
+    return ["--config", str(workdir / "config.env"), "enrich", "--db", str(workdir / "g.sqlite"), *extra]
+
+
+# --- a flag from an old rule table does not outlive the rule ---
+
+
+def test_run_classify_rescores_the_older_snapshots_of_a_flagged_page(conn):
+    page_id = put(conn, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    add_snapshot(conn, page_id, {"title": "plain", "description": "", "content": ["nothing here at all, really"]}, T0 + 60, KEY)
+    old_snapshot = conn.execute("SELECT MIN(id) FROM snapshots").fetchone()[0]
+    # The old snapshot's score as some earlier rule table left it: wrong, and flagged.
+    save_score(conn, old_snapshot, page_id, 99, True, None, [("old_rule", 99, "x", 1)], T0)
+    conn.commit()
+    counts = run_classify(conn, log=quiet)
+    row = conn.execute("SELECT score, flagged FROM scores WHERE snapshot_id = ?", (old_snapshot,)).fetchone()
+    assert tuple(row) == (6, 1)  # the spoof, scored by today's table
+    assert counts["rescored"] == 1
+    assert counts["pages"] == 1  # still one page, counted by its newest snapshot
+    assert counts["flagged"] == 0
+
+
+def test_pages_never_flagged_are_not_rescored(swept):
+    put(swept, "Notes-10-17", "Notes", "", "first version of some notes")
+    page_id = swept.execute("SELECT id FROM pages WHERE path = 'Notes-10-17'").fetchone()[0]
+    add_snapshot(swept, page_id, {"title": "Notes", "description": "", "content": ["second version of the notes"]}, T0 + 60, KEY)
+    counts = run_classify(swept, log=quiet)
+    assert counts["rescored"] == 0
+
+
+# --- the rules read link targets (decided 22 November) ---
+
+
+def put_linked(conn, path, title, text, href):
+    page_id = upsert_page(conn, path, T0)
+    page = {"title": title, "description": text[:100], "content": [{"tag": "p", "children": [text, {"tag": "a", "attrs": {"href": href}, "children": ["Download here"]}]}]}
+    add_snapshot(conn, page_id, page, T0, KEY)
+    return page_id
+
+
+def test_run_classify_sees_the_address_behind_a_link(conn):
+    put_linked(conn, "Game-10-17", "Game", "Free game, full version. ", "https://files.example.com/setup.exe")
+    run_classify(conn, log=quiet)
+    assert "executable_link" in all_hit_names(conn, "Game-10-17")
+    assert assigned_labels(conn, "Game-10-17") == ["malware_delivery"]
+
+
+def test_run_classify_does_not_file_a_lure_with_a_hidden_link_as_prose(conn):
+    put_linked(conn, "Story-10-17", "Story", "word " * 700, "https://files.example.com/book.zip")
+    put(conn, "Essay-10-17", "Essay", "", "word " * 700)
+    run_classify(conn, log=quiet)
+    assert "prose" not in assigned_labels(conn, "Story-10-17")
+    assert assigned_labels(conn, "Essay-10-17") == ["prose"]
+
+
+def test_a_hidden_link_does_not_move_the_resolver_score(conn):
+    put_linked(conn, "Notes-10-17", "Notes", "see the docs. ", "https://www.tenable.com@agfc.harper18.workers.dev/")
+    run_classify(conn, log=quiet)
+    assert score_of(conn, "Notes-10-17") == (0, 0)
+
+
+def test_the_evidence_of_a_hit_on_a_link_target_is_redacted(conn):
+    put_linked(conn, "Katya-10-17", "Katya", "write to me. ", "https://m.dating.example.com/autologin/?key=0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d")
+    run_classify(conn, log=quiet)
+    evidence = [r[0] for r in conn.execute("SELECT evidence FROM hits WHERE rule = 'autologin_link'")]
+    assert len(evidence) == 1
+    assert "0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d" not in evidence[0]
+    assert "SECRET{" in evidence[0]
+
+
+# --- what the third review of 22 November found ---
+
+
+def nested(depth: int) -> dict:
+    node = "deep"
+    for _ in range(depth):
+        node = {"tag": "b", "children": [node]}
+    return node
+
+
+def test_redact_page_really_does_overflow_on_a_very_deep_page():
+    # The premise of the test above and the one below.
+    from graphwatch.redact import redact_page
+
+    with pytest.raises(RecursionError):
+        redact_page({"content": [nested(3000)]}, KEY)

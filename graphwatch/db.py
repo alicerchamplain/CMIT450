@@ -122,6 +122,17 @@ CREATE TABLE IF NOT EXISTS hits (
     matches     INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS hits_snapshot ON hits (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS labels (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+    page_id     INTEGER NOT NULL REFERENCES pages(id),
+    category    TEXT    NOT NULL,
+    score       INTEGER NOT NULL,
+    assigned    INTEGER NOT NULL,  -- 1 when score reached the threshold
+    is_primary  INTEGER NOT NULL,  -- 1 on the label used in single-count tables
+    PRIMARY KEY (snapshot_id, category)
+);
+CREATE INDEX IF NOT EXISTS labels_category ON labels (category, assigned);
 """
 
 
@@ -568,27 +579,81 @@ def save_progress(
     conn.commit()
 
 
-def latest_snapshots(conn: Connection) -> sqlite3.Cursor:
+def latest_snapshots(
+    conn: Connection,
+    after_page_id: int = 0,
+    limit: int | None = None,
+    content: bool = True,
+) -> sqlite3.Cursor:
     """Function to read the newest snapshot of every page, for the classifier
+
+    The classifier asks for a batch of pages at a time, reads the batch whole
+    and only then writes its scores. A cursor left open over the whole table
+    would hold a read lock for the length of the run, and SQLite does not let
+    a connection that is reading wait its turn to write.
 
     Args:
         conn (Connection): SQL db connection
+        after_page_id (int, optional): only pages with a larger id, so the
+            next batch starts where the last one ended. Defaults to 0.
+        limit (int | None, optional): how many pages. Defaults to None, all.
+        content (bool, optional): False leaves the stored nodes out of the
+            row (content is NULL), for a pass that only reads the text.
+            Defaults to True.
 
     Returns:
         sqlite3.Cursor: one row per page, in page id order, with snapshot_id,
-            page_id, path, held_out, title, description and text
+            page_id, path, held_out, title, description, text and content
     """
-    sql = """
+    sql = f"""
     SELECT s.id AS snapshot_id, p.id AS page_id, p.path, p.held_out,
-           s.title, s.description, s.text
+           s.title, s.description, s.text,
+           {"s.content" if content else "NULL"} AS content
     FROM pages p
     JOIN snapshots s ON s.id = (
         SELECT id FROM snapshots WHERE page_id = p.id
         ORDER BY fetched_at DESC, id DESC LIMIT 1
     )
+    WHERE p.id > ?
     ORDER BY p.id
     """
-    return conn.execute(sql)
+    params: list = [after_page_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(sql, params)
+
+
+def superseded_flagged_snapshots(conn: Connection) -> list[sqlite3.Row]:
+    """Function to read the older snapshots that hold a flagged score
+
+    latest_snapshots gives the classifier each page's newest snapshot. An
+    older snapshot keeps whatever score it got on the night it was the
+    newest, under that night's rules. "Has this page ever been flagged" is
+    read from those rows, by the re-poll and by enrichment, so the ones that
+    say yes have to be scored again under today's rules. An older snapshot
+    with no score, or with a score that is not flagged, cannot make a page
+    flagged and is left alone; that is most of them once a page is polled
+    every ten minutes.
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        list[sqlite3.Row]: rows of snapshot_id, page_id, title, description,
+            text and content, for snapshots that are not their page's newest
+    """
+    sql = """
+    SELECT s.id AS snapshot_id, s.page_id, s.title, s.description, s.text, s.content
+    FROM snapshots s
+    JOIN scores sc ON sc.snapshot_id = s.id AND sc.flagged = 1
+    WHERE s.id != (
+        SELECT id FROM snapshots WHERE page_id = s.page_id
+        ORDER BY fetched_at DESC, id DESC LIMIT 1
+      )
+    ORDER BY s.id
+    """
+    return conn.execute(sql).fetchall()
 
 
 def save_score(
@@ -635,6 +700,56 @@ def save_score(
     conn.executemany(hit_insert, hit_params)
 
 
+def save_labels(
+    conn: Connection,
+    snapshot_id: int,
+    page_id: int,
+    labels: list[tuple[str, int, bool, bool]],
+) -> None:
+    """Function to store one snapshot's score in each category
+
+    A second call for the same snapshot replaces the first, like save_score.
+    Does not commit: the caller commits in batches.
+
+    Args:
+        conn (Connection): SQL db connection
+        snapshot_id (int): The snapshot that was scored
+        page_id (int): The page the snapshot belongs to
+        labels (list[tuple[str, int, bool, bool]]): one (category, score,
+            assigned, is_primary) per category to store. The caller leaves
+            out the categories that scored 0, so a near miss is a row with
+            assigned = 0.
+    """
+    conn.execute("DELETE FROM labels WHERE snapshot_id = ?", (snapshot_id,))
+    label_insert = """
+    INSERT INTO labels (snapshot_id, page_id, category, score, assigned, is_primary)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """
+    label_params = [
+        (snapshot_id, page_id, category, score, int(assigned), int(is_primary))
+        for category, score, assigned, is_primary in labels
+    ]
+    conn.executemany(label_insert, label_params)
+
+
+def label_rows(conn: Connection, snapshot_id: int) -> list[sqlite3.Row]:
+    """Function to load the category scores stored for one snapshot
+
+    Args:
+        conn (Connection): SQL db connection
+        snapshot_id (int): The snapshot to look up
+
+    Returns:
+        list[sqlite3.Row]: rows of category, score, assigned and is_primary
+            in the order they were stored
+    """
+    label_select = """
+    SELECT category, score, assigned, is_primary FROM labels
+    WHERE snapshot_id = ? ORDER BY rowid
+    """
+    return conn.execute(label_select, (snapshot_id,)).fetchall()
+
+
 def explain_rows(
     conn: Connection, path: str
 ) -> tuple[sqlite3.Row | None, list[sqlite3.Row]]:
@@ -645,8 +760,8 @@ def explain_rows(
         path (str): The page path as Telegraph spells it, e.g. Hello-10-17-154
 
     Returns:
-        tuple[sqlite3.Row | None, list[sqlite3.Row]]: The score row (path,
-            held_out, title, text, score, flagged) and its hits (rule, weight,
+        tuple[sqlite3.Row | None, list[sqlite3.Row]]: The score row (snapshot_id,
+            path, held_out, title, text, score, flagged) and its hits (rule, weight,
             evidence, matches) in the order they were stored. (None, []) if the
             page is unknown or has not been classified.
     """

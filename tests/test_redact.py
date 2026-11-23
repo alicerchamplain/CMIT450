@@ -1217,6 +1217,15 @@ def test_the_newer_proxy_schemes_have_their_user_id_hashed(scheme):
     assert out == f"{scheme}://" + hash_secret("made-up-password", KEY) + "@vpn.example.org:443"
 
 
+def test_redaction_knows_every_proxy_scheme_the_rules_call_a_proxy_link():
+    from graphwatch.redact import PROXY_USERINFO_PATTERN
+    from graphwatch.rules import PROXY_URI_PATTERN
+
+    for scheme in ("vless", "trojan", "ss", "ssr", "socks", "socks5", "hysteria", "hysteria2", "tuic"):
+        assert PROXY_URI_PATTERN.search(f"{scheme}://x")
+        assert PROXY_USERINFO_PATTERN.search(f"{scheme}://made-up-password@h"), scheme
+
+
 # A token value in plain base64, in a fragment, or percent-encoded
 
 

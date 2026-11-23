@@ -19,11 +19,13 @@ from graphwatch.db import (
     explain_rows,
     held_out_paths,
     http_logger,
+    label_rows,
     latest_snapshots,
     load_known,
     parse_path,
     load_progress,
     stale_pages,
+    save_labels,
     save_progress,
     save_score,
     store_fetch,
@@ -1132,6 +1134,7 @@ def test_latest_snapshots_carries_the_fields_the_rules_read(conn):
     assert row["description"] == page["description"]
     assert row["text"].startswith(page["title"] + "\n")
     assert row["held_out"] == 0
+    assert json.loads(row["content"]) == page["content"]  # for the link targets
 
 
 def test_latest_snapshots_picks_the_newest_snapshot_of_an_edited_page(conn):
@@ -1267,3 +1270,162 @@ def test_explain_rows_uses_the_newest_scored_snapshot(conn):
     row, hits = explain_rows(conn, "a-01-01")
     assert row["score"] == 6
     assert len(hits) == 2
+
+
+# --------------------------------------------------------------------------
+# labels: one row per category that scored (classification plan, 2026-11-15)
+# --------------------------------------------------------------------------
+
+# (category, score, assigned, is_primary)
+LABELS = [
+    ("leaked_credentials", 6, True, True),
+    ("seo_spam", 4, True, False),
+    ("pointer", 3, False, False),
+    ("resolver", -1, False, False),
+]
+
+
+def all_labels(conn) -> list[tuple]:
+    sql = "SELECT snapshot_id, page_id, category, score, assigned, is_primary FROM labels ORDER BY rowid"
+    return [tuple(r) for r in conn.execute(sql)]
+
+
+def test_connect_creates_the_labels_table(conn):
+    assert "labels" in tables(conn)
+    assert columns(conn, "labels") == {
+        "snapshot_id",
+        "page_id",
+        "category",
+        "score",
+        "assigned",
+        "is_primary",
+    }
+
+
+def test_connect_adds_the_labels_table_to_a_database_made_before_it(tmp_path):
+    # A new table needs no migration: CREATE TABLE IF NOT EXISTS is enough.
+    db = tmp_path / "g.sqlite"
+    old = sqlite3.connect(str(db))
+    old.executescript(SCHEMA.split("CREATE TABLE IF NOT EXISTS labels")[0])
+    old.commit()
+    old.close()
+    c = connect(db)
+    assert "labels" in tables(c)
+    c.close()
+
+
+def test_save_labels_round_trip(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_labels(conn, snap, page_id, LABELS)
+    assert all_labels(conn) == [
+        (snap, page_id, "leaked_credentials", 6, 1, 1),
+        (snap, page_id, "seo_spam", 4, 1, 0),
+        (snap, page_id, "pointer", 3, 0, 0),
+        (snap, page_id, "resolver", -1, 0, 0),
+    ]
+
+
+def test_label_rows_returns_one_snapshots_rows_in_stored_order(conn):
+    a, snap_a = stored_page(conn, "a-01-01")
+    b, snap_b = stored_page(conn, "b-01-01")
+    save_labels(conn, snap_a, a, LABELS)
+    save_labels(conn, snap_b, b, [("prose", 4, True, True)])
+    rows = label_rows(conn, snap_a)
+    assert [r["category"] for r in rows] == [label[0] for label in LABELS]
+    assert [tuple(r) for r in label_rows(conn, snap_b)] == [("prose", 4, 1, 1)]
+
+
+def test_label_rows_is_empty_for_a_snapshot_with_no_labels(conn):
+    _page_id, snap = stored_page(conn, "a-01-01")
+    assert label_rows(conn, snap) == []
+
+
+def test_save_labels_twice_replaces_the_snapshots_rows(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_labels(conn, snap, page_id, LABELS)
+    save_labels(conn, snap, page_id, [("prose", 4, True, True)])
+    assert all_labels(conn) == [(snap, page_id, "prose", 4, 1, 1)]
+
+
+def test_save_labels_with_no_rows_clears_a_page_that_no_longer_scores(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_labels(conn, snap, page_id, LABELS)
+    save_labels(conn, snap, page_id, [])
+    assert all_labels(conn) == []
+
+
+def test_save_labels_leaves_other_snapshots_alone(conn):
+    a, snap_a = stored_page(conn, "a-01-01")
+    b, snap_b = stored_page(conn, "b-01-01")
+    save_labels(conn, snap_a, a, LABELS)
+    save_labels(conn, snap_b, b, [("prose", 4, True, True)])
+    save_labels(conn, snap_b, b, [])
+    assert len(all_labels(conn)) == len(LABELS)
+
+
+def test_a_category_is_stored_once_per_snapshot(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    twice = [("prose", 4, True, True), ("prose", 5, True, False)]
+    with pytest.raises(sqlite3.IntegrityError):
+        save_labels(conn, snap, page_id, twice)
+
+
+def test_save_labels_does_not_commit(tmp_path):
+    db = tmp_path / "g.sqlite"
+    c = connect(db)
+    page_id, snap = stored_page(c, "a-01-01")
+    save_labels(c, snap, page_id, LABELS)
+    reader = connect(db)
+    assert reader.execute("SELECT COUNT(*) FROM labels").fetchone()[0] == 0
+    c.commit()
+    assert reader.execute("SELECT COUNT(*) FROM labels").fetchone()[0] == len(LABELS)
+    reader.close()
+    c.close()
+
+
+def test_save_score_and_save_labels_do_not_touch_each_others_rows(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_score(conn, snap, page_id, 6, True, None, HITS, T0)
+    save_labels(conn, snap, page_id, LABELS)
+    save_score(conn, snap, page_id, 1, False, None, HITS[1:], T0 + 9)
+    assert len(all_labels(conn)) == len(LABELS)
+    save_labels(conn, snap, page_id, [])
+    assert conn.execute("SELECT COUNT(*) FROM hits").fetchone()[0] == 1
+
+
+def test_near_misses_of_a_category_can_be_queried_like_the_resolvers(conn):
+    # What the table is for: assigned = 0 with a positive score is a near miss.
+    a, snap_a = stored_page(conn, "a-01-01")
+    b, snap_b = stored_page(conn, "b-01-01")
+    save_labels(conn, snap_a, a, [("pointer", 4, True, True)])
+    save_labels(conn, snap_b, b, [("pointer", 3, False, False)])
+    sql = """
+    SELECT p.path FROM labels l JOIN pages p ON p.id = l.page_id
+    WHERE l.category = 'pointer' AND l.assigned = 0 AND l.score > 0
+    """
+    assert [r["path"] for r in conn.execute(sql)] == ["b-01-01"]
+
+
+def test_explain_rows_carries_the_snapshot_id_for_the_label_lookup(conn):
+    page_id, snap = stored_page(conn, "a-01-01")
+    save_score(conn, snap, page_id, 6, True, None, HITS, T0)
+    row, _hits = explain_rows(conn, "a-01-01")
+    assert row["snapshot_id"] == snap
+
+
+# --- what the second review of 22 November found -------------------------------------
+
+
+def test_latest_snapshots_can_be_read_a_batch_at_a_time(conn):
+    ids = [stored_page(conn, f"a-01-0{n}")[0] for n in range(1, 6)]
+    first = latest_snapshots(conn, 0, 2).fetchall()
+    second = latest_snapshots(conn, first[-1]["page_id"], 2).fetchall()
+    third = latest_snapshots(conn, second[-1]["page_id"], 2).fetchall()
+    assert [r["page_id"] for r in first + second + third] == ids
+    assert latest_snapshots(conn, ids[-1], 2).fetchall() == []
+
+
+def test_latest_snapshots_can_leave_the_content_out(conn):
+    stored_page(conn, "a-01-01")
+    assert latest_snapshots(conn, content=False).fetchone()["content"] is None
+    assert latest_snapshots(conn).fetchone()["content"] is not None
