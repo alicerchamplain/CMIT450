@@ -65,6 +65,39 @@ def test_collect_takes_the_destination_of_a_flagged_spoof_page_and_never_the_dec
     assert list(collected(conn)) == [("host", "agfc.harper18.workers.dev")]
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "see https://www.tenable.com/plugins for more",
+        "see https://WWW.Tenable.com:8443/plugins for more",  # the host of a URL, whatever its case and port
+        "see www.tenable.com for more",
+    ],
+)
+def test_a_url_on_the_decoys_own_site_is_not_collected_and_neither_is_its_host(conn, body):
+    # The decoy is a real vendor's site. Its pages are no more the actor's
+    # than its name is, and absent from the feeds they would count as novel.
+    put(conn, "Hello-10-17-9", SPOOF_TITLE, body=body)
+    run_classify(conn, log=quiet)
+    assert list(collected(conn)) == [("host", "agfc.harper18.workers.dev")]
+
+
+def test_a_decoy_on_one_flagged_page_is_not_collected_from_another(conn):
+    put(conn, "Hello-10-17-9", SPOOF_TITLE)
+    put(conn, "Hello-10-17-10", OTHER_SPOOF_TITLE, body="mirror of www.tenable.com and https://www.tenable.com/plugins")
+    run_classify(conn, log=quiet)
+    assert list(collected(conn)) == [
+        ("host", "agfc.harper18.workers.dev"),
+        ("host", "second.example-tunnel.workers.dev"),
+    ]
+
+
+def test_a_url_on_another_site_is_still_collected_from_a_spoof_page(conn):
+    put(conn, "Hello-10-17-9", SPOOF_TITLE, body="get https://docs.tenable.com.example.org/x now")
+    run_classify(conn, log=quiet)
+    assert ("url", "https://docs.tenable.com.example.org/x") in collected(conn)
+    assert ("host", "docs.tenable.com.example.org") in collected(conn)
+
+
 def test_a_token_is_never_collected(conn):
     put(conn, "Hello-10-17-9", SPOOF_TITLE, body="dGViaQ== " + API_SAMPLE)
     run_classify(conn, log=quiet)

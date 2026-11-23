@@ -79,13 +79,17 @@ def collect_indicators(conn: Connection) -> list[Seen]:
     Returns:
         list[Seen]: one entry per ip, host or url, in order of first
             appearance, and after each url its host. Decoys and tokens are
-            left out.
+            left out, and so is a host that is a decoy on any flagged page
+            and a url on such a host.
     """
     first = {}
     last = {}
     pages = {}
+    decoys = set()
     for row in flagged_page_snapshots(conn):
         for indicator in extract(row["title"], row["text"]):
+            if indicator.kind == "decoy":
+                decoys.add(indicator.value)
             if indicator.kind not in LOOKUP_KINDS:
                 continue
             keys = [(indicator.kind, indicator.value)]
@@ -98,9 +102,20 @@ def collect_indicators(conn: Connection) -> list[Seen]:
                 first.setdefault(key, row["fetched_at"])
                 last[key] = row["fetched_at"]
                 pages.setdefault(key, set()).add(row["page_id"])
+
+    def on_a_decoy(kind: str, value: str) -> bool:
+        # A decoy is somebody else's site, named as bait. That holds on every
+        # page and for every address on the site, so none of it is the
+        # actor's and none of it is sent to a feed
+        if kind == "url":
+            host = host_of_url(value)
+            return host is not None and host[1] in decoys
+        return value in decoys
+
     return [
         Seen(kind, value, first[(kind, value)], last[(kind, value)], len(pages[(kind, value)]))
         for kind, value in first
+        if not on_a_decoy(kind, value)
     ]
 
 
