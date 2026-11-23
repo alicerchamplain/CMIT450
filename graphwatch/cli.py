@@ -33,7 +33,11 @@ from graphwatch.db import (
     label_rows,
     latest_snapshots,
     load_progress,
+    mark_gone,
     parse_path,
+    refresh_snapshot,
+    resweep_cost,
+    resweep_paths,
     save_labels,
     save_progress,
     save_score,
@@ -262,8 +266,14 @@ def run_sweep(
                     except StopIteration as stop:
                         summary = stop.value
                         break
-                    store_fetch(conn, f, time.time(), key)
-                    stored += 1
+                    try:
+                        store_fetch(conn, f, time.time(), key)
+                        stored += 1
+                    except RecursionError:
+                        # A page nested deeper than Python can walk cannot be
+                        # redacted, so it is not stored. The walk moves on:
+                        # stopping here would stop it here every night.
+                        log(f"{f.page['path']}: nested too deep to redact, not stored")
                     counter = parse_path(f.page["path"])[3] or 1
                     save_progress(
                         conn,
@@ -299,6 +309,60 @@ def run_sweep(
             f"skipped {uncounted} title-days with no crowd count; run crowd for those days, then sweep again"
         )
     return stored, requests
+
+
+def run_resweep(
+    conn: Connection, client: TelegraphClient, pages: list, key: bytes, log=print
+) -> dict:
+    """Function to fetch stored pages again and record what happened to each
+
+    A page that is still there has its last_seen moved. If its fingerprint
+    moved too, it gets a new snapshot and a content_changed event; if not,
+    only its view count is kept. A page that answers PAGE_NOT_FOUND gets a
+    gone event. A failed fetch changes nothing, so last_seen stays old and
+    the page is first in line on the next run.
+
+    Args:
+        conn (Connection): SQL db connection
+        client (TelegraphClient): Telegraph client
+        pages (list): rows of id and path from resweep_paths
+        key (bytes): the hmac key for redaction
+        log (optional): Logging function. Defaults to print.
+
+    Returns:
+        dict: counts of refreshed, changed, gone and failed
+    """
+    counts = {"refreshed": 0, "changed": 0, "gone": 0, "failed": 0}
+    try:
+        for row in pages:
+            fetch = client.get_page(row["path"])
+            ts = time.time()
+            if fetch.outcome is Outcome.FOUND:
+                # By the row's id: Telegraph may answer with the path in
+                # another spelling than the one stored, and the row asked
+                # for is the one that has to leave the work list
+                try:
+                    changed = refresh_snapshot(conn, row["id"], fetch.page, ts, key)
+                except RecursionError:
+                    # Nested deeper than Python can walk: it cannot be
+                    # redacted, so it is not stored, and the run goes on
+                    conn.rollback()
+                    counts["failed"] += 1
+                    log(f"{row['path']}: nested too deep to redact, not stored")
+                    continue
+                counts["refreshed"] += 1
+                if changed:
+                    counts["changed"] += 1
+                    log(f"{row['path']}: content changed")
+            elif fetch.outcome is Outcome.NOT_FOUND:
+                mark_gone(conn, row["id"], ts)
+                counts["gone"] += 1
+                log(f"{row['path']}: gone")
+            else:
+                counts["failed"] += 1
+    except BudgetExceeded:
+        log("budget exceeded")
+    return counts
 
 
 def run_meta(conn: Connection, client: TelegraphClient, pages: list, log=print) -> dict:
@@ -607,6 +671,26 @@ def parse_args(argv: list[str]):
     sweep.add_argument(
         "--unfrozen", action="store_true", help="skip the SHA256SUMS check"
     )
+    sweep.add_argument(
+        "--resweep", action="store_true", help="fetch stored pages again"
+    )
+    sweep.add_argument(
+        "--older-than",
+        type=float,
+        default=20.0,
+        help="with --resweep: only pages last seen this many hours ago or more",
+    )
+    sweep.add_argument(
+        "--flagged",
+        action="store_true",
+        help="with --resweep: only pages the classifier has flagged",
+    )
+    sweep.add_argument(
+        "--match",
+        metavar="TEXT",
+        default=None,
+        help="with --resweep: only pages whose newest text contains TEXT",
+    )
     meta = sub.add_parser("meta", help="fetch page timestamps")
     meta.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
     meta.add_argument("--rate", type=float, default=8.0)
@@ -633,6 +717,8 @@ def main(argv: list[str] | None = None):
             to read sys.argv. Defaults to None.
     """
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.command == "sweep" and args.days is not None and args.days < 1:
+        raise SystemExit("--days has to be 1 or more")
     if args.command == "freeze":
         run_freeze(args.wordlists, log=lambda s: print(s, flush=True))
         return
@@ -650,12 +736,44 @@ def main(argv: list[str] | None = None):
         return
     if args.command == "sweep":
         key = require_key(args.config)
-    if args.command in ("crowd", "sweep"):
+    resweep = args.command == "sweep" and args.resweep
+    # A re-sweep walks stored pages, not titles, so it reads no word list
+    if args.command in ("crowd", "sweep") and not resweep:
         entries = load_frozen(args.wordlists, args.unfrozen)
     conn = connect(args.db)
     client = TelegraphClient(
         rate_per_s=args.rate, budget=args.budget, log=http_logger(conn)
     )
+    if resweep:
+        started = time.time()
+        cutoff = started - args.older_than * 3600
+        if args.days is None:
+            days = None
+            window = "all days"
+        else:
+            days = recent_days(args.today or date.today(), args.days)
+            window = (
+                f"{args.days} days, From: {days[0][0]:02d}-{days[0][1]:02d} "
+                f"to {days[-1][0]:02d}-{days[-1][1]:02d}"
+            )
+        cost = resweep_cost(conn, cutoff, days, args.flagged, args.match)
+        print(
+            f"Resweep: {window}, Pages: {cost:,}, "
+            f"Older than: {args.older_than:g}h, Budget: {args.budget:,}",
+            flush=True,
+        )
+        pages = resweep_paths(conn, cutoff, days, args.flagged, args.match)
+        counts = run_resweep(
+            conn, client, pages, key, log=lambda s: print(s, flush=True)
+        )
+        elapsed = time.time() - started
+        print(
+            f"refreshed {counts['refreshed']:,} pages, {counts['changed']:,} changed, "
+            f"{counts['gone']:,} gone, {counts['failed']:,} failed, "
+            f"{client.requests_made:,} requests, {elapsed:.0f}s",
+            flush=True,
+        )
+        return
     if args.command == "crowd":
         days = recent_days(args.today or date.today(), args.days)
         started = time.time()

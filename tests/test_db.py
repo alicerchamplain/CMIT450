@@ -19,11 +19,18 @@ from graphwatch.db import (
     explain_rows,
     held_out_paths,
     http_logger,
+    is_gone,
     label_rows,
     latest_snapshots,
     load_known,
     parse_path,
+    refresh_snapshot,
+    superseded_flagged_snapshots,
+    BUSY_TIMEOUT_S,
     load_progress,
+    mark_gone,
+    resweep_cost,
+    resweep_paths,
     stale_pages,
     save_labels,
     save_progress,
@@ -1413,6 +1420,404 @@ def test_explain_rows_carries_the_snapshot_id_for_the_label_lookup(conn):
     assert row["snapshot_id"] == snap
 
 
+# --------------------------------------------------------------------------
+# re-sweep: the work list and the gone marker (issue #37,
+# plan/resweep-plan-2026-11-04.md)
+# --------------------------------------------------------------------------
+
+HOUR = 3600.0
+
+
+def seen_page(conn, path: str, last_seen: float) -> int:
+    """A stored page with one snapshot, last seen at the given time."""
+    page_id = upsert_page(conn, path, last_seen)
+    add_snapshot(conn, page_id, {"title": path, "content": [f"body of {path}"]}, last_seen, KEY)
+    return page_id
+
+
+def flag(conn, page_id: int, flagged: bool = True) -> None:
+    snap = conn.execute(
+        "SELECT id FROM snapshots WHERE page_id = ? ORDER BY id DESC LIMIT 1", (page_id,)
+    ).fetchone()[0]
+    save_score(conn, snap, page_id, 6 if flagged else 0, flagged, None, [], T0)
+    conn.commit()
+
+
+def work(conn, cutoff, **kwargs) -> list[str]:
+    return [row["path"] for row in resweep_paths(conn, cutoff, **kwargs)]
+
+
+def events_of(conn, page_id: int, kind: str) -> list[float]:
+    sql = "SELECT ts FROM events WHERE page_id = ? AND kind = ? ORDER BY id"
+    return [r["ts"] for r in conn.execute(sql, (page_id, kind))]
+
+
+def test_resweep_paths_lists_pages_last_seen_before_the_cutoff(conn):
+    seen_page(conn, "Hello-10-17-1", T0)
+    seen_page(conn, "Hello-10-17-2", T0 + 2 * HOUR)
+    assert work(conn, T0 + HOUR) == ["Hello-10-17-1"]
+    assert work(conn, T0 + 3 * HOUR) == ["Hello-10-17-1", "Hello-10-17-2"]
+
+
+def test_resweep_paths_cutoff_is_strict(conn):
+    seen_page(conn, "Hello-10-17-1", T0)
+    assert work(conn, T0) == []
+
+
+def test_resweep_paths_returns_the_id_with_the_path(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    row = resweep_paths(conn, T0 + HOUR)[0]
+    assert (row["id"], row["path"]) == (page_id, "Hello-10-17-1")
+
+
+def test_resweep_paths_is_oldest_first_then_by_title_day_and_counter(conn):
+    seen_page(conn, "Hello-10-18-1", T0 + 60)
+    seen_page(conn, "Test-10-17-1", T0)
+    seen_page(conn, "Hello-10-17-2", T0)
+    seen_page(conn, "Hello-10-17-1", T0)
+    seen_page(conn, "Hello-10-16-9", T0)
+    assert work(conn, T0 + HOUR) == [
+        "Hello-10-16-9",
+        "Hello-10-17-1",
+        "Hello-10-17-2",
+        "Test-10-17-1",
+        "Hello-10-18-1",
+    ]
+
+
+def test_resweep_paths_respects_the_window(conn):
+    seen_page(conn, "Hello-10-16-1", T0)
+    seen_page(conn, "Hello-10-17-1", T0)
+    seen_page(conn, "Hello-11-17-1", T0)
+    assert work(conn, T0 + HOUR, days=[(10, 17)]) == ["Hello-10-17-1"]
+    assert work(conn, T0 + HOUR, days=[(10, 16), (11, 17)]) == ["Hello-10-16-1", "Hello-11-17-1"]
+    assert len(work(conn, T0 + HOUR, days=None)) == 3
+
+
+def test_resweep_paths_respects_the_limit(conn):
+    for n in range(1, 6):
+        seen_page(conn, f"Hello-10-17-{n}", T0 + n)
+    assert work(conn, T0 + HOUR, limit=2) == ["Hello-10-17-1", "Hello-10-17-2"]
+
+
+def test_a_page_fetched_again_drops_out_of_the_work_list(conn):
+    # last_seen is the progress marker: nothing else has to be reset.
+    seen_page(conn, "Hello-10-17-1", T0)
+    seen_page(conn, "Hello-10-17-2", T0)
+    cutoff = T0 + HOUR
+    fetch = Fetch(
+        "Hello-10-17-1",
+        Outcome.FOUND,
+        {"path": "Hello-10-17-1", "title": "t", "content": ["again"]},
+        None,
+        200,
+        5,
+    )
+    store_fetch(conn, fetch, cutoff + 5, KEY)
+    assert work(conn, cutoff) == ["Hello-10-17-2"]
+
+
+def test_resweep_paths_can_keep_to_flagged_pages(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    b = seen_page(conn, "Hello-10-17-2", T0)
+    seen_page(conn, "Hello-10-17-3", T0)  # never classified
+    flag(conn, a, True)
+    flag(conn, b, False)
+    assert work(conn, T0 + HOUR, flagged=True) == ["Hello-10-17-1"]
+    assert len(work(conn, T0 + HOUR)) == 3
+
+
+def test_a_page_flagged_once_stays_on_the_flagged_list_after_an_edit(conn):
+    # The actor edits in place. A new snapshot has no score until classify
+    # runs, and may never be flagged again; the page is still one to watch.
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    flag(conn, page_id, True)
+    add_snapshot(conn, page_id, {"title": "t", "content": ["rotated"]}, T0 + 60, KEY)
+    assert work(conn, T0 + HOUR, flagged=True) == ["Hello-10-17-1"]
+    flag(conn, page_id, False)
+    assert work(conn, T0 + HOUR, flagged=True) == ["Hello-10-17-1"]
+
+
+def test_resweep_paths_can_keep_to_pages_whose_newest_text_matches(conn):
+    seen_page(conn, "Hello-10-17-1", T0)
+    page_id = seen_page(conn, "Hello-10-17-2", T0)
+    add_snapshot(conn, page_id, {"title": "t", "content": ["now 8.8.8.8"]}, T0 + 60, KEY)
+    assert work(conn, T0 + HOUR, match="8.8.8.8") == ["Hello-10-17-2"]
+    # The older snapshot of the second page does not count.
+    assert work(conn, T0 + HOUR, match="body of Hello-10-17-2") == []
+    assert work(conn, T0 + HOUR, match="body of Hello-10-17-1") == ["Hello-10-17-1"]
+
+
+def test_match_is_a_plain_substring_not_a_like_pattern(conn):
+    seen_page(conn, "Hello-10-17-1", T0)
+    assert work(conn, T0 + HOUR, match="%") == []
+    assert work(conn, T0 + HOUR, match="_") == []
+
+
+def test_the_filters_combine(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    b = seen_page(conn, "Hello-10-18-1", T0)
+    flag(conn, a)
+    flag(conn, b)
+    assert work(conn, T0 + HOUR, days=[(10, 18)], flagged=True, match="body of") == ["Hello-10-18-1"]
+
+
+def test_resweep_cost_is_the_length_of_the_work_list(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    seen_page(conn, "Hello-10-17-2", T0)
+    seen_page(conn, "Hello-10-18-1", T0 + 2 * HOUR)
+    flag(conn, a)
+    for kwargs in (
+        {},
+        {"days": [(10, 17)]},
+        {"flagged": True},
+        {"match": "Hello-10-17-2"},
+        {"days": [(10, 17)], "flagged": True},
+    ):
+        for cutoff in (T0, T0 + HOUR, T0 + 3 * HOUR):
+            assert resweep_cost(conn, cutoff, **kwargs) == len(resweep_paths(conn, cutoff, **kwargs))
+    assert resweep_cost(conn, T0 + HOUR) == 2
+
+
+def test_mark_gone_writes_exactly_one_event_with_the_fetch_time(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    mark_gone(conn, page_id, T0 + 99)
+    assert events_of(conn, page_id, "gone") == [T0 + 99]
+
+
+def test_mark_gone_keeps_the_page_its_snapshots_and_last_seen(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    mark_gone(conn, page_id, T0 + 99)
+    row = conn.execute("SELECT last_seen FROM pages WHERE id = ?", (page_id,)).fetchone()
+    assert row["last_seen"] == T0
+    assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 1
+
+
+def test_a_gone_page_is_left_out_of_the_work_list_and_the_cost(conn):
+    # Otherwise it would be asked for again every night.
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    seen_page(conn, "Hello-10-17-2", T0)
+    mark_gone(conn, page_id, T0 + 99)
+    assert work(conn, T0 + HOUR) == ["Hello-10-17-2"]
+    assert resweep_cost(conn, T0 + HOUR) == 1
+
+
+def test_is_gone_follows_the_newest_gone_or_returned_event(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    assert is_gone(conn, page_id) is False
+    mark_gone(conn, page_id, T0 + 10)
+    assert is_gone(conn, page_id) is True
+    add_event(conn, page_id, "returned", T0 + 20)
+    assert is_gone(conn, page_id) is False
+    mark_gone(conn, page_id, T0 + 30)
+    assert is_gone(conn, page_id) is True
+
+
+def test_other_event_kinds_do_not_make_a_page_gone(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    add_event(conn, page_id, "content_changed", T0 + 10)
+    assert is_gone(conn, page_id) is False
+    assert work(conn, T0 + HOUR) == ["Hello-10-17-1"]
+
+
+def test_a_gone_page_that_is_fetched_again_gets_a_returned_event(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    mark_gone(conn, page_id, T0 + 10)
+    upsert_page(conn, "Hello-10-17-1", T0 + 20)
+    assert events_of(conn, page_id, "returned") == [T0 + 20]
+    assert is_gone(conn, page_id) is False
+
+
+def test_a_returned_page_is_back_on_the_work_list(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    mark_gone(conn, page_id, T0 + 10)
+    upsert_page(conn, "Hello-10-17-1", T0 + 20)
+    assert work(conn, T0 + HOUR) == ["Hello-10-17-1"]
+
+
+def test_an_ordinary_refetch_writes_no_returned_event(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    upsert_page(conn, "Hello-10-17-1", T0 + 20)
+    assert events_of(conn, page_id, "returned") == []
+
+
+def test_returned_is_written_once_not_on_every_later_fetch(conn):
+    page_id = seen_page(conn, "Hello-10-17-1", T0)
+    mark_gone(conn, page_id, T0 + 10)
+    upsert_page(conn, "Hello-10-17-1", T0 + 20)
+    upsert_page(conn, "Hello-10-17-1", T0 + 30)
+    assert events_of(conn, page_id, "returned") == [T0 + 20]
+
+
+# --- what a second fetch records (resweep plan, step 3) ---
+
+
+def test_views_are_not_part_of_the_fingerprint(conn):
+    # A page nobody edited gets a snapshot with the new view count and no event.
+    page_id = upsert_page(conn, "Hello-10-17-1", T0)
+    page = {"title": "t", "description": "d", "views": 5, "content": ["same"]}
+    add_snapshot(conn, page_id, page, T0, KEY)
+    _snap, changed = add_snapshot(conn, page_id, {**page, "views": 9}, T0 + 60, KEY)
+    assert changed is False
+    assert events_of(conn, page_id, "content_changed") == []
+    views = [r["views"] for r in conn.execute("SELECT views FROM snapshots ORDER BY id")]
+    assert views == [5, 9]
+
+
+def test_a_rotation_writes_one_content_changed_event_at_the_fetch_time(conn):
+    page_id = upsert_page(conn, "Hello-10-17-1", T0)
+    add_snapshot(conn, page_id, {"title": "8.8.8.8", "content": ["x"]}, T0, KEY)
+    _snap, changed = add_snapshot(conn, page_id, {"title": "9.9.9.9", "content": ["x"]}, T0 + 60, KEY)
+    assert changed is True
+    assert events_of(conn, page_id, "content_changed") == [T0 + 60]
+
+
+# --------------------------------------------------------------------------
+# the ten-minute re-poll: a snapshot only on change, views kept apart, and
+# two writers that wait for each other (decided 22 November)
+# --------------------------------------------------------------------------
+
+
+def poll_page(title="t", body="same", views=5) -> dict:
+    return {"path": "Hello-10-17-1", "title": title, "description": body, "views": views, "content": [body]}
+
+
+def stored_poll_page(conn) -> int:
+    page_id = upsert_page(conn, "Hello-10-17-1", T0)
+    add_snapshot(conn, page_id, poll_page(), T0, KEY)
+    return page_id
+
+
+def test_connect_creates_the_views_table(conn):
+    assert "views" in tables(conn)
+    assert columns(conn, "views") == {"page_id", "fetched_at", "views"}
+
+
+def test_refresh_snapshot_of_an_unchanged_page_stores_no_snapshot(conn):
+    page_id = stored_poll_page(conn)
+    assert refresh_snapshot(conn, page_id, poll_page(views=9), T0 + 600, KEY) is False
+    assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 1
+    assert events_of(conn, page_id, "content_changed") == []
+
+
+def test_refresh_snapshot_keeps_the_view_count_of_an_unchanged_page(conn):
+    page_id = stored_poll_page(conn)
+    refresh_snapshot(conn, page_id, poll_page(views=9), T0 + 600, KEY)
+    refresh_snapshot(conn, page_id, poll_page(views=12), T0 + 1200, KEY)
+    rows = [tuple(r) for r in conn.execute("SELECT page_id, fetched_at, views FROM views ORDER BY fetched_at")]
+    assert rows == [(page_id, T0 + 600, 9), (page_id, T0 + 1200, 12)]
+
+
+def test_refresh_snapshot_moves_last_seen_whether_or_not_the_page_changed(conn):
+    page_id = stored_poll_page(conn)
+    refresh_snapshot(conn, page_id, poll_page(), T0 + 600, KEY)
+    assert conn.execute("SELECT last_seen FROM pages WHERE id = ?", (page_id,)).fetchone()[0] == T0 + 600
+    refresh_snapshot(conn, page_id, poll_page(title="new"), T0 + 1200, KEY)
+    assert conn.execute("SELECT last_seen FROM pages WHERE id = ?", (page_id,)).fetchone()[0] == T0 + 1200
+
+
+def test_refresh_snapshot_of_a_changed_page_stores_it_and_writes_the_event(conn):
+    page_id = stored_poll_page(conn)
+    assert refresh_snapshot(conn, page_id, poll_page(title="9.9.9.9"), T0 + 600, KEY) is True
+    titles = [r["title"] for r in conn.execute("SELECT title FROM snapshots ORDER BY id")]
+    assert titles == ["t", "9.9.9.9"]
+    assert events_of(conn, page_id, "content_changed") == [T0 + 600]
+    assert conn.execute("SELECT COUNT(*) FROM views").fetchone()[0] == 0
+
+
+def test_refresh_snapshot_compares_after_redaction(conn):
+    # The stored fingerprint is of the redacted page, so the raw page has to
+    # be redacted before the two are compared.
+    page_id = upsert_page(conn, "Hello-10-17-1", T0)
+    page = poll_page(body="password: hunter2")
+    add_snapshot(conn, page_id, page, T0, KEY)
+    assert refresh_snapshot(conn, page_id, page, T0 + 600, KEY) is False
+
+
+def test_refresh_snapshot_of_a_page_with_no_snapshot_stores_the_first(conn):
+    page_id = upsert_page(conn, "Hello-10-17-1", T0)
+    assert refresh_snapshot(conn, page_id, poll_page(), T0 + 600, KEY) is False
+    assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 1
+
+
+def test_refresh_snapshot_goes_by_the_page_id_not_the_path_in_the_answer(conn):
+    page_id = upsert_page(conn, "mark-01-20-5", T0, held_out=True)
+    add_snapshot(conn, page_id, poll_page(), T0, KEY)
+    answer = {**poll_page(title="edited"), "path": "Mark-01-20-5"}
+    refresh_snapshot(conn, page_id, answer, T0 + 600, KEY)
+    assert [tuple(r) for r in conn.execute("SELECT id, path, held_out FROM pages")] == [(page_id, "mark-01-20-5", 1)]
+    assert conn.execute("SELECT COUNT(*) FROM snapshots WHERE page_id = ?", (page_id,)).fetchone()[0] == 2
+
+
+def test_two_polls_at_the_same_instant_keep_one_views_row(conn):
+    page_id = stored_poll_page(conn)
+    refresh_snapshot(conn, page_id, poll_page(views=9), T0 + 600, KEY)
+    refresh_snapshot(conn, page_id, poll_page(views=10), T0 + 600, KEY)
+    assert [r["views"] for r in conn.execute("SELECT views FROM views")] == [10]
+
+
+def test_the_busy_timeout_is_a_minute():
+    assert BUSY_TIMEOUT_S == 60
+
+
+def test_a_writer_waits_for_another_writer_instead_of_failing(tmp_path, monkeypatch):
+    # The nightly job and the ten-minute re-poll share one file.
+    import threading
+
+    db = tmp_path / "g.sqlite"
+    first = connect(db)
+    first.execute("BEGIN IMMEDIATE")
+    first.execute("INSERT INTO events (ts, kind) VALUES (?, ?)", (T0, "held"))
+    done = []
+
+    def second_writer():
+        second = connect(db)
+        add_event(second, None, "waited", T0 + 1)
+        done.append(True)
+        second.close()
+
+    thread = threading.Thread(target=second_writer)
+    thread.start()
+    thread.join(0.3)
+    assert done == []  # still waiting, not failed
+    first.commit()
+    thread.join(10)
+    assert done == [True]
+    kinds = {r[0] for r in first.execute("SELECT kind FROM events")}
+    assert kinds == {"held", "waited"}
+    first.close()
+
+
+def test_resweep_paths_with_a_window_of_no_days_is_empty_not_an_error(conn):
+    seen_page(conn, "Hello-10-17-1", T0)
+    assert resweep_paths(conn, T0 + HOUR, days=[]) == []
+    assert resweep_cost(conn, T0 + HOUR, days=[]) == 0
+
+
+def test_superseded_flagged_snapshots_are_the_older_snapshots_of_flagged_pages(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    b = seen_page(conn, "Hello-10-17-2", T0)
+    flag(conn, a, True)
+    flag(conn, b, False)
+    add_snapshot(conn, a, {"title": "t", "content": ["second"]}, T0 + 60, KEY)
+    add_snapshot(conn, a, {"title": "t", "content": ["third"]}, T0 + 120, KEY)
+    add_snapshot(conn, b, {"title": "t", "content": ["second"]}, T0 + 60, KEY)
+    rows = superseded_flagged_snapshots(conn)
+    # Of page a's two older snapshots only the first holds a flagged score;
+    # the second was never scored and cannot make the page flagged.
+    oldest = conn.execute("SELECT MIN(id) FROM snapshots WHERE page_id = ?", (a,)).fetchone()[0]
+    assert [(r["page_id"], r["snapshot_id"]) for r in rows] == [(a, oldest)]
+    newest = conn.execute("SELECT MAX(id) FROM snapshots WHERE page_id = ?", (a,)).fetchone()[0]
+    assert newest not in [r["snapshot_id"] for r in rows]
+    assert set(rows[0].keys()) == {"snapshot_id", "page_id", "title", "description", "text", "content"}
+
+
+def test_a_flagged_page_with_one_snapshot_has_nothing_superseded(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    flag(conn, a, True)
+    assert superseded_flagged_snapshots(conn) == []
+
+
 # --- what the second review of 22 November found -------------------------------------
 
 
@@ -1429,3 +1834,43 @@ def test_latest_snapshots_can_leave_the_content_out(conn):
     stored_page(conn, "a-01-01")
     assert latest_snapshots(conn, content=False).fetchone()["content"] is None
     assert latest_snapshots(conn).fetchone()["content"] is not None
+
+
+def test_a_changed_snapshot_and_its_event_are_one_transaction(tmp_path):
+    # add_event commits on its own. Had add_snapshot used it, a run that died
+    # after the event and before the snapshot would leave an event with no
+    # snapshot, and the next poll would write the event a second time.
+    db = tmp_path / "g.sqlite"
+    writer = connect(db)
+    page_id = upsert_page(writer, "Hello-10-17-1", T0)
+    add_snapshot(writer, page_id, poll_page(), T0, KEY)
+    statements = []
+    writer.set_trace_callback(statements.append)
+    add_snapshot(writer, page_id, poll_page(title="9.9.9.9"), T0 + 600, KEY)
+    writer.set_trace_callback(None)
+    event_at = next(i for i, sql in enumerate(statements) if sql.startswith("INSERT INTO events"))
+    snapshot_at = next(i for i, sql in enumerate(statements) if "INSERT INTO snapshots" in sql)
+    commits = [i for i, sql in enumerate(statements) if sql.strip().upper() == "COMMIT"]
+    assert event_at < snapshot_at
+    assert not [i for i in commits if event_at < i < snapshot_at]
+    writer.close()
+
+
+def test_refresh_snapshot_of_a_changed_page_commits_once(tmp_path):
+    db = tmp_path / "g.sqlite"
+    writer = connect(db)
+    page_id = upsert_page(writer, "Hello-10-17-1", T0)
+    add_snapshot(writer, page_id, poll_page(), T0, KEY)
+    statements = []
+    writer.set_trace_callback(statements.append)
+    refresh_snapshot(writer, page_id, poll_page(title="9.9.9.9"), T0 + 600, KEY)
+    writer.set_trace_callback(None)
+    assert sum(1 for sql in statements if sql.strip().upper() == "COMMIT") == 1
+
+
+def test_refresh_snapshot_of_an_unchanged_page_refreshes_the_author_fields(conn):
+    page_id = stored_poll_page(conn)
+    page = {**poll_page(), "author_name": "new name", "author_url": "https://t.me/new"}
+    assert refresh_snapshot(conn, page_id, page, T0 + 600, KEY) is False
+    row = conn.execute("SELECT author_name, author_url FROM pages WHERE id = ?", (page_id,)).fetchone()
+    assert tuple(row) == ("new name", "https://t.me/new")

@@ -133,6 +133,13 @@ CREATE TABLE IF NOT EXISTS labels (
     PRIMARY KEY (snapshot_id, category)
 );
 CREATE INDEX IF NOT EXISTS labels_category ON labels (category, assigned);
+
+CREATE TABLE IF NOT EXISTS views (
+    page_id     INTEGER NOT NULL REFERENCES pages(id),
+    fetched_at  REAL    NOT NULL,
+    views       INTEGER,
+    PRIMARY KEY (page_id, fetched_at)
+) WITHOUT ROWID;
 """
 
 
@@ -142,6 +149,11 @@ CREATE INDEX IF NOT EXISTS labels_category ON labels (category, assigned);
 # -(0[1-9]|[12]\d|3[01]) : hyphen then group 3, two digits: 01-31 the day
 # (?:-(\d+))?	         : optional: a hyphen then group 4, one or more digits, the counter
 PATTERN = re.compile(r"^(.+?)-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:-(\d+))?$")
+
+# How long a write waits for another process to finish its own, in seconds.
+# The nightly job and the ten-minute re-poll share one database file and
+# SQLite lets one of them write at a time; sqlite3's own default is 5.
+BUSY_TIMEOUT_S = 60
 
 
 def connect(path: str | Path):
@@ -153,7 +165,7 @@ def connect(path: str | Path):
     Returns:
         sqlite3 connection: Connection to the db
     """
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
@@ -283,12 +295,37 @@ def upsert_page(conn: Connection, path: str, ts: float, held_out: bool = False) 
     cur = conn.execute(upsert_sql, upsert_params)
     if existing is not None:
         page_id = existing["id"]
+        # A page the re-sweep marked gone has been fetched again
+        if is_gone(conn, page_id):
+            add_event(conn, page_id, "returned", ts)
     else:
         page_id = cur.lastrowid
         add_event(conn, page_id, "discovered", ts)
     conn.commit()
 
     return page_id
+
+
+def fingerprint(title: str | None, description: str | None, content: list) -> str:
+    """Function to hash the parts of a page that make it one version or another
+
+    Views are left out, so a page nobody edited keeps its fingerprint however
+    often it is read. The page has to be redacted first: the fingerprint is
+    of what is stored.
+
+    Args:
+        title (str | None): The redacted page title
+        description (str | None): The redacted page description
+        content (list): The redacted page content nodes
+
+    Returns:
+        str: sha256 hex digest of the three fields as canonical JSON
+    """
+    fields = {"title": title, "description": description, "content": content}
+    canonical = json.dumps(
+        fields, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def add_snapshot(
@@ -311,19 +348,19 @@ def add_snapshot(
     description = page.get("description")
     views = page.get("views")
     content = page.get("content", [])
-    fingerprint = {"title": title, "description": description, "content": content}
     author_name = page.get("author_name")
     author_url = page.get("author_url")
-    canonical = json.dumps(
-        fingerprint, sort_keys=True, ensure_ascii=False, separators=(",", ":")
-    )
-    sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    sha = fingerprint(title, description, content)
     hash_select = "SELECT sha256 FROM snapshots WHERE page_id = ? ORDER BY fetched_at DESC, id DESC LIMIT 1"
     hash_params = (page_id,)
     previous = conn.execute(hash_select, hash_params).fetchone()
     changed = previous is not None and previous["sha256"] != sha
     if changed:
-        add_event(conn, page_id, "content_changed", ts)
+        # Not add_event, which commits on its own: the event and the snapshot
+        # it is about are written in one transaction, so a run that dies in
+        # between leaves neither and the next fetch records the change once
+        event_insert = "INSERT INTO events (page_id, kind, ts, detail) VALUES (?, ?, ?, ?)"
+        conn.execute(event_insert, (page_id, "content_changed", ts, None))
     snapshot_insert = """
     INSERT INTO snapshots (page_id, fetched_at, title, description, views, content, text, sha256)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -348,6 +385,51 @@ def add_snapshot(
     conn.execute(page_update, page_update_params)
     conn.commit()
     return cur.lastrowid, changed
+
+
+def refresh_snapshot(
+    conn: Connection, page_id: int, page: dict, ts: float, key: bytes
+) -> bool:
+    """Function to record that a stored page was fetched again
+
+    The page's last_seen moves to now. If the page reads the same as its
+    newest snapshot, no snapshot is added: the view count goes into the views
+    table, which is all that is new about it. If it reads differently, the
+    new version is stored as a snapshot and add_snapshot writes the
+    content_changed event. A page that is fetched every ten minutes would
+    otherwise add 144 identical rows a day.
+
+    The page is found by its id, not by the path Telegraph answers with,
+    which can be spelled in another case than the path that was asked for.
+
+    Args:
+        conn (Connection): SQL db connection
+        page_id (int): The stored page that was fetched again
+        page (dict): Page content as Telegraph returned it
+        ts (float): Timestamp of the fetch
+        key (bytes): The hmac key for redactions
+
+    Returns:
+        bool: True if the content changed and a snapshot was stored
+    """
+    redacted = redact_page(page, key)
+    sha = fingerprint(
+        redacted.get("title"), redacted.get("description"), redacted.get("content", [])
+    )
+    hash_select = "SELECT sha256 FROM snapshots WHERE page_id = ? ORDER BY fetched_at DESC, id DESC LIMIT 1"
+    previous = conn.execute(hash_select, (page_id,)).fetchone()
+    conn.execute("UPDATE pages SET last_seen = ? WHERE id = ?", (ts, page_id))
+    if previous is not None and previous["sha256"] == sha:
+        views_insert = "INSERT OR REPLACE INTO views (page_id, fetched_at, views) VALUES (?, ?, ?)"
+        conn.execute(views_insert, (page_id, ts, page.get("views")))
+        # The author fields are not part of the fingerprint, so they are
+        # refreshed here the way add_snapshot refreshes them
+        author_update = "UPDATE pages SET author_name = ?, author_url = ? WHERE id = ?"
+        conn.execute(author_update, (page.get("author_name"), page.get("author_url"), page_id))
+        conn.commit()
+        return False
+    _snapshot_id, changed = add_snapshot(conn, page_id, page, ts, key)
+    return changed
 
 
 def store_fetch(
@@ -499,6 +581,155 @@ def stale_pages(conn: Connection, hours: float, now: float, limit: int) -> list[
     LIMIT ?
     """
     return conn.execute(sql, (cutoff, limit)).fetchall()
+
+
+# A page is gone while the newest of its gone and returned events is a gone
+NOT_GONE = """
+    COALESCE((
+        SELECT e.kind FROM events e
+        WHERE e.page_id = p.id AND e.kind IN ('gone', 'returned')
+        ORDER BY e.ts DESC, e.id DESC LIMIT 1
+    ), 'returned') != 'gone'
+"""
+
+
+def is_gone(conn: Connection, page_id: int) -> bool:
+    """Check if the re-sweep found a page deleted and it has not come back since
+
+    Args:
+        conn (Connection): SQL db connection
+        page_id (int): The page to check
+
+    Returns:
+        bool: True if the page's newest gone or returned event is a gone
+    """
+    sql = """
+    SELECT kind FROM events
+    WHERE page_id = ? AND kind IN ('gone', 'returned')
+    ORDER BY ts DESC, id DESC LIMIT 1
+    """
+    row = conn.execute(sql, (page_id,)).fetchone()
+    return row is not None and row["kind"] == "gone"
+
+
+def mark_gone(conn: Connection, page_id: int, ts: float) -> None:
+    """Record that a stored page now answers PAGE_NOT_FOUND
+
+    The page row and its snapshots stay, and last_seen is not touched: it is
+    the last time the page was really there. The gone event is what keeps
+    the page out of the next re-sweep.
+
+    Args:
+        conn (Connection): SQL db connection
+        page_id (int): The page that is gone
+        ts (float): Timestamp of the fetch that found it gone
+    """
+    add_event(conn, page_id, "gone", ts)
+
+
+def _resweep_where(
+    cutoff: float,
+    days: list[tuple[int, int]] | None,
+    flagged: bool,
+    match: str | None,
+) -> tuple[str, list]:
+    """Build the WHERE clause the re-sweep work list and its cost share
+
+    Returns:
+        tuple[str, list]: the SQL after WHERE and its parameters
+    """
+    clauses = ["p.last_seen < ?", NOT_GONE]
+    params: list = [cutoff]
+    if days is not None and not days:
+        # A window of no days holds no page
+        clauses.append("0")
+    elif days is not None:
+        marks = ", ".join("(?, ?)" for _ in days)
+        clauses.append(f"(p.month, p.day) IN (VALUES {marks})")
+        for month, day in days:
+            params.extend((month, day))
+    if flagged:
+        # Any snapshot ever flagged: the actor edits pages in place, so a
+        # page that stopped looking like a resolver is still one to watch
+        clauses.append(
+            "EXISTS (SELECT 1 FROM scores sc WHERE sc.page_id = p.id AND sc.flagged = 1)"
+        )
+    if match is not None:
+        clauses.append(
+            """instr((
+                SELECT s.text FROM snapshots s WHERE s.page_id = p.id
+                ORDER BY s.fetched_at DESC, s.id DESC LIMIT 1
+            ), ?) > 0"""
+        )
+        params.append(match)
+    return " AND ".join(clauses), params
+
+
+def resweep_paths(
+    conn: Connection,
+    cutoff: float,
+    days: list[tuple[int, int]] | None = None,
+    flagged: bool = False,
+    match: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Fetch the stored pages that a re-sweep should fetch again, oldest first
+
+    last_seen is the progress marker: store_fetch moves it forward, so a page
+    drops out of this list the moment it is fetched and a run stopped by the
+    budget is picked up by the next one with nothing to reset.
+
+    Args:
+        conn (Connection): SQL db connection
+        cutoff (float): only pages last seen before this timestamp
+        days (list[tuple[int, int]] | None, optional): (month, day) pairs to
+            keep to, or None for every day. Defaults to None.
+        flagged (bool, optional): only pages the classifier has ever flagged.
+            Defaults to False.
+        match (str | None, optional): only pages whose newest snapshot text
+            contains this string. Defaults to None.
+        limit (int | None, optional): query limit. Defaults to None.
+
+    Returns:
+        list[sqlite3.Row]: rows of id and path
+    """
+    where, params = _resweep_where(cutoff, days, flagged, match)
+    sql = f"""
+    SELECT p.id, p.path FROM pages p
+    WHERE {where}
+    ORDER BY p.last_seen, p.slug, p.month, p.day, p.counter
+    """
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def resweep_cost(
+    conn: Connection,
+    cutoff: float,
+    days: list[tuple[int, int]] | None = None,
+    flagged: bool = False,
+    match: str | None = None,
+) -> int:
+    """Count the requests a re-sweep needs: one per page in its work list
+
+    Args:
+        conn (Connection): SQL db connection
+        cutoff (float): only pages last seen before this timestamp
+        days (list[tuple[int, int]] | None, optional): (month, day) pairs to
+            keep to, or None for every day. Defaults to None.
+        flagged (bool, optional): only pages the classifier has ever flagged.
+            Defaults to False.
+        match (str | None, optional): only pages whose newest snapshot text
+            contains this string. Defaults to None.
+
+    Returns:
+        int: the length of the list resweep_paths would return with no limit
+    """
+    where, params = _resweep_where(cutoff, days, flagged, match)
+    sql = f"SELECT COUNT(*) FROM pages p WHERE {where}"
+    return conn.execute(sql, params).fetchone()[0]
 
 
 def load_progress(

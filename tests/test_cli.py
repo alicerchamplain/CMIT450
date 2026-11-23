@@ -25,6 +25,7 @@ from graphwatch.cli import (
     run_crowd,
     run_explain,
     run_meta,
+    run_resweep,
     run_sweep,
 )
 from graphwatch.config import CONFIG
@@ -35,6 +36,7 @@ from graphwatch.db import (
     http_logger,
     latest_snapshots,
     load_progress,
+    resweep_paths,
     save_score,
     upsert_page,
 )
@@ -1759,7 +1761,296 @@ def test_main_classify_explain_prints_the_labels(tmp_path, capsys, no_network):
     assert "proxy_list +5" in out
 
 
+# --------------------------------------------------------------------------
+# re-sweep (issue #37): run_resweep and sweep --resweep
+# (plan/resweep-plan-2026-11-04.md)
+# --------------------------------------------------------------------------
+
+HOUR = 3600.0
+
+
+class ResweepSession:
+    """Serves the page stored under each path in `pages`; a test edits that
+    dict to rotate or delete a page between two runs. `failing` paths get a
+    500 with an unparseable body, which the client reports as FAILED."""
+
+    def __init__(self, pages, failing=()):
+        self.pages = pages
+        self.failing = set(failing)
+        self.paths = []
+
+    def get(self, url, **kwargs):
+        path = urllib.parse.unquote(url.split("/getPage/", 1)[1].split("?", 1)[0])
+        self.paths.append(path)
+        if path in self.failing:
+            r = Resp(b"not json")
+            r.status_code = 500
+            return r
+        if path not in self.pages:
+            return Resp(MISSING_BODY)
+        result = {"path": path, **self.pages[path]}
+        return Resp(json.dumps({"ok": True, "result": result}).encode("utf-8"))
+
+
+def live_page(title, body="Hello,+world!", views=1) -> dict:
+    return {"title": title, "description": body, "views": views, "content": [body]}
+
+
+def make_resweep_client(pages, failing=(), **kwargs):
+    session = ResweepSession(pages, failing)
+    client = TelegraphClient(session=session, sleep=lambda s: None, retries=0, **kwargs)
+    return client, session
+
+
+# What Telegraph serves at the start of each test, and what was stored a day ago.
+LIVE = {
+    "Hello-10-17-1": live_page("8.8.8.8 first"),
+    "Hello-10-17-2": live_page("second"),
+    "Hello-10-17-3": live_page("third"),
+}
+
+
+@pytest.fixture
+def stored(conn):
+    """Three pages as a sweep stored them at T0, long before any cutoff used here."""
+    for path, page in LIVE.items():
+        page_id = upsert_page(conn, path, T0)
+        add_snapshot(conn, page_id, {"path": path, **page}, T0, KEY)
+    return conn
+
+
+def everything(conn):
+    """The whole work list: every stored page not marked gone."""
+    return resweep_paths(conn, time.time() + HOUR)
+
+
+def kinds(conn, path):
+    sql = """
+    SELECT e.kind FROM events e JOIN pages p ON p.id = e.page_id
+    WHERE p.path = ? ORDER BY e.id
+    """
+    return [r["kind"] for r in conn.execute(sql, (path,))]
+
+
+def snapshots_of(conn, path):
+    sql = """
+    SELECT s.title, s.views FROM snapshots s JOIN pages p ON p.id = s.page_id
+    WHERE p.path = ? ORDER BY s.id
+    """
+    return [tuple(r) for r in conn.execute(sql, (path,))]
+
+
+def last_seen(conn, path):
+    return conn.execute("SELECT last_seen FROM pages WHERE path = ?", (path,)).fetchone()[0]
+
+
+def views_of(conn, path):
+    sql = """
+    SELECT v.views FROM views v JOIN pages p ON p.id = v.page_id
+    WHERE p.path = ? ORDER BY v.fetched_at
+    """
+    return [r["views"] for r in conn.execute(sql, (path,))]
+
+
+def test_run_resweep_fetches_each_listed_page_once(stored):
+    client, session = make_resweep_client(dict(LIVE))
+    counts = run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert sorted(session.paths) == sorted(LIVE)
+    assert counts == {"refreshed": 3, "changed": 0, "gone": 0, "failed": 0}
+
+
+def test_run_resweep_moves_last_seen_and_stores_no_snapshot_of_an_unchanged_page(stored):
+    # Decided 22 November: a page polled every ten minutes would otherwise
+    # add 144 identical rows a day.
+    client, _ = make_resweep_client(dict(LIVE))
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert len(snapshots_of(stored, "Hello-10-17-2")) == 1
+    assert last_seen(stored, "Hello-10-17-2") > T0
+
+
+def test_run_resweep_an_unchanged_page_writes_no_event_and_logs_nothing(stored):
+    client, _ = make_resweep_client(dict(LIVE))
+    lines = []
+    run_resweep(stored, client, everything(stored), KEY, log=lines.append)
+    assert lines == []
+    for path in LIVE:
+        assert kinds(stored, path) == ["discovered"]
+
+
+def test_run_resweep_a_view_count_tick_is_not_a_change(stored):
+    live = {**LIVE, "Hello-10-17-2": live_page("second", views=40)}
+    client, _ = make_resweep_client(live)
+    counts = run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert counts["changed"] == 0
+    assert snapshots_of(stored, "Hello-10-17-2") == [("second", 1)]
+    assert views_of(stored, "Hello-10-17-2") == [40]
+
+
+def test_run_resweep_reports_a_rotation_as_one_content_changed_event(stored):
+    # The actor's shape: the same page, a new address in the title.
+    live = {**LIVE, "Hello-10-17-1": live_page("9.9.9.9 first")}
+    client, _ = make_resweep_client(live)
+    lines = []
+    counts = run_resweep(stored, client, everything(stored), KEY, log=lines.append)
+    assert counts == {"refreshed": 3, "changed": 1, "gone": 0, "failed": 0}
+    assert lines == ["Hello-10-17-1: content changed"]
+    assert kinds(stored, "Hello-10-17-1") == ["discovered", "content_changed"]
+    assert [title for title, _ in snapshots_of(stored, "Hello-10-17-1")] == [
+        "8.8.8.8 first",
+        "9.9.9.9 first",
+    ]
+
+
+def test_run_resweep_the_change_event_carries_the_fetch_time(stored):
+    live = {**LIVE, "Hello-10-17-1": live_page("9.9.9.9 first")}
+    client, _ = make_resweep_client(live)
+    before = time.time()
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    ts = stored.execute("SELECT ts FROM events WHERE kind = 'content_changed'").fetchone()[0]
+    assert before <= ts <= time.time()
+    assert ts == last_seen(stored, "Hello-10-17-1")
+
+
+def test_run_resweep_a_second_run_does_not_report_the_same_rotation_again(stored):
+    live = {**LIVE, "Hello-10-17-1": live_page("9.9.9.9 first")}
+    client, _ = make_resweep_client(live)
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    counts = run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert counts["changed"] == 0
+    assert kinds(stored, "Hello-10-17-1").count("content_changed") == 1
+
+
+def test_run_resweep_marks_a_deleted_page_gone(stored):
+    live = {path: page for path, page in LIVE.items() if path != "Hello-10-17-2"}
+    client, _ = make_resweep_client(live)
+    lines = []
+    counts = run_resweep(stored, client, everything(stored), KEY, log=lines.append)
+    assert counts == {"refreshed": 2, "changed": 0, "gone": 1, "failed": 0}
+    assert lines == ["Hello-10-17-2: gone"]
+    assert kinds(stored, "Hello-10-17-2") == ["discovered", "gone"]
+
+
+def test_run_resweep_a_gone_page_keeps_its_snapshot_and_last_seen(stored):
+    live = {path: page for path, page in LIVE.items() if path != "Hello-10-17-2"}
+    client, _ = make_resweep_client(live)
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert snapshots_of(stored, "Hello-10-17-2") == [("second", 1)]
+    assert last_seen(stored, "Hello-10-17-2") == T0
+
+
+def test_run_resweep_does_not_ask_for_a_gone_page_again(stored):
+    live = {path: page for path, page in LIVE.items() if path != "Hello-10-17-2"}
+    client, session = make_resweep_client(live)
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    session.paths.clear()
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert "Hello-10-17-2" not in session.paths
+    assert kinds(stored, "Hello-10-17-2").count("gone") == 1
+
+
+def test_run_resweep_a_failed_fetch_changes_nothing(stored):
+    client, _ = make_resweep_client(dict(LIVE), failing={"Hello-10-17-2"})
+    counts = run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert counts == {"refreshed": 2, "changed": 0, "gone": 0, "failed": 1}
+    assert last_seen(stored, "Hello-10-17-2") == T0
+    assert kinds(stored, "Hello-10-17-2") == ["discovered"]
+    assert len(snapshots_of(stored, "Hello-10-17-2")) == 1
+
+
+def test_run_resweep_a_failed_page_is_first_in_line_next_time(stored):
+    client, _ = make_resweep_client(dict(LIVE), failing={"Hello-10-17-2"})
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert everything(stored)[0]["path"] == "Hello-10-17-2"
+
+
+def test_run_resweep_a_failure_is_never_taken_for_a_deletion(stored):
+    client, _ = make_resweep_client(dict(LIVE), failing=set(LIVE))
+    counts = run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert counts["gone"] == 0
+    assert stored.execute("SELECT COUNT(*) FROM events WHERE kind = 'gone'").fetchone()[0] == 0
+
+
+def test_run_resweep_budget_exceeded_is_logged_not_raised(stored):
+    client, session = make_resweep_client(dict(LIVE), budget=2)
+    lines = []
+    counts = run_resweep(stored, client, everything(stored), KEY, log=lines.append)
+    assert counts["refreshed"] == 2
+    assert lines[-1] == "budget exceeded"
+    assert len(session.paths) == 2
+
+
+def test_run_resweep_after_a_budget_stop_the_list_is_the_unfetched_tail(stored):
+    cutoff = time.time() - 1
+    client, session = make_resweep_client(dict(LIVE), budget=2)
+    run_resweep(stored, client, resweep_paths(stored, cutoff), KEY, log=quiet)
+    left = [row["path"] for row in resweep_paths(stored, cutoff)]
+    assert left == sorted(set(LIVE) - set(session.paths))
+    assert len(left) == 1
+
+
+def test_run_resweep_an_empty_list_makes_no_requests(conn):
+    client, session = make_resweep_client({})
+    counts = run_resweep(conn, client, [], KEY, log=quiet)
+    assert counts == {"refreshed": 0, "changed": 0, "gone": 0, "failed": 0}
+    assert session.paths == []
+
+
+def test_run_resweep_stores_redacted_content(stored):
+    live = {**LIVE, "Hello-10-17-3": live_page("third", "password: hunter2")}
+    client, _ = make_resweep_client(live)
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    text = stored.execute(
+        "SELECT s.text FROM snapshots s JOIN pages p ON p.id = s.page_id "
+        "WHERE p.path = ? ORDER BY s.id DESC LIMIT 1",
+        ("Hello-10-17-3",),
+    ).fetchone()[0]
+    assert "hunter2" not in text
+    assert "SECRET{" in text
+
+
+def test_run_resweep_logs_every_request(stored):
+    client, _ = make_resweep_client(dict(LIVE), log=http_logger(stored))
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert stored.execute("SELECT COUNT(*) FROM http_log").fetchone()[0] == 3
+
+
+def test_run_resweep_keeps_the_held_out_mark(conn):
+    page_id = upsert_page(conn, "Known-01-02", T0, held_out=True)
+    add_snapshot(conn, page_id, live_page("known"), T0, KEY)
+    client, _ = make_resweep_client({"Known-01-02": live_page("known")})
+    run_resweep(conn, client, everything(conn), KEY, log=quiet)
+    assert conn.execute("SELECT held_out FROM pages WHERE id = ?", (page_id,)).fetchone()[0] == 1
+
+
+def test_a_flagged_repoll_fetches_only_the_flagged_pages(stored):
+    run_classify(stored, log=quiet)  # the title with a public IP flags
+    assert score_of(stored, "Hello-10-17-1")[1] == 1
+    pages = resweep_paths(stored, time.time() + HOUR, flagged=True)
+    client, session = make_resweep_client(dict(LIVE))
+    run_resweep(stored, client, pages, KEY, log=quiet)
+    assert session.paths == ["Hello-10-17-1"]
+
+
 # --- the command ---
+
+
+def test_parse_args_resweep_defaults():
+    args = parse_args(["sweep"])
+    assert args.resweep is False
+    assert args.older_than == 20.0
+    assert args.flagged is False
+    assert args.match is None
+
+
+def test_parse_args_resweep_options():
+    args = parse_args(
+        ["sweep", "--resweep", "--older-than", "0", "--flagged", "--match", "8.8.8.8", "--days", "31"]
+    )
+    assert args.resweep is True
+    assert args.older_than == 0.0
+    assert args.flagged is True
+    assert args.match == "8.8.8.8"
+    assert args.days == 31
 
 
 def resweep_argv(workdir, *extra):
@@ -1778,6 +2069,95 @@ def resweep_argv(workdir, *extra):
     ]
 
 
+@pytest.fixture
+def stored_file(workdir):
+    """The three stored pages in a database file, the first one flagged."""
+    c = connect(workdir / "g.sqlite")
+    for path, page in LIVE.items():
+        page_id = upsert_page(c, path, T0)
+        add_snapshot(c, page_id, {"path": path, **page}, T0, KEY)
+    run_classify(c, log=quiet)
+    c.close()
+    return workdir
+
+
+def test_main_resweep_prints_the_header_and_the_summary(stored_file, capsys):
+    main(resweep_argv(stored_file))
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "Resweep: all days, Pages: 3, Older than: 20h, Budget: 0"
+    assert lines[1] == "budget exceeded"
+    assert lines[2].startswith("refreshed 0 pages, 0 changed, 0 gone, 0 failed, 0 requests, ")
+
+
+def test_main_resweep_needs_no_word_lists(stored_file, capsys):
+    # The wordlists directory in resweep_argv does not exist.
+    main(resweep_argv(stored_file))
+    assert "Resweep:" in capsys.readouterr().out
+
+
+def test_main_resweep_needs_the_key(stored_file):
+    argv = resweep_argv(stored_file)
+    argv[1] = str(stored_file / "nope.env")
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert "nope.env" in str(exc.value)
+
+
+def test_main_resweep_flagged_counts_only_the_flagged_pages(stored_file, capsys):
+    main(resweep_argv(stored_file, "--flagged"))
+    assert "Pages: 1," in capsys.readouterr().out.splitlines()[0]
+
+
+def test_main_resweep_match_narrows_the_list(stored_file, capsys):
+    main(resweep_argv(stored_file, "--match", "second"))
+    assert "Pages: 1," in capsys.readouterr().out.splitlines()[0]
+    main(resweep_argv(stored_file, "--match", "no such text anywhere"))
+    assert "Pages: 0," in capsys.readouterr().out.splitlines()[0]
+
+
+def test_main_resweep_days_names_the_window(stored_file, capsys):
+    main(resweep_argv(stored_file, "--days", "2", "--today", "2026-10-18"))
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first == (
+        "Resweep: 2 days, From: 10-17 to 10-18, Pages: 3, Older than: 20h, Budget: 0"
+    )
+    main(resweep_argv(stored_file, "--days", "2", "--today", "2026-11-18"))
+    assert "Pages: 0," in capsys.readouterr().out.splitlines()[0]
+
+
+def test_main_resweep_older_than_leaves_out_pages_seen_since(stored_file, capsys):
+    c = connect(stored_file / "g.sqlite")
+    upsert_page(c, "Hello-10-17-2", time.time())  # seen a moment ago
+    c.close()
+    main(resweep_argv(stored_file))
+    assert "Pages: 2," in capsys.readouterr().out.splitlines()[0]
+    main(resweep_argv(stored_file, "--older-than", "0"))
+    assert "Pages: 3," in capsys.readouterr().out.splitlines()[0]
+
+
+def test_main_resweep_hands_the_work_list_to_run_resweep(stored_file, monkeypatch, capsys):
+    seen = {}
+
+    def fake_run_resweep(conn, client, pages, key, log=print):
+        seen["paths"] = [row["path"] for row in pages]
+        seen["key"] = key
+        return {"refreshed": 1, "changed": 1, "gone": 0, "failed": 0}
+
+    monkeypatch.setattr("graphwatch.cli.run_resweep", fake_run_resweep)
+    main(resweep_argv(stored_file, "--flagged"))
+    assert seen == {"paths": ["Hello-10-17-1"], "key": b"\x00\xff"}
+    assert "refreshed 1 pages, 1 changed, 0 gone, 0 failed" in capsys.readouterr().out
+
+
+def test_main_sweep_without_the_flag_does_not_resweep(workdir, monkeypatch, capsys):
+    def refuse(*args, **kwargs):
+        raise AssertionError("an ordinary sweep must not re-sweep")
+
+    monkeypatch.setattr("graphwatch.cli.run_resweep", refuse)
+    main(["--config", str(workdir / "config.env"), "sweep", *common(workdir), "--days", "1"])
+    assert "Resweep" not in capsys.readouterr().out
+
+
 # --- the command ---
 
 
@@ -1791,6 +2171,85 @@ def no_feed_network(monkeypatch):
 
 def enrich_argv(workdir, *extra):
     return ["--config", str(workdir / "config.env"), "enrich", "--db", str(workdir / "g.sqlite"), *extra]
+
+
+# --- the re-poll every ten minutes, and what the review of 22 November found ---
+
+
+def test_a_hundred_polls_of_an_unchanged_page_add_no_snapshot(stored):
+    client, _ = make_resweep_client(dict(LIVE))
+    for _ in range(100):
+        run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert stored.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 3
+    assert stored.execute("SELECT COUNT(*) FROM events WHERE kind != 'discovered'").fetchone()[0] == 0
+    assert len(views_of(stored, "Hello-10-17-1")) == 100
+
+
+def test_a_rotation_between_two_polls_is_one_snapshot_and_one_event(stored):
+    live = dict(LIVE)
+    client, _ = make_resweep_client(live)
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    live["Hello-10-17-1"] = live_page("9.9.9.9 first")
+    counts = run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert counts["changed"] == 1
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert [title for title, _ in snapshots_of(stored, "Hello-10-17-1")] == ["8.8.8.8 first", "9.9.9.9 first"]
+    assert kinds(stored, "Hello-10-17-1") == ["discovered", "content_changed"]
+
+
+def test_a_page_that_changes_back_is_a_second_change(stored):
+    live = dict(LIVE)
+    client, _ = make_resweep_client(live)
+    live["Hello-10-17-1"] = live_page("9.9.9.9 first")
+    run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    live["Hello-10-17-1"] = live_page("8.8.8.8 first")
+    counts = run_resweep(stored, client, everything(stored), KEY, log=quiet)
+    assert counts["changed"] == 1
+    assert kinds(stored, "Hello-10-17-1").count("content_changed") == 2
+
+
+class RespellingSession(ResweepSession):
+    """Answers with the path in upper case, as Telegraph does when the stored
+    spelling differs from its own."""
+
+    def get(self, url, **kwargs):
+        resp = super().get(url, **kwargs)
+        body = json.loads(resp.content)
+        if body.get("ok"):
+            body["result"]["path"] = body["result"]["path"].upper()
+            resp.content = json.dumps(body).encode("utf-8")
+        return resp
+
+
+def test_run_resweep_refreshes_the_row_it_asked_for_when_telegraph_respells_the_path(conn):
+    page_id = upsert_page(conn, "mark-01-20-5", T0, held_out=True)
+    add_snapshot(conn, page_id, live_page("known"), T0, KEY)
+    session = RespellingSession({"mark-01-20-5": live_page("known")})
+    client = TelegraphClient(session=session, sleep=lambda s: None, retries=0)
+    run_resweep(conn, client, everything(conn), KEY, log=quiet)
+    rows = [tuple(r) for r in conn.execute("SELECT path, held_out FROM pages")]
+    assert rows == [("mark-01-20-5", 1)]  # no second row, and still held out
+    assert last_seen(conn, "mark-01-20-5") > T0
+    cutoff = time.time() - 1
+    assert [r["path"] for r in resweep_paths(conn, cutoff)] == []
+
+
+def test_main_sweep_refuses_a_window_of_no_days(workdir):
+    for argv in (["--days", "0"], ["--days", "-3"], ["--resweep", "--days", "0"]):
+        with pytest.raises(SystemExit) as exc:
+            main(["--config", str(workdir / "config.env"), "sweep", *common(workdir), *argv])
+        assert "--days" in str(exc.value)
+
+
+def test_main_resweep_older_than_zero_takes_every_page_every_time(stored_file, capsys):
+    # The ten-minute cron line: sweep --resweep --flagged --older-than 0
+    c = connect(stored_file / "g.sqlite")
+    for path in LIVE:
+        c.execute("UPDATE pages SET last_seen = ? WHERE path = ?", (time.time() - 5, path))
+    c.commit()
+    c.close()
+    main(resweep_argv(stored_file, "--older-than", "0", "--flagged"))
+    assert "Pages: 1, Older than: 0h" in capsys.readouterr().out.splitlines()[0]
 
 
 # --- a flag from an old rule table does not outlive the rule ---
@@ -1809,6 +2268,27 @@ def test_run_classify_rescores_the_older_snapshots_of_a_flagged_page(conn):
     assert counts["rescored"] == 1
     assert counts["pages"] == 1  # still one page, counted by its newest snapshot
     assert counts["flagged"] == 0
+
+
+def test_a_stale_flag_on_an_older_snapshot_is_cleared(conn):
+    # The false positives of 22 November: flagged once, and a re-poll has since added a snapshot.
+    page_id = put(conn, "PayPal-10-31-12", "PayPal", "", "cfihelp.ua@gmail.com write to us")
+    add_snapshot(conn, page_id, {"title": "PayPal", "description": "", "content": ["edited text, nothing to see"]}, T0 + 60, KEY)
+    old_snapshot = conn.execute("SELECT MIN(id) FROM snapshots").fetchone()[0]
+    save_score(conn, old_snapshot, page_id, 5, True, None, [("userinfo_spoof", 5, "cfihelp.ua@gmail.com", 1)], T0)
+    conn.commit()
+    assert [r["path"] for r in resweep_paths(conn, time.time() + HOUR, flagged=True)] == ["PayPal-10-31-12"]
+    run_classify(conn, log=quiet)
+    assert resweep_paths(conn, time.time() + HOUR, flagged=True) == []
+    assert conn.execute("SELECT COUNT(*) FROM scores WHERE flagged = 1").fetchone()[0] == 0
+
+
+def test_an_actor_page_stays_on_the_flagged_list_after_it_is_edited_to_nothing(conn):
+    page_id = put(conn, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    run_classify(conn, log=quiet)
+    add_snapshot(conn, page_id, {"title": "gone quiet", "description": "", "content": ["nothing here at all, really"]}, T0 + 60, KEY)
+    run_classify(conn, log=quiet)
+    assert [r["path"] for r in resweep_paths(conn, time.time() + HOUR, flagged=True)] == ["Hello-10-17-9"]
 
 
 def test_pages_never_flagged_are_not_rescored(swept):
@@ -1859,6 +2339,87 @@ def test_the_evidence_of_a_hit_on_a_link_target_is_redacted(conn):
     assert "SECRET{" in evidence[0]
 
 
+# --- classify and the ten-minute re-poll on one file (second review, 22 November) ---
+
+
+def test_run_classify_holds_nothing_open_between_reading_a_batch_and_writing_it(tmp_path, monkeypatch):
+    # The re-poll writes to the same file every ten minutes. Classify used to
+    # write with its own read cursor still open; SQLite then fails the write
+    # at once with "database is locked" if another process wrote in between,
+    # whatever the timeout. Here another connection writes at the start of
+    # every batch's write-out, as the re-poll would between two batches.
+    import sqlite3
+
+    import graphwatch.cli as cli
+
+    monkeypatch.setattr("graphwatch.cli.CLASSIFY_BATCH", 2)
+    db = tmp_path / "g.sqlite"
+    writer = connect(db)
+    for n in range(1, 6):
+        put(writer, f"Hello-10-17-{n}", "Hello", "", f"note {n}")
+    real_save_score = cli.save_score
+    intrusions = []
+
+    def save_score_after_an_intrusion(conn, *args, **kwargs):
+        if not conn.in_transaction:
+            other = sqlite3.connect(str(db), timeout=1)
+            other.execute("INSERT INTO events (ts, kind) VALUES (?, ?)", (T0, "repoll"))
+            other.commit()
+            other.close()
+            intrusions.append(True)
+        return real_save_score(conn, *args, **kwargs)
+
+    monkeypatch.setattr("graphwatch.cli.save_score", save_score_after_an_intrusion)
+    counts = run_classify(writer, log=quiet)
+    assert counts["pages"] == 5
+    assert len(intrusions) == 3  # batches of 2, 2 and 1
+    assert writer.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 5
+    assert writer.execute("SELECT COUNT(*) FROM events WHERE kind = 'repoll'").fetchone()[0] == 3
+    writer.close()
+
+
+def test_run_classify_commits_each_batch_before_it_reads_the_next(tmp_path, monkeypatch):
+    import graphwatch.cli as cli
+
+    monkeypatch.setattr("graphwatch.cli.CLASSIFY_BATCH", 2)
+    db = tmp_path / "g.sqlite"
+    writer = connect(db)
+    for n in range(1, 6):
+        put(writer, f"Hello-10-17-{n}", "Hello", "", f"note {n}")
+    real = cli.latest_snapshots
+    open_transactions = []
+
+    def watching(conn, *args, **kwargs):
+        open_transactions.append(conn.in_transaction)
+        return real(conn, *args, **kwargs)
+
+    monkeypatch.setattr("graphwatch.cli.latest_snapshots", watching)
+    run_classify(writer, log=quiet)
+    assert open_transactions and not any(open_transactions)
+    writer.close()
+
+
+def test_run_classify_gives_the_same_result_whatever_the_batch_size(conn, monkeypatch):
+    put_fixture(conn, "Hello-10-17-154", "Hello-10-17-154")
+    put(conn, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    for title in ("Cobalt-Strike", "Mimikatz", "Stealer"):
+        put(conn, f"{title}-10-17", title, "", SQUATTER_BODY)
+    put(conn, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
+
+    def stored():
+        scores = [tuple(r) for r in conn.execute("SELECT snapshot_id, score, flagged FROM scores ORDER BY snapshot_id")]
+        labels = [tuple(r) for r in conn.execute("SELECT snapshot_id, category, score, assigned, is_primary FROM labels ORDER BY snapshot_id, category")]
+        return scores, labels
+
+    monkeypatch.setattr("graphwatch.cli.CLASSIFY_BATCH", 1000)
+    whole = dict(run_classify(conn, log=quiet))
+    whole_rows = stored()
+    monkeypatch.setattr("graphwatch.cli.CLASSIFY_BATCH", 1)
+    one_by_one = dict(run_classify(conn, log=quiet))
+    assert one_by_one == whole
+    assert stored() == whole_rows
+
+
 # --- what the third review of 22 November found ---
 
 
@@ -1869,9 +2430,41 @@ def nested(depth: int) -> dict:
     return node
 
 
+def test_run_sweep_moves_past_a_page_nested_too_deep_to_redact(conn, counted, monkeypatch):
+    # One such page would otherwise stop the sweep at the same counter every night.
+    import graphwatch.cli as cli
+
+    real = cli.store_fetch
+
+    def store_or_overflow(conn, fetch, ts, key, **kwargs):
+        if fetch.page["path"] == "Hello-10-24":
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(conn, fetch, ts, key, **kwargs)
+
+    monkeypatch.setattr("graphwatch.cli.store_fetch", store_or_overflow)
+    client, _ = make_sweep_client({"Hello-10-24", "Hello-10-24-2"})
+    lines = []
+    stored, _requests = run_sweep(conn, client, ENTRIES, DAYS, KEY, 2, None, set(), log=lines.append)
+    assert stored == 1
+    assert stored_paths(conn) == ["Hello-10-24-2"]
+    assert "Hello-10-24: nested too deep to redact, not stored" in lines
+    assert load_progress(conn, "Hello", 10, 24)[1] is True  # the day is closed, not stuck
+
+
 def test_redact_page_really_does_overflow_on_a_very_deep_page():
     # The premise of the test above and the one below.
     from graphwatch.redact import redact_page
 
     with pytest.raises(RecursionError):
         redact_page({"content": [nested(3000)]}, KEY)
+
+
+def test_run_resweep_counts_a_page_nested_too_deep_as_failed_and_goes_on(stored):
+    live = {**LIVE, "Hello-10-17-1": {"title": "t", "description": "", "views": 1, "content": [nested(3000)]}}
+    client, _ = make_resweep_client(live)
+    lines = []
+    counts = run_resweep(stored, client, everything(stored), KEY, log=lines.append)
+    assert counts == {"refreshed": 2, "changed": 0, "gone": 0, "failed": 1}
+    assert lines == ["Hello-10-17-1: nested too deep to redact, not stored"]
+    assert last_seen(stored, "Hello-10-17-1") == T0
+    assert len(snapshots_of(stored, "Hello-10-17-1")) == 1
