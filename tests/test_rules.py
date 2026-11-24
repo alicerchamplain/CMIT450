@@ -9,7 +9,9 @@ The rules of the other categories are in tests/test_categories.py.
 
 import base64
 import dataclasses
+import itertools
 import json
+import math
 import re
 import subprocess
 import sys
@@ -18,11 +20,19 @@ from pathlib import Path
 import pytest
 
 from graphwatch.rules import (
+    ARCHIVE_EXTENSIONS,
+    AUTOLOGIN_WORDS,
     CATEGORIES,
     EMAIL_PATTERN,
     ENCODED_TOKEN_PATTERN,
+    EXECUTABLE_EXTENSIONS,
+    FOLD,
+    HASHED_LOGIN_PARAM_PATTERN,
+    HASHED_LOGIN_VALUE,
     IP_PATTERN,
     MAILBOX_PROVIDERS,
+    PATH_TOKEN,
+    PROXY_SERVER,
     RULES,
     SECRET_LABELS,
     THRESHOLD,
@@ -33,6 +43,7 @@ from graphwatch.rules import (
     Rule,
     apply_rules,
     category_scores,
+    fold,
     counted_secret,
     decodes_to_pointer,
     decodes_to_printable,
@@ -894,7 +905,7 @@ class CountingPattern:
         return self.compiled.finditer(s)
 
 
-def test_a_gate_skips_the_regex_unless_the_lower_cased_field_holds_it():
+def test_a_gate_skips_the_regex_unless_its_rules_own_folded_field_holds_one_of_its_strings():
     pattern = CountingPattern(r"WARNING_BANNER")
     r = Rule("r", 1, "text", pattern, "test rule", gate="warning_banner")
     assert apply_rules(None, None, "no banner here", rules=(r,)) == []
@@ -902,9 +913,18 @@ def test_a_gate_skips_the_regex_unless_the_lower_cased_field_holds_it():
     hits = apply_rules(None, None, "a WARNING_BANNER here", rules=(r,))
     assert pattern.runs == 1
     assert [h.evidence for h in hits] == ["WARNING_BANNER"]
-
-
-def test_gate_looks_at_the_rules_own_field():
+    # a rule's gate is always a tuple once the rule is made, and any one of them opens it
+    assert r.gate == ("warning_banner",)
+    either = CountingPattern(r"(?i)stealer|redline")
+    several = Rule("r", 1, "text", either, "test rule", gate=("stealer", "redline"))
+    for text, runs in (("neither", 0), ("RedLine", 1), ("a stealer", 2), ("a \u017ftealer", 3)):
+        hits = apply_rules(None, None, text, rules=(several,))
+        assert (either.runs, len(hits)) == (runs, min(runs, 1)), text
+    # a gate that is not folded could never be found in a folded field
+    for bad in ("Stealer", ("stealer", ""), "\u017ftealer"):
+        with pytest.raises(ValueError, match="gate"):
+            custom(gate=bad)
+    # a gate looks at its rule's own field
     r = custom(where="title", pattern=r"https?://\S+", gate="://")
     assert apply_rules("plain title", None, "body https://example.com", rules=(r,)) == []
     # and a second field is not judged by the first one's lower-cased copy
@@ -930,11 +950,49 @@ GATE_CORPUS = [
     "HTTPS://dating.example.com/l/SECRET{" + "ab" * 32 + "}/open",
     # Letters that fold oddly. re.IGNORECASE matches them against ASCII ones
     # and str.lower() does not turn them into ASCII, so a gate would skip a
-    # rule that its pattern matched. The gated patterns fold ASCII only.
+    # rule that its pattern matched. These four patterns fold ASCII only;
+    # for the ones that fold every alphabet there is fold().
     "API_ID and APİ_HASH",  # dotted capital I
     "t.me/proxy?ſerver=8.8.8.8",  # long s
     "abcdefghijklmnop.onıon",  # dotless i
     "<İnput type=password>",
+    # The rules gated on 24 November: every one of their gates, in capitals
+    # and with the letters a case-insensitive pattern takes for another and
+    # lower() does not (long s, the two odd i, the old Cyrillic shapes)
+    "panel.example.WORKERS.DEV a.trycloudflare.com a.ngrok.io a.ngrok.app a.ngrok-free.app a.ngrok-free.dev "
+    "a.duckdnſ.org a.ddnſ.net a.hopto.org a.zapto.org a.ſytes.net a.ſerveo.net a.loca.lt a.portmap.İo a.playİt.gg",
+    "https://PASTEBIN.com/raw/abc raw.githubuſercontent.com/x gİst.githubusercontent.com/y",
+    "POWERSHELL -enc x; cmd.exe; mſhta; rundll32; regſvr32; certutİl; bİtsadmin; Invoke-WebRequest; "
+    "FromBase64String; curl -s; wget http://x; /BIN/SH; /bin/baſh",
+    "MEDİAFIRE.com Mega.NZ gofİle.io anonfİles dropmefİles dİsk.yandex yadi.ſk drİve.google.com dropbox.COM "
+    "cdn.dİscordapp.com/attachments/1 x/releaſes/download/y tranſfer.sh catbox.MOE pİxeldrain",
+    "CVV fresh, Fullz, cardİng; Кардинг",
+    "ſtealer logs, ſtealler, RedLİne, Lumma, VİDAR, Raccoon, Стиллер, ᲃᲄилер",
+    "claim your aİrdrop: Seed Phraſe, сид фраз, ᲃиᲁ-фраз, Wallet Connect, walletconnect, MetaMaſk, "
+    "Truſt Wallet, draİner, ᲁрейнер, Аирдроп",
+    "login.example.pageſ.dev a.web.app a.fİrebaseapp.com a.vercel.app a.netlİfy.app a.gİthub.io a.glİtch.me "
+    "a.repl.co a.onrender.com a.herokuapp.com a.000webhoſtapp.com a.weebly.com a.blogſpot.com a.wİxsite.com",
+    "bİt.ly/a CLCK.RU/a tİnyurl.com/a cutt.ly/a iſ.gd/a goo.ſu/a vk.cc/a rb.gy/a ſhorturl.at/a tİny.cc/a ow.ly/a",
+    "паᲃпорт 1234, Прописка, ᲁата рождения, Адрес проживания, аᲁрес проживания",
+    "İntim vip, PORN, Порно, Секс, ᲃлив, Эскорт",
+    "MDİSK and TeraBox links",
+    "best caſino bonus, Казино, 1XBET, 1Wİn, Vavada, PIN-UP, pİnup, Букмекер",
+    "vleſs://x VMESS://x ſs://x SSR://x trojan://x ſocks://x SOCKS5://x hyſteria://x hysterİa2://x tuİc://x",
+    # The rules whose gate comes from their check: one link to a page, so
+    # that no other link's string opens the gate for it
+    *(
+        "https://x.example/AUTOLOGIN/1 https://x.example/Token-Login/2 https://x.example/a?token=ſECRET{" + "ab" * 32 + "} "
+        "https://f.example/a.EXE https://f.example/b.apK https://f.example/c.MSI https://f.example/d.SCR "
+        "https://f.example/e.PS1 https://f.example/f.LNK https://f.example/g.hta https://f.example/h.ISO "
+        "https://f.example/i.RAR https://f.example/j.7Z https://f.example/k.Zip"
+    ).split(),
+    # and what those checks turn away, right at the edge of what their gate
+    # lets through: a check that came to accept one of these without its gate
+    # following would fire here with the gate off and not with it on
+    "https://d.example/l/u-SECRET{" + "ab" * 32 + "}/open",  # a hashed token that is not a whole path segment
+    "https://d.example/l?token=0123456789abcdef0123456789abcdef",  # a login parameter that was not hashed
+    "tg://proxy?server:8.8.8.8&port=443",  # no server=
+    "https://f.example/setup.exe.txt https://f.example/a.zipx",  # the extension is not the end of the path
 ]
 
 
@@ -956,6 +1014,146 @@ def test_the_gate_corpus_exercises_every_gated_rule():
         fired |= {h.rule.name for h in page_hits("t", body=text)}
     gated = {r.name for r in RULES if r.gate is not None}
     assert gated <= fired, gated - fired
+
+
+def test_fold_gives_a_gate_letter_for_every_letter_a_gated_pattern_takes_for_it():
+    # A gate is looked up in fold(field). If the pattern takes some letter x
+    # for the gate's letter c and fold(x) is not c, a page written with x is
+    # skipped although the pattern matches it. Every code point is tried, in
+    # one search per kind of pattern: case-insensitive, and that in ASCII only.
+    every = "".join(map(chr, range(sys.maxunicode + 1)))
+    kinds = {}
+    for r in RULES:
+        if r.gate is not None and r.pattern.flags & re.IGNORECASE:
+            kinds.setdefault(r.pattern.flags & (re.IGNORECASE | re.ASCII), set()).update("".join(r.gate))
+    assert len(kinds) == 2
+    for flags, letters in kinds.items():
+        one_of_them = re.compile("[" + "".join(re.escape(c) for c in sorted(letters)) + "]", flags)
+        taken = [m.group(0) for m in one_of_them.finditer(every)]
+        assert len(taken) > len(letters)  # capitals at least
+        for x in taken:
+            for c in letters:
+                if re.fullmatch(re.escape(c), x, flags):
+                    assert fold(x) == c, (hex(ord(x)), c)
+    # the capital sigma is the one letter lower() treats by its place in the word
+    assert fold("ΟΔΟΣ ΣΟΦΙΑ") == fold("οδοσ σοφια") == "οδοσ σοφια"
+    # and a text with none of the odd letters is lower-cased and nothing else
+    assert fold("Plain ASCII and Кириллица") == "plain ascii and кириллица"
+
+
+# Characters to try in a class like \\s or [^>]: ASCII, some more spaces, and
+# every letter fold() changes
+PROBE = (
+    "".join(chr(code) for code in range(32, 127))
+    + "\t\n\r\x0b\x0c\xa0\u2003\u3000"
+    + "".join(chr(code) for code in sorted(FOLD))
+)
+CLASS_PARTS = {
+    "CATEGORY_DIGIT": r"\d",
+    "CATEGORY_NOT_DIGIT": r"\D",
+    "CATEGORY_SPACE": r"\s",
+    "CATEGORY_NOT_SPACE": r"\S",
+    "CATEGORY_WORD": r"\w",
+    "CATEGORY_NOT_WORD": r"\W",
+}
+
+
+def class_samples(items, flags) -> list[str]:
+    """One character for each different fold() among those a character class takes."""
+    if all(str(item) == "LITERAL" for item, _code in items):
+        # a short set of plain characters, like [ -]: each one is a branch
+        return [chr(code) for _item, code in items]
+    source = ""
+    for item, value in items:
+        kind = str(item)
+        if kind == "NEGATE":
+            source += "^"
+        elif kind == "LITERAL":
+            source += re.escape(chr(value))
+        elif kind == "RANGE":
+            source += re.escape(chr(value[0])) + "-" + re.escape(chr(value[1]))
+        else:
+            source += CLASS_PARTS[str(value)]
+    one = re.compile(f"[{source}]", flags & (re.IGNORECASE | re.ASCII))
+    kept = {}
+    for c in PROBE:
+        if one.fullmatch(c):
+            kept.setdefault(fold(c), c)
+    return list(kept.values())
+
+
+def node_samples(op, value, flags) -> list[str]:
+    name = str(op)
+    if name == "LITERAL":
+        return [chr(value)]
+    if name == "NOT_LITERAL":
+        return ["b" if value == ord("a") else "a"]
+    if name == "ANY":
+        return ["a"]
+    if name == "IN":
+        return class_samples(value, flags)
+    if name == "BRANCH":
+        return [sample for branch in value[1] for sample in branch_samples(branch, flags)]
+    if name == "SUBPATTERN":
+        return branch_samples(value[3], flags)
+    if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+        least, _most, part = value
+        once = branch_samples(part, flags)
+        if least == 0:
+            return [""] + once
+        return [once[0] * least] + [other + once[0] * (least - 1) for other in once[1:]]
+    # an anchor or a look-around takes up no text
+    return [""]
+
+
+def branch_samples(items, flags) -> list[str]:
+    """Strings a parsed pattern can match: every branch of every alternation,
+    an optional part there and not there, and every kind of character a class
+    takes. All combinations of them while they are few; one change at a time
+    from the plainest string when they are not."""
+    options = [node_samples(op, value, flags) for op, value in items]
+    if math.prod(len(choice) for choice in options) <= 3000:
+        return ["".join(parts) for parts in itertools.product(*options)]
+    plain = [choice[0] for choice in options]
+    samples = ["".join(plain)]
+    for position, choice in enumerate(options):
+        for other in choice[1:]:
+            samples.append("".join(plain[:position] + [other] + plain[position + 1 :]))
+    return samples
+
+
+# Their gate is text the rule's check asks for, not text the pattern asks
+# for. The gate and the check read that text from one constant in rules.py.
+GATED_BY_THE_CHECK = {"autologin_link", "token_in_path", "executable_link", "archive_link", "telegram_proxy_link"}
+
+
+def test_every_branch_of_a_gated_pattern_holds_one_of_its_gates_and_every_gate_is_a_branch():
+    # A term added to a pattern and not to its gate would be matched and
+    # never counted. The samples come from the pattern's own parse tree, so a
+    # new branch is tried without anyone remembering to add an example.
+    parser = pytest.importorskip("re._parser")
+    for r in RULES:
+        if r.gate is None or r.name in GATED_BY_THE_CHECK:
+            continue
+        samples = branch_samples(parser.parse(r.pattern.pattern, r.pattern.flags), r.pattern.flags)
+        # A sample the pattern does not match by itself would be a branch
+        # this test cannot see, one behind a look-around for instance
+        unseen = [sample for sample in samples if not r.pattern.search(sample)]
+        assert not unseen, (r.name, unseen[:5])
+        assert len(samples) >= len(r.gate), r.name
+        for sample in samples:
+            for text in (sample, sample.upper()):
+                assert any(gate in fold(text) for gate in r.gate), (r.name, sample)
+        for gate in r.gate:
+            assert any(gate in fold(sample) for sample in samples), (r.name, gate)
+    # the gates that come from a check are that check's own constants
+    by_name = {r.name: r for r in RULES}
+    assert by_name["token_in_path"].gate == (fold(PATH_TOKEN),)
+    assert by_name["telegram_proxy_link"].gate == (PROXY_SERVER,)
+    assert by_name["autologin_link"].gate == (*AUTOLOGIN_WORDS, fold(HASHED_LOGIN_VALUE))
+    assert by_name["executable_link"].gate == EXECUTABLE_EXTENSIONS
+    assert by_name["archive_link"].gate == ARCHIVE_EXTENSIONS
+    assert HASHED_LOGIN_PARAM_PATTERN.pattern.endswith(re.escape(HASHED_LOGIN_VALUE))
 
 
 # --- the body field, and the page field: the text and the link targets behind it ---
@@ -1108,3 +1306,41 @@ def test_no_rule_is_slow_on_a_long_unbroken_run(name, laptop_seconds):
         if r.pattern is None:
             continue
         assert laptop_seconds(lambda: list(r.pattern.finditer(text))) < 1.0, (r.name, name)
+
+
+# An ordinary page: a post of 1,400 characters in two languages with a channel
+# link, a handle, an address and a URL, which is about the mean on Telegraph
+ORDINARY_PAGE = (
+    "Привет всем! Сегодня расскажу, как мы съездили на выходные за город и что из этого вышло. "
+    "Погода была отличная, дорога заняла около двух часов, по пути заехали в небольшое кафе. "
+    "Подробности и фотографии выкладываю в канале https://t.me/somechannel, подписывайтесь. "
+    "We also tried the new place near the station: the menu is short, prices are fair, 450 rub for lunch. "
+    "Contact: @travel_notes or travel.notes@example.com, сайт https://example.com/blog/2026/11/trip?id=42 . "
+) * 3
+
+# The pattern rules with no gate: the eleven resolver rules, which do not
+# change, and the ones whose pattern asks for no particular text
+NO_GATE = {r.name for r in RULES[:11] if r.pattern is not None} | {
+    "bare_pointer_body",
+    "ip_in_short_body",
+    "encoded_body",
+    "api_sample_page",
+    "wallet_address",
+}
+
+
+def test_an_ordinary_page_is_scored_in_under_a_millisecond_and_every_other_rule_has_a_gate(laptop_seconds):
+    # The long-run tests above only say that no crafted page takes seconds.
+    # They said nothing when classify went from 14 minutes a night to 100 on
+    # 22 November: forty new rules, most with no gate, each a pass over every
+    # ordinary page. This page took 1.6 ms with no gates and 0.46 ms with them
+    # (24 November, the laptop). A new rule without a gate has to be put on
+    # the list above by hand, which is the moment to ask what it costs.
+    assert {r.name for r in RULES if r.pattern is not None and r.gate is None} == NO_GATE
+    text = "Поездка\n" + ORDINARY_PAGE[:120] + "\n" + ORDINARY_PAGE
+    runs = 200
+    spent = min(
+        laptop_seconds(lambda: [apply_rules("Поездка", ORDINARY_PAGE[:120], text) for _ in range(runs)])
+        for _ in range(3)
+    )
+    assert spent / runs < 0.0009

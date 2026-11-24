@@ -13,6 +13,7 @@ import pytest
 
 from graphwatch.db import (
     SCHEMA,
+    _resweep_where,
     add_event,
     add_snapshot,
     cached_feeds,
@@ -28,6 +29,7 @@ from graphwatch.db import (
     is_gone,
     label_rows,
     latest_snapshots,
+    live_older_snapshots,
     load_known,
     load_progress,
     lookup_rows,
@@ -46,7 +48,6 @@ from graphwatch.db import (
     stale_pages,
     store_fetch,
     store_meta,
-    superseded_flagged_snapshots,
     upsert_indicator,
     upsert_page,
     upsert_title,
@@ -73,6 +74,7 @@ ALL_TABLES = {
     "crowd",
     "sweep_progress",
     "scores",
+    "classify_state",
     "hits",
     "labels",
     "views",
@@ -1162,6 +1164,12 @@ def test_resweep_paths_can_keep_to_flagged_pages(conn):
     flag(conn, b, False)
     assert work(conn, T0 + HOUR, flagged=True) == ["Hello-10-17-1"]
     assert len(work(conn, T0 + HOUR)) == 3
+    # The list is built from the few flagged scores, through their own index,
+    # and not by asking the scores about every page (ten seconds on 730,000)
+    where, params = _resweep_where(T0 + HOUR, None, True, None)
+    plan = [row["detail"] for row in conn.execute(f"EXPLAIN QUERY PLAN SELECT p.id FROM pages p WHERE {where}", params)]
+    assert any("scores_flagged" in step for step in plan), plan
+    assert not any(step.startswith("SCAN p") for step in plan), plan
 
 
 def test_a_page_flagged_once_stays_on_the_flagged_list_after_an_edit(conn):
@@ -1658,26 +1666,31 @@ def test_two_polls_at_the_same_instant_keep_one_views_row(conn):
     assert [r["views"] for r in conn.execute("SELECT views FROM views")] == [10]
 
 
-def test_superseded_flagged_snapshots_are_the_older_snapshots_of_flagged_pages(conn):
+def test_live_older_snapshots_are_the_older_ones_that_are_flagged_or_hold_the_templated_hit(conn):
     a = seen_page(conn, "Hello-10-17-1", T0)
     b = seen_page(conn, "Hello-10-17-2", T0)
+    c = seen_page(conn, "Hello-10-17-3", T0)
+    d = seen_page(conn, "Hello-10-17-4", T0)
     flag(conn, a, True)
     flag(conn, b, False)
+    flag(conn, d, True)  # flagged, and its one snapshot is its newest: nothing older
+    # c lost its flag to the templated penalty, and has to be able to get it back
+    first = {page: conn.execute("SELECT MIN(id) FROM snapshots WHERE page_id = ?", (page,)).fetchone()[0] for page in (a, b, c)}
+    save_score(conn, first[c], c, 2, False, "abc", [("templated_body", -2, "body abc", 1), ("other", 4, "x", 1)], T0)
     add_snapshot(conn, a, {"title": "t", "content": ["second"]}, T0 + 60, KEY)
     add_snapshot(conn, a, {"title": "t", "content": ["third"]}, T0 + 120, KEY)
     add_snapshot(conn, b, {"title": "t", "content": ["second"]}, T0 + 60, KEY)
-    rows = superseded_flagged_snapshots(conn)
-    # Of page a's two older snapshots only the first holds a flagged score;
-    # the second was never scored and cannot make the page flagged.
-    oldest = conn.execute("SELECT MIN(id) FROM snapshots WHERE page_id = ?", (a,)).fetchone()[0]
-    assert [(r["page_id"], r["snapshot_id"]) for r in rows] == [(a, oldest)]
-    assert set(rows[0].keys()) == {"snapshot_id", "page_id", "title", "description", "text", "content"}
-
-
-def test_a_flagged_page_with_one_snapshot_has_nothing_superseded(conn):
-    a = seen_page(conn, "Hello-10-17-1", T0)
-    flag(conn, a, True)
-    assert superseded_flagged_snapshots(conn) == []
+    add_snapshot(conn, c, {"title": "t", "content": ["second"]}, T0 + 60, KEY)
+    conn.commit()
+    # Of page a's two older snapshots only the first holds a score; the second
+    # was never scored and cannot make the page flagged. b's is not flagged.
+    assert live_older_snapshots(conn, "templated_body", 4) == [first[a], first[c]]
+    # any other hit keeps no row alive
+    assert live_older_snapshots(conn, "another_rule", 4) == [first[a]]
+    # A row that a run at a higher threshold left unflagged is found again
+    # by a run at a threshold its score reaches: c's 2 here, at 2 and not at 3
+    assert live_older_snapshots(conn, "another_rule", 3) == [first[a]]
+    assert live_older_snapshots(conn, "another_rule", 2) == [first[a], first[c]]
 
 
 # --- what the second review of 22 November found -------------------------------------

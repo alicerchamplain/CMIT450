@@ -291,10 +291,20 @@ AUTOLOGIN_WORDS = ("autologin", "token-login")
 # [?&#]                     : the parameter starts the query, follows another, or is in the fragment
 # (?:token|auth|access_token|login_token|session|sid|code) : a name like a login token's
 # =SECRET\{                 : and a hashed value
+# The = and the start of a hashed value. The check and the rule's gate both
+# read it from here, so that one cannot be changed without the other
+HASHED_LOGIN_VALUE = "=SECRET{"
 HASHED_LOGIN_PARAM_PATTERN = re.compile(
-    r"[?&#](?:token|auth|access_token|login_token|session|sid|code)=SECRET\{",
+    r"[?&#](?:token|auth|access_token|login_token|session|sid|code)"
+    + re.escape(HASHED_LOGIN_VALUE),
     re.IGNORECASE,
 )
+
+# A hashed token as a whole path segment starts like this; the check and the gate again
+PATH_TOKEN = "/SECRET{"
+
+# What a Telegram proxy link names its server with; the check and the gate again
+PROXY_SERVER = "server="
 
 # What a link straight to something that runs ends in, and what an archive ends in
 EXECUTABLE_EXTENSIONS = (".exe", ".apk", ".msi", ".scr", ".ps1", ".lnk", ".hta", ".iso")
@@ -322,6 +332,26 @@ SHORT_BODY_PATTERN = re.compile(r"\A.{1,199}\Z", re.DOTALL)
 # Regex for a body that is one run of base64, hex or base32 characters
 ENCODED_BODY_PATTERN = re.compile(r"\A[A-Za-z0-9+/=_-]{12,}\Z")
 
+# The service domains of TUNNEL_HOST_PATTERN, each behind the dot that ends the
+# poster's own label: the rule's gate
+TUNNEL_HOST_GATE = (
+    ".workers.dev",
+    ".trycloudflare.com",
+    ".ngrok.io",
+    ".ngrok.app",
+    ".ngrok-free.app",
+    ".ngrok-free.dev",
+    ".duckdns.org",
+    ".ddns.net",
+    ".hopto.org",
+    ".zapto.org",
+    ".sytes.net",
+    ".serveo.net",
+    ".loca.lt",
+    ".portmap.io",
+    ".playit.gg",
+)
+
 # Regex for a host on a tunnel or dynamic-DNS service
 # (?<![\w.-])         : start of the whole hostname, not of a label inside it,
 #                       so a long dotted run is read once and not once per label
@@ -336,11 +366,31 @@ TUNNEL_HOST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+RAW_PASTE_GATE = (
+    "pastebin.com/raw",
+    "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+)
+
 # Regex for a link to raw paste or raw repository content
 RAW_PASTE_PATTERN = re.compile(
     r"(?:pastebin\.com/raw|raw\.githubusercontent\.com|gist\.githubusercontent\.com)"
     r"[^\s<>\"']*",
     re.IGNORECASE,
+)
+
+# Every scheme PROXY_URI_PATTERN knows, with its ://
+PROXY_URI_GATE = (
+    "vless://",
+    "vmess://",
+    "ss://",
+    "ssr://",
+    "trojan://",
+    "socks://",
+    "socks5://",
+    "hysteria://",
+    "hysteria2://",
+    "tuic://",
 )
 
 # Regex for a proxy or VPN link
@@ -371,11 +421,44 @@ TELEGRAM_PROXY_PATTERN = re.compile(
 # \s*:                      : the colon that makes it a key
 PROXY_CONFIG_KEY_PATTERN = re.compile(r'"(?:server|port|address)"\s*:', re.IGNORECASE)
 
+RUN_COMMAND_GATE = (
+    "powershell",
+    "cmd.exe",
+    "mshta",
+    "rundll32",
+    "regsvr32",
+    "certutil",
+    "bitsadmin",
+    "invoke-webrequest",
+    "frombase64string",
+    "curl -",
+    "wget http",
+    "/bin/sh",
+    "/bin/bash",
+)
+
 # Regex for a download-and-run command
 RUN_COMMAND_PATTERN = re.compile(
     r"(?<![\w-])(?:powershell|cmd\.exe|mshta|rundll32|regsvr32|certutil|bitsadmin"
     r"|invoke-webrequest|frombase64string|curl -|wget http|/bin/sh|/bin/bash)",
     re.IGNORECASE,
+)
+
+FILE_HOST_GATE = (
+    "mega.nz",
+    "mediafire.com",
+    "gofile.io",
+    "anonfiles",
+    "dropmefiles",
+    "disk.yandex",
+    "yadi.sk",
+    "drive.google.com",
+    "dropbox.com",
+    "cdn.discordapp.com/attachments",
+    "/releases/download/",
+    "transfer.sh",
+    "catbox.moe",
+    "pixeldrain",
 )
 
 # Regex for a link to a file host
@@ -393,12 +476,40 @@ ONION_PATTERN = re.compile(
     r"\b(?:[a-z2-7]{56}|[a-z2-7]{16})\.onion\b", re.IGNORECASE | re.ASCII
 )
 
+CARD_TERMS_GATE = ("cvv", "fullz", "carding", "кардинг")
+
 # Regex for carding vocabulary
 CARD_TERMS_PATTERN = re.compile(r"\b(?:cvv2?|fullz|carding)\b|кардинг", re.IGNORECASE)
+
+STEALER_TERMS_GATE = (
+    "stealer",
+    "stealler",
+    "стиллер",
+    "стилер",
+    "redline",
+    "lumma",
+    "vidar",
+    "raccoon",
+)
 
 # Regex for stealer vocabulary and stealer family names
 STEALER_TERMS_PATTERN = re.compile(
     r"stealer|stealler|стиллер|стилер|redline|lumma|vidar|raccoon", re.IGNORECASE
+)
+
+# сид[ -]фраз and wallet ?connect are two strings each here
+DRAINER_TERMS_GATE = (
+    "seed phrase",
+    "сид фраз",
+    "сид-фраз",
+    "airdrop",
+    "аирдроп",
+    "wallet connect",
+    "walletconnect",
+    "metamask",
+    "trust wallet",
+    "drainer",
+    "дрейнер",
 )
 
 # Regex for wallet-drainer and fake-airdrop vocabulary
@@ -428,6 +539,23 @@ INPUT_TAG_PATTERN = re.compile(r"<input[^>]*", re.IGNORECASE | re.ASCII)
 # Regex for the attribute that makes an input a password field
 PASSWORD_TYPE_PATTERN = re.compile(r"type\s*=\s*[\"']?password", re.IGNORECASE | re.ASCII)
 
+FREE_HOST_GATE = (
+    ".pages.dev",
+    ".web.app",
+    ".firebaseapp.com",
+    ".vercel.app",
+    ".netlify.app",
+    ".github.io",
+    ".glitch.me",
+    ".repl.co",
+    ".onrender.com",
+    ".herokuapp.com",
+    ".000webhostapp.com",
+    ".weebly.com",
+    ".blogspot.com",
+    ".wixsite.com",
+)
+
 # Regex for a host on a free hosting service, same shape as TUNNEL_HOST_PATTERN
 FREE_HOST_PATTERN = re.compile(
     r"(?<![\w.-])(?:[a-z0-9-]+\.)+"
@@ -435,6 +563,20 @@ FREE_HOST_PATTERN = re.compile(
     r"|glitch\.me|repl\.co|onrender\.com|herokuapp\.com|000webhostapp\.com"
     r"|weebly\.com|blogspot\.com|wixsite\.com)(?![\w-])",
     re.IGNORECASE,
+)
+
+SHORTENER_GATE = (
+    "bit.ly/",
+    "clck.ru/",
+    "tinyurl.com/",
+    "cutt.ly/",
+    "is.gd/",
+    "goo.su/",
+    "vk.cc/",
+    "rb.gy/",
+    "shorturl.at/",
+    "tiny.cc/",
+    "ow.ly/",
 )
 
 # Regex for a link through a URL shortener
@@ -464,16 +606,91 @@ TELEGRAM_BOT_PATTERN = re.compile(r"t\.me/\w+bot\b", re.IGNORECASE)
 # @[A-Za-z]\w{4,31}\b : @, a letter, then 4 to 31 more word characters
 TELEGRAM_HANDLE_PATTERN = re.compile(r"(?<![\w@])@[A-Za-z]\w{4,31}\b")
 
+ADULT_AD_TERMS_GATE = ("порно", "porn", "секс", "слив", "intim", "эскорт")
+
 # Regex for the vocabulary of the "sliv" and VIP-bot adverts
 ADULT_AD_TERMS_PATTERN = re.compile(r"порно|porn|секс|слив|intim|эскорт", re.IGNORECASE)
 
 # Regex for the file hosts that movie-link spam points at
 MOVIE_LINK_TERMS_PATTERN = re.compile(r"mdisk|terabox", re.IGNORECASE)
 
+# pin-?up is two strings here
+CASINO_TERMS_GATE = (
+    "casino",
+    "казино",
+    "1xbet",
+    "1win",
+    "vavada",
+    "букмекер",
+    "pinup",
+    "pin-up",
+)
+
 # Regex for casino and betting brand names
 CASINO_TERMS_PATTERN = re.compile(
     r"casino|казино|1xbet|1win|vavada|букмекер|pin-?up", re.IGNORECASE
 )
+
+
+# The letters re.IGNORECASE takes for another letter and str.lower() does not
+# turn into it. A pattern for "stealer" matches "ſtealer" with a long s, and
+# "ſtealer".lower() is still "ſtealer": a gate that only lower-cased the
+# page would skip a rule its pattern matched, and the poster chooses the
+# letters. Capital sigma is here because lower() makes it ς at the end of a
+# word and σ everywhere else.
+FOLD = str.maketrans(
+    {
+        "\u0130": "i",  # İ, capital I with a dot
+        "\u0131": "i",  # ı, small i without one
+        "\u017f": "s",  # ſ, long s
+        "\u1e9b": "\u1e61",  # ẛ to ṡ
+        "\ufb05": "\ufb06",  # the two st ligatures
+        "\u00b5": "\u03bc",  # micro sign to μ
+        "\u0345": "\u03b9",  # the iota below a letter, to ι
+        "\u1fbe": "\u03b9",
+        "\u1fd3": "\u0390",  # ΐ, written two ways
+        "\u1fe3": "\u03b0",  # ΰ, written two ways
+        "\u03d0": "\u03b2",  # ϐ to β
+        "\u03f5": "\u03b5",  # ϵ to ε
+        "\u03d1": "\u03b8",  # ϑ to θ
+        "\u03f0": "\u03ba",  # ϰ to κ
+        "\u03d6": "\u03c0",  # ϖ to π
+        "\u03f1": "\u03c1",  # ϱ to ρ
+        "\u03c2": "\u03c3",  # ς to σ
+        "\u03a3": "\u03c3",  # Σ to σ
+        "\u03d5": "\u03c6",  # ϕ to φ
+        "\u1c80": "\u0432",  # the old Cyrillic letter shapes, to в д о с т т ъ ѣ ꙋ
+        "\u1c81": "\u0434",
+        "\u1c82": "\u043e",
+        "\u1c83": "\u0441",
+        "\u1c84": "\u0442",
+        "\u1c85": "\u0442",
+        "\u1c86": "\u044a",
+        "\u1c87": "\u0463",
+        "\u1c88": "\ua64b",
+    }
+)
+
+# Any one of the letters FOLD changes, to see whether a text has one at all
+FOLD_PATTERN = re.compile("[" + "".join(chr(code) for code in FOLD) + "]")
+
+
+def fold(s: str) -> str:
+    """The lower-cased copy of a field that the gates are looked up in
+
+    str.lower() and, before it, the few letters of FOLD. Two letters that a
+    case-insensitive pattern takes for each other come out of here as the
+    same letter, which lower() alone does not promise.
+
+    Args:
+        s (str): a field of the page, or a gate
+
+    Returns:
+        str: s folded; a gate is written already folded
+    """
+    if not s.isascii() and FOLD_PATTERN.search(s):
+        s = s.translate(FOLD)
+    return s.lower()
 
 
 @dataclass(frozen=True)
@@ -482,9 +699,14 @@ class Rule:
 
     category is the category the weight counts towards. min_matches holds the
     rule back until it has matched that many times: a proxy list is three
-    ip:port lines, not one. gate is a lower-case substring that has to be in
-    the field before the regex is run at all; it saves time and never changes
-    a result, so it has to be text every match of the pattern contains.
+    ip:port lines, not one.
+
+    gate is one folded substring, or a tuple of them, and one of them has to
+    be in the folded field (see fold) before the regex is run at all. It
+    saves time and never changes a result, so a gate has to be text that is
+    in every match the rule can count: every match of the pattern, or every
+    match its check lets through. A rule read from the table always has its
+    gate as a tuple.
     """
 
     name: str
@@ -495,7 +717,17 @@ class Rule:
     check: Callable[[str], bool] | None = None
     category: str = "resolver"
     min_matches: int = 1
-    gate: str | None = None
+    gate: str | tuple[str, ...] | None = None
+
+    def __post_init__(self):
+        if self.gate is None:
+            return
+        gates = (self.gate,) if isinstance(self.gate, str) else tuple(self.gate)
+        for gate in gates:
+            if not gate or fold(gate) != gate:
+                raise ValueError(f"{self.name}: gate {gate!r} is empty or not folded")
+        # The class is frozen, so the tuple is put in place this way
+        object.__setattr__(self, "gate", gates)
 
 
 @dataclass(frozen=True)
@@ -628,7 +860,7 @@ def has_token_in_path(url: str) -> bool:
     # the slash is in the query, and the URL has no path at all
     rest = rest.partition("?")[0].partition("#")[0]
     path = rest.partition("/")[2]
-    return ("/" + path).find("/SECRET{") != -1
+    return ("/" + path).find(PATH_TOKEN) != -1
 
 
 def _path_ends_with(url: str, extensions: tuple[str, ...]) -> bool:
@@ -655,7 +887,7 @@ def is_archive_link(url: str) -> bool:
 
 def names_a_server(s: str) -> bool:
     """Function to check if a Telegram proxy link carries the server it connects to"""
-    return "server=" in s.lower()
+    return PROXY_SERVER in s.lower()
 
 
 def is_password_input(s: str) -> bool:
@@ -704,6 +936,7 @@ RULES: tuple[Rule, ...] = (
     # ----------------------------------------------------------------------
     # resolver: the known actor's shapes. These eleven rules and their
     # weights are the verdict reported since 14 November and do not change.
+    # None of them has a gate, so that not even a gate can be what changed.
     # ----------------------------------------------------------------------
     Rule(
         "userinfo_spoof",
@@ -828,6 +1061,7 @@ RULES: tuple[Rule, ...] = (
         TUNNEL_HOST_PATTERN,
         "Matches pages naming a host on a tunnel or dynamic-DNS service like trycloudflare[.]com, workers[.]dev, ngrok or duckdns[.]org",
         category="pointer",
+        gate=TUNNEL_HOST_GATE,
     ),
     Rule(
         "encoded_body",
@@ -845,6 +1079,7 @@ RULES: tuple[Rule, ...] = (
         RAW_PASTE_PATTERN,
         "Matches pages linking to raw paste or raw repository content, which a script reads and a person does not",
         category="pointer",
+        gate=RAW_PASTE_GATE,
     ),
     Rule(
         "api_sample_page",
@@ -924,7 +1159,7 @@ RULES: tuple[Rule, ...] = (
         "Matches links that log the reader in as someone else: an autologin path, or a login parameter whose value redaction hashed",
         check=is_autologin_link,
         category="leaked_credentials",
-        gate="://",
+        gate=(*AUTOLOGIN_WORDS, fold(HASHED_LOGIN_VALUE)),
     ),
     Rule(
         "token_in_path",
@@ -934,7 +1169,7 @@ RULES: tuple[Rule, ...] = (
         "Matches links with a hashed token as a path segment, which is where some dating login links carry it. Weak, because a numeric id that passes the Luhn check is hashed as a card number and looks the same: 11 of 28 on the first night",
         check=has_token_in_path,
         category="leaked_credentials",
-        gate="://",
+        gate=fold(PATH_TOKEN),
     ),
     # ----------------------------------------------------------------------
     # proxy_list
@@ -946,7 +1181,7 @@ RULES: tuple[Rule, ...] = (
         PROXY_URI_PATTERN,
         "Matches proxy and VPN links: vless://, vmess://, ss://, trojan://, socks5:// and the like",
         category="proxy_list",
-        gate="://",
+        gate=PROXY_URI_GATE,
     ),
     Rule(
         "ip_port_list",
@@ -967,7 +1202,7 @@ RULES: tuple[Rule, ...] = (
         "Matches Telegram proxy links, t[.]me/proxy? and tg://proxy",
         check=names_a_server,
         category="proxy_list",
-        gate="server=",
+        gate=PROXY_SERVER,
     ),
     Rule(
         "proxy_config_keys",
@@ -1000,7 +1235,7 @@ RULES: tuple[Rule, ...] = (
         "Matches links straight to something that runs: a URL whose path ends in .exe, .apk, .msi, .scr, .ps1, .lnk, .hta or .iso",
         check=is_executable_link,
         category="malware_delivery",
-        gate="://",
+        gate=EXECUTABLE_EXTENSIONS,
     ),
     Rule(
         "run_command",
@@ -1009,6 +1244,7 @@ RULES: tuple[Rule, ...] = (
         RUN_COMMAND_PATTERN,
         "Matches download-and-run commands: powershell, mshta, certutil, curl, wget and the like",
         category="malware_delivery",
+        gate=RUN_COMMAND_GATE,
     ),
     Rule(
         "archive_link",
@@ -1018,7 +1254,7 @@ RULES: tuple[Rule, ...] = (
         "Matches links to an archive: a URL whose path ends in .zip, .rar or .7z",
         check=is_archive_link,
         category="malware_delivery",
-        gate="://",
+        gate=ARCHIVE_EXTENSIONS,
     ),
     Rule(
         "file_host_link",
@@ -1027,6 +1263,7 @@ RULES: tuple[Rule, ...] = (
         FILE_HOST_PATTERN,
         "Matches links to a file host like mega[.]nz, mediafire or a GitHub release download",
         category="malware_delivery",
+        gate=FILE_HOST_GATE,
     ),
     # ----------------------------------------------------------------------
     # fraud_market
@@ -1047,6 +1284,7 @@ RULES: tuple[Rule, ...] = (
         CARD_TERMS_PATTERN,
         "Matches carding adverts: cvv, fullz, carding",
         category="fraud_market",
+        gate=CARD_TERMS_GATE,
     ),
     Rule(
         "stealer_terms",
@@ -1055,6 +1293,7 @@ RULES: tuple[Rule, ...] = (
         STEALER_TERMS_PATTERN,
         "Matches stealer-log adverts: stealer, redline, lumma, vidar. Most pages with these words are templated adverts, which template_spam counts first",
         category="fraud_market",
+        gate=STEALER_TERMS_GATE,
     ),
     # ----------------------------------------------------------------------
     # crypto_lure
@@ -1066,6 +1305,7 @@ RULES: tuple[Rule, ...] = (
         DRAINER_TERMS_PATTERN,
         "Matches airdrop, claim and drainer lures: airdrop, seed phrase, wallet connect, drainer",
         category="crypto_lure",
+        gate=DRAINER_TERMS_GATE,
     ),
     Rule(
         "wallet_address",
@@ -1095,6 +1335,7 @@ RULES: tuple[Rule, ...] = (
         FREE_HOST_PATTERN,
         "Matches links to a free hosting service like pages[.]dev, web[.]app, netlify[.]app or github[.]io, where credential-collection pages are put up",
         category="phishing",
+        gate=FREE_HOST_GATE,
     ),
     Rule(
         "shortener_link",
@@ -1103,6 +1344,7 @@ RULES: tuple[Rule, ...] = (
         SHORTENER_PATTERN,
         "Matches links through a URL shortener, which hide where they lead",
         category="phishing",
+        gate=SHORTENER_GATE,
     ),
     # ----------------------------------------------------------------------
     # doxx: one rule per identity field, so two different fields make a label
@@ -1114,6 +1356,7 @@ RULES: tuple[Rule, ...] = (
         PASSPORT_FIELD_PATTERN,
         "Matches pages with a passport field. Counted, never excerpted",
         category="doxx",
+        gate="паспорт",
     ),
     Rule(
         "identity_registration",
@@ -1122,6 +1365,7 @@ RULES: tuple[Rule, ...] = (
         REGISTRATION_FIELD_PATTERN,
         "Matches pages with a registered-address field. Counted, never excerpted",
         category="doxx",
+        gate="прописк",
     ),
     Rule(
         "identity_birth_date",
@@ -1130,6 +1374,7 @@ RULES: tuple[Rule, ...] = (
         BIRTH_DATE_FIELD_PATTERN,
         "Matches pages with a date-of-birth field. Counted, never excerpted",
         category="doxx",
+        gate="дата рождения",
     ),
     Rule(
         "identity_address",
@@ -1138,6 +1383,7 @@ RULES: tuple[Rule, ...] = (
         ADDRESS_FIELD_PATTERN,
         "Matches pages with a home-address field. Counted, never excerpted",
         category="doxx",
+        gate="адрес проживания",
     ),
     # ----------------------------------------------------------------------
     # telegram_funnel
@@ -1176,6 +1422,7 @@ RULES: tuple[Rule, ...] = (
         ADULT_AD_TERMS_PATTERN,
         "Matches the vocabulary of the sliv and VIP-bot adverts",
         category="telegram_funnel",
+        gate=ADULT_AD_TERMS_GATE,
     ),
     # ----------------------------------------------------------------------
     # seo_spam
@@ -1187,6 +1434,7 @@ RULES: tuple[Rule, ...] = (
         MOVIE_LINK_TERMS_PATTERN,
         "Matches movie-link spam, which points at mdisk and terabox",
         category="seo_spam",
+        gate=("mdisk", "terabox"),
     ),
     Rule(
         "casino_terms",
@@ -1195,6 +1443,7 @@ RULES: tuple[Rule, ...] = (
         CASINO_TERMS_PATTERN,
         "Matches casino and betting spam by brand name",
         category="seo_spam",
+        gate=CASINO_TERMS_GATE,
     ),
     # ----------------------------------------------------------------------
     # placeholder
@@ -1279,17 +1528,18 @@ def apply_rules(
         "body": body_of(title, description, text).strip(),
     }
     fields["page"] = "\n".join([fields["text"], *links])
-    # Lower-cased copies for the gates, made only for the fields a gate reads
-    lowered = {}
+    # Folded copies for the gates, made only for the fields a gate reads
+    folded = {}
     hits = []
     for rule in rules:
         if rule.pattern is None:
             continue
         field = fields[rule.where]
         if rule.gate is not None:
-            if rule.where not in lowered:
-                lowered[rule.where] = field.lower()
-            if rule.gate not in lowered[rule.where]:
+            if rule.where not in folded:
+                folded[rule.where] = fold(field)
+            lowered = folded[rule.where]
+            if not any(gate in lowered for gate in rule.gate):
                 continue
         evidence = None
         matches = 0

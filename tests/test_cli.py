@@ -9,6 +9,7 @@ fake session.
 
 import hashlib
 import json
+import random
 import re
 import runpy
 import time
@@ -23,6 +24,8 @@ import pytest
 import requests
 
 from graphwatch.cli import (
+    CLASSIFY_WORKERS,
+    classify_counts,
     main,
     make_fetch,
     make_probe,
@@ -36,16 +39,19 @@ from graphwatch.cli import (
     run_resweep,
     run_sweep,
 )
+from graphwatch.classify import Scorer, _start_worker
 from graphwatch.config import CONFIG
 from graphwatch.crowd import DayCount, save_day_count
 from graphwatch.db import (
     add_snapshot,
+    classify_mark,
     http_logger,
     connect,
     load_progress,
     resweep_paths,
     save_lookup,
     save_score,
+    set_classify_mark,
     store_meta,
     upsert_indicator,
     upsert_page,
@@ -215,7 +221,7 @@ LISTS = Path("wordlists")
         ),
         (["meta", "--stale", "24"], dict(db=DB, rate=8.0, budget=230000, limit=5000, stale=24.0, workers=4)),
         (["freeze"], dict(wordlists=LISTS)),
-        (["classify"], dict(db=DB, threshold=4, explain=None)),
+        (["classify"], dict(db=DB, threshold=4, explain=None, workers=CLASSIFY_WORKERS, full=False)),
         (["enrich"], dict(db=DB, file=None, refresh=False, budget=None, table=False, recheck_days=14.0)),
     ],
 )
@@ -1194,7 +1200,8 @@ def test_run_classify_on_an_empty_database(conn):
     counts = run_classify(conn, log=lines.append)
     assert (counts["pages"], counts["held_out"]) == (0, 0)
     assert lines[0] == "classified 0 pages at threshold 4: 0 flagged, 0 near misses, 0 templated bodies"
-    assert lines[-1].split() == ["unlabelled", "0", "(0.0%", "of", "pages)"]
+    assert lines[-2].split() == ["unlabelled", "0", "(0.0%", "of", "pages)"]
+    assert lines[-1] == "scored every page: 0 snapshots, and 0 older ones again"
 
 
 # --- labels (plan/classification-plan-2026-11-15.md) ---
@@ -1266,8 +1273,8 @@ def test_run_classify_logs_the_totals_then_one_line_per_category_then_the_unlabe
     counts = run_classify(mixed, log=lines.append)
     assert lines[0] == "classified 11 pages at threshold 4: 2 flagged, 3 near misses, 1 templated bodies"
     assert lines[1] == "held-out: 0/0 flagged"
-    assert len(lines) == 2 + len(CATEGORIES) + 1
-    for category, line in zip(CATEGORIES, lines[2:-1]):
+    assert len(lines) == 2 + len(CATEGORIES) + 2
+    for category, line in zip(CATEGORIES, lines[2:-2]):
         assert line.split() == [
             category,
             "labelled", f"{counts['labelled'][category]},",
@@ -1275,18 +1282,270 @@ def test_run_classify_logs_the_totals_then_one_line_per_category_then_the_unlabe
             "near", "misses", f"{counts['category_near_miss'][category]}",
         ]
     assert lines[3].split() == ["template_spam", "labelled", "3,", "primary", "3,", "near", "misses", "0"]
-    assert lines[-1].split() == ["unlabelled", "3", "(27.3%", "of", "pages)"]
+    assert lines[-2].split() == ["unlabelled", "3", "(27.3%", "of", "pages)"]
+    assert lines[-1] == "scored every page: 11 snapshots, and 0 older ones again"
 
 
-def test_run_classify_twice_replaces_rather_than_adds(mixed):
-    def rows():
-        return [mixed.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("scores", "hits", "labels")]
+def tables_of(conn):
+    """Everything classify stores, row for row. When a row was written and the
+    ids of the hits are left out: they say that a row was written again, not
+    what it holds."""
+    scores = "SELECT snapshot_id, page_id, score, flagged, body_sha256 FROM scores ORDER BY snapshot_id"
+    hits = "SELECT snapshot_id, rule, weight, evidence, matches FROM hits ORDER BY snapshot_id, id"
+    labels = "SELECT snapshot_id, page_id, category, score, assigned, is_primary FROM labels ORDER BY snapshot_id, category"
+    return [[tuple(row) for row in conn.execute(sql)] for sql in (scores, hits, labels)]
+
+
+def written(conn):
+    """When each score was written and the id of every hit: a snapshot that was
+    scored again has a new time and new hit ids."""
+    times = {r[0]: r[1] for r in conn.execute("SELECT snapshot_id, classified_at FROM scores")}
+    return times, [r[0] for r in conn.execute("SELECT id FROM hits ORDER BY id")]
+
+
+def page_id_of(conn, path):
+    return conn.execute("SELECT id FROM pages WHERE path = ?", (path,)).fetchone()[0]
+
+
+def snapshots_of_page(conn, path, scored=False):
+    sql = "SELECT s.id FROM snapshots s JOIN pages p ON p.id = s.page_id WHERE p.path = ?"
+    if scored:
+        sql += " AND s.id IN (SELECT snapshot_id FROM scores)"
+    return [r[0] for r in conn.execute(sql + " ORDER BY s.id", (path,))]
+
+
+# What a run did, as opposed to what the table holds afterwards
+RUN_KEYS = ("full", "scored", "rescored")
+
+
+def test_an_ordinary_night_scores_the_new_and_the_changed_snapshots_and_writes_no_other_row(mixed):
+    first = run_classify(mixed, log=quiet)
+    assert [first[key] for key in RUN_KEYS] == [True, 11, 0]
+    stored, rows = tables_of(mixed), written(mixed)
+    assert [len(table) for table in stored][0] == 11
+    # A night with nothing new: nothing is scored and no row is written, and
+    # the counts are still of every page
+    lines = []
+    second = run_classify(mixed, log=lines.append)
+    assert second == {**first, "full": False, "scored": 0}
+    assert (tables_of(mixed), written(mixed)) == (stored, rows)
+    assert lines[0] == "classified 11 pages at threshold 4: 2 flagged, 3 near misses, 1 templated bodies"
+    assert lines[-1] == "scored 0 new or changed snapshots, and 0 older ones again; every other page kept its score"
+    # The sweep stores a page, and the re-poll finds an old one changed twice
+    put(mixed, "Notes-10-18", "Notes", "", PLAIN_BODY)
+    notes = page_id_of(mixed, "Notes-10-17")
+    for minute, body in enumerate(("an edit nobody scored", PROXY_BODY), start=1):
+        add_snapshot(mixed, notes, {"title": "Notes", "description": "", "content": [body]}, T0 + 60 * minute, KEY)
+    third = run_classify(mixed, log=quiet)
+    assert [third[key] for key in RUN_KEYS] == [False, 2, 0]
+    assert (third["pages"], third["labelled"]["proxy_list"]) == (12, first["labelled"]["proxy_list"] + 1)
+    # Only a page's newest snapshot is scored: the edit in between never is
+    first_snapshot, _between, newest = snapshots_of_page(mixed, "Notes-10-17")
+    assert snapshots_of_page(mixed, "Notes-10-17", scored=True) == [first_snapshot, newest]
+    # and the eleven rows of the first night are the rows written that night
+    times, _hit_ids = written(mixed)
+    assert {snapshot: times[snapshot] for snapshot in rows[0]} == rows[0]
+    assert len(times) == 13
+    # The re-poll stores a flagged page's edit while classify is still
+    # running: the page is counted by the snapshot that was scored, not dropped
+    spoof = page_id_of(mixed, "Hello-10-17-9")
+    add_snapshot(mixed, spoof, {"title": "Hello", "description": "", "content": ["rotated"]}, T0 + 600, KEY)
+    counts = classify_counts(mixed, 4)
+    assert (counts["pages"], counts["flagged"]) == (third["pages"], third["flagged"]) == (12, 2)
+    assert counts["labelled"] == third["labelled"]
+
+
+# Bodies long enough to be hashed. The first is flagged for its /! marker
+# until it is a template, which takes two points off; under the spoof title
+# any of them is flagged, and the penalty takes that flag too.
+MARKER_BODY = "the key for this month is at /!bucket-of-the-month, fetch it from there as usual"
+NIGHT_BODIES = (MARKER_BODY, PLAIN_BODY, PROXY_BODY + " and a few more words", SQUATTER_BODY, "short")
+NIGHT_TITLES = ("Hello", "Notes", "Proxy", "Accounts", SPOOF_TITLE)
+
+
+def test_ordinary_nights_store_what_scoring_every_page_each_night_would():
+    # Two databases get the same pages and the same edits. One scores every
+    # page every night (full=True); the other only what an ordinary night
+    # scores. They must hold the same rows after every night, whatever the
+    # batch size.
+    did = {"scored": 0, "rescored": 0, "every_page": 0}
+    for seed in range(8):
+        rng = random.Random(seed)
+        every_night, ordinary = connect(":memory:"), connect(":memory:")
+        paths = []
+        clock = T0
+        for night in range(7):
+            edits = []
+            for _ in range(rng.randint(1, 5)):
+                if paths and rng.random() < 0.5:
+                    # a re-poll finds a page changed, sometimes twice before classify runs
+                    path = rng.choice(paths)
+                    edits += [(path, rng.choice(NIGHT_TITLES), rng.choice(NIGHT_BODIES)) for _ in range(rng.randint(1, 2))]
+                else:
+                    paths.append(f"Page-10-{10 + night}-{len(paths) + 1}")
+                    edits.append((paths[-1], rng.choice(NIGHT_TITLES), rng.choice(NIGHT_BODIES)))
+            for conn in (every_night, ordinary):
+                ts = clock
+                for path, title, body in edits:
+                    ts += 60
+                    page_id = upsert_page(conn, path, ts)
+                    add_snapshot(conn, page_id, {"title": title, "description": "", "content": [body]}, ts, KEY)
+            clock += 86_400
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr("graphwatch.cli.CLASSIFY_BATCH", (1000, 1, 3)[seed % 3])
+                all_pages = run_classify(every_night, log=quiet, full=True)
+                some = run_classify(ordinary, log=quiet)
+            where = (seed, night)
+            assert tables_of(ordinary) == tables_of(every_night), where
+            assert flagged_list(ordinary) == flagged_list(every_night), where
+            assert {k: v for k, v in some.items() if k not in RUN_KEYS} == {k: v for k, v in all_pages.items() if k not in RUN_KEYS}, where
+            assert some["full"] is (night == 0), where
+            if night:
+                did["scored"] += some["scored"]
+                did["rescored"] += some["rescored"]
+                did["every_page"] += all_pages["scored"] + all_pages["rescored"]
+    # The nights did happen as described: templates came and went under
+    # flagged pages, and the ordinary nights scored a fraction of the pages
+    assert did["rescored"] > 0
+    assert 0 < did["scored"] + did["rescored"] < did["every_page"] / 2
+
+
+@pytest.mark.parametrize(
+    "why",
+    ["the threshold", "the code", "the mark was cleared", "it was asked for", "a run was cut short", "the mark was cleared under a run"],
+)
+def test_every_page_is_scored_again_when_the_stored_scores_may_be_out_of_date(mixed, monkeypatch, why):
+    import graphwatch.cli as cli
 
     run_classify(mixed, log=quiet)
-    first = rows()
-    run_classify(mixed, log=quiet)
-    assert rows() == first
-    assert first[0] == 11
+    assert run_classify(mixed, log=quiet)["full"] is False
+    options = {}
+    real_save_labels, calls = cli.save_labels, []
+    if why == "the mark was cleared under a run":
+        # reredact rewrites snapshots while a run is scoring every page, some
+        # of them scored already: that run must not end by calling itself complete
+
+        # The same holds when a second run started meanwhile and put its own token there.
+        for left_by_the_other in (None, "running:the token of another run"):
+
+            def replace_at_the_third(*args, **kwargs):
+                calls.append(args)
+                if len(calls) == 3:
+                    set_classify_mark(mixed, left_by_the_other)
+                return real_save_labels(*args, **kwargs)
+
+            calls.clear()
+            monkeypatch.setattr(cli, "save_labels", replace_at_the_third)
+            lines = []
+            assert run_classify(mixed, log=lines.append, full=True)["full"] is True
+            assert "the mark was cleared while classify ran: the next run scores every page again" in lines
+            assert classify_mark(mixed) == left_by_the_other
+        monkeypatch.setattr(cli, "save_labels", real_save_labels)
+    if why == "the threshold":
+        options = {"threshold": 3}
+    elif why == "the code":
+        monkeypatch.setattr(cli, "fingerprint", lambda threshold: f"other rules at {threshold}")
+    elif why == "the mark was cleared":
+        # what reredact does when it rewrites a snapshot (test_reredact.py)
+        set_classify_mark(mixed, None)
+        mixed.commit()
+    elif why == "a run was cut short":
+
+        def stop_at_the_third(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 3:
+                raise KeyboardInterrupt
+            return real_save_labels(*args, **kwargs)
+
+        monkeypatch.setattr(cli, "save_labels", stop_at_the_third)
+        with pytest.raises(KeyboardInterrupt):
+            run_classify(mixed, log=quiet, full=True)
+        mixed.rollback()
+        # what is left in the mark's place is that run's token, and no fingerprint
+        assert classify_mark(mixed).startswith("running:")
+        monkeypatch.setattr(cli, "save_labels", real_save_labels)
+    lines = []
+    counts = run_classify(mixed, log=lines.append, full=(why == "it was asked for"), **options)
+    assert [counts[key] for key in RUN_KEYS] == [True, 11, 0]
+    assert lines[-1] == "scored every page: 11 snapshots, and 0 older ones again"
+    assert classify_mark(mixed) == cli.fingerprint(options.get("threshold", 4))
+    # and the night after that is an ordinary one again
+    assert run_classify(mixed, log=quiet, **options)["full"] is False
+
+
+def test_a_body_that_becomes_a_template_or_stops_being_one_is_scored_again_wherever_it_is_stored(conn):
+    # Night 1: the marker page is flagged, and one other title shares its body
+    watched = put(conn, "Hello-10-17-1", "Hello", "", MARKER_BODY)
+    put(conn, "Notes-10-17", "Notes", "", MARKER_BODY)
+    run_classify(conn, log=quiet)
+    assert flagged_list(conn) == ["Hello-10-17-1", "Notes-10-17"]
+    # The re-poll finds the watched page edited to plain text: its flag is on
+    # an older snapshot now. Two more titles take up the body, three with Notes.
+    add_snapshot(conn, watched, {"title": "Hello", "description": "", "content": ["nothing here at all, really"]}, T0 + 60, KEY)
+    put(conn, "Proxy-10-18", "Proxy", "", MARKER_BODY)
+    last = put(conn, "Accounts-10-18", "Accounts", "", MARKER_BODY)
+    counts = run_classify(conn, log=quiet)
+    # scored: the edit and the two new pages, and Notes, which did not change
+    # and whose body is a template tonight; and the older flagged snapshot
+    assert [counts[key] for key in RUN_KEYS] == [False, 4, 1]
+    assert counts["templated"] == 1
+    assert flagged_list(conn) == []
+    assert assigned_labels(conn, "Notes-10-17") == ["template_spam"]
+    # One of the three is edited, and the body is two titles' again. Both of
+    # them get their flag back, and so does the older snapshot that lost it
+    # to the penalty: until 24 November that row was never scored again, and
+    # the page was off the re-poll's list for good. The edited page's own
+    # older snapshot holds the penalty too, and is judged the same way.
+    add_snapshot(conn, last, {"title": "Accounts", "description": "", "content": ["nothing here either, honestly"]}, T0 + 120, KEY)
+    counts = run_classify(conn, log=quiet)
+    assert [counts[key] for key in RUN_KEYS] == [False, 3, 2]
+    assert counts["templated"] == 0
+    assert sorted(flagged_list(conn)) == ["Accounts-10-18", "Hello-10-17-1", "Notes-10-17", "Proxy-10-18"]
+    assert assigned_labels(conn, "Notes-10-17") == ["resolver"]
+    # nothing is left to do: the night after scores nothing
+    counts = run_classify(conn, log=quiet)
+    assert [counts[key] for key in RUN_KEYS] == [False, 0, 0]
+
+
+def test_two_worker_processes_store_what_one_process_does(monkeypatch):
+    # The workers are real processes here, started the way they are on the
+    # VPS. The threshold is not the default, so a worker that ignored the one
+    # it was started with would store other rows.
+    import graphwatch.classify as classify
+
+    monkeypatch.setattr(classify, "POOL_MIN_ROWS", 1)
+    real_score_snapshot, in_this_process = classify.score_snapshot, []
+
+    def counted(item, *args):
+        in_this_process[-1] += 1
+        return real_score_snapshot(item, *args)
+
+    monkeypatch.setattr(classify, "score_snapshot", counted)
+    stored = []
+    for workers in (1, 2):
+        in_this_process.append(0)
+        conn = connect(":memory:")
+        put_fixture(conn, "Hello-10-17-154", "Hello-10-17-154")
+        put(conn, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+        put_linked(conn, "Katya-10-17", "Katya", "write to me. ", "https://files.example.com/setup.exe")
+        for title in ("Cobalt-Strike", "Mimikatz", "Stealer"):
+            put(conn, f"{title}-10-17", title, "", SQUATTER_BODY)
+        counts = run_classify(conn, threshold=5, log=quiet, workers=workers)
+        stored.append((tables_of(conn), counts))
+    assert stored[0] == stored[1]
+    assert stored[0][1]["scored"] == 6
+    # with two workers this process scored nothing itself
+    assert in_this_process == [6, 0]
+    monkeypatch.undo()
+    # A batch too small to be worth it starts no worker, and there is never less than one scorer
+    with Scorer([], 4, workers=2) as small:
+        assert len(small.score([(1, 1, "t", "", "t\n\nx", "[]")])) == 1
+        assert small._pool is None
+    assert Scorer([], 4, workers=0).workers == 1
+    # A worker that loaded other scoring code than its parent refuses to start
+    with pytest.raises(RuntimeError, match="other scoring code"):
+        _start_worker(frozenset(), 4, "the fingerprint of other code")
+    _start_worker(frozenset(), 4, classify.fingerprint(4))
 
 
 def test_the_threshold_is_an_argument_for_the_verdict_and_for_every_category(mixed):
@@ -1305,9 +1564,10 @@ def test_held_out_pages_change_no_count_but_their_own_and_are_never_named(mixed)
     put(mixed, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
     put(mixed, "Known-01-03", "Hello", "", "nothing here", held_out=True)
     put(mixed, "Known-01-04", "Accounts", "", COMBO_BODY, held_out=True)
+    upsert_page(mixed, "Known-01-05", T0, held_out=True)  # on the list and never fetched: no snapshot
     lines = []
     after = run_classify(mixed, log=lines.append)
-    assert after == {**before, "held_out": 3, "held_out_flagged": 1}
+    assert after == {**before, "held_out": 3, "held_out_flagged": 1, "full": False, "scored": 3}
     # Recall is logged as counts: which held-out pages missed is never printed.
     assert lines[1] == "held-out: 1/3 flagged"
     out = "\n".join(lines)
@@ -1371,15 +1631,41 @@ def test_run_classify_rescores_the_older_snapshots_of_a_flagged_page(conn):
     assert counts["rescored"] == 1
     assert counts["pages"] == 1  # still one page, counted by its newest snapshot
     assert counts["flagged"] == 0
+    # and labelled by it: the older snapshot's resolver label is not counted
+    assert (counts["labelled"]["resolver"], counts["unlabelled"]) == (0, 1)
     # the actor edits pages in place: once a resolver, still one to watch
+    assert flagged_list(conn) == ["Hello-10-17-9"]
+    # A run by hand at a higher threshold takes that flag off. The next
+    # run at 4 gives it back: until 24 November it was gone for good.
+    run_classify(conn, threshold=7, log=quiet)
+    assert flagged_list(conn) == []
+    counts = run_classify(conn, log=quiet)
+    assert (counts["full"], counts["rescored"]) == (True, 1)
     assert flagged_list(conn) == ["Hello-10-17-9"]
 
 
-def test_a_stale_flag_on_an_older_snapshot_is_cleared(conn):
+def test_a_stale_flag_on_an_older_snapshot_is_cleared(conn, monkeypatch):
     # The false positives of 22 November: flagged once, and a re-poll has since added a snapshot.
-    with_an_older_flagged_snapshot(conn, "PayPal-10-31-12", "PayPal", "", "example.ua@gmail.com write to us", 5)
+    import graphwatch.cli as cli
+
+    old_snapshot = with_an_older_flagged_snapshot(conn, "PayPal-10-31-12", "PayPal", "", "example.ua@gmail.com write to us", 5)
     assert flagged_list(conn) == ["PayPal-10-31-12"]
-    run_classify(conn, log=quiet)
+    # A run that is stopped while it scores the older snapshots is not a
+    # complete one: the run after it scores every page, and clears the flag
+    real_save_labels = cli.save_labels
+
+    def stop_at_the_older_snapshot(conn_, snapshot_id, *args):
+        if snapshot_id == old_snapshot:
+            raise KeyboardInterrupt
+        return real_save_labels(conn_, snapshot_id, *args)
+
+    monkeypatch.setattr(cli, "save_labels", stop_at_the_older_snapshot)
+    with pytest.raises(KeyboardInterrupt):
+        run_classify(conn, log=quiet)
+    conn.rollback()
+    monkeypatch.undo()
+    assert flagged_list(conn) == ["PayPal-10-31-12"]
+    assert run_classify(conn, log=quiet)["full"] is True
     assert flagged_list(conn) == []
     assert conn.execute("SELECT COUNT(*) FROM scores WHERE flagged = 1").fetchone()[0] == 0
 
@@ -1438,27 +1724,6 @@ def test_run_classify_holds_nothing_open_between_reading_a_batch_and_writing_it(
     assert writer.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 5
     assert writer.execute("SELECT COUNT(*) FROM events WHERE kind = 'repoll'").fetchone()[0] == 3
     writer.close()
-
-
-def test_run_classify_gives_the_same_result_whatever_the_batch_size(conn, monkeypatch):
-    put_fixture(conn, "Hello-10-17-154", "Hello-10-17-154")
-    put(conn, "Hello-10-17-9", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
-    for title in ("Cobalt-Strike", "Mimikatz", "Stealer"):
-        put(conn, f"{title}-10-17", title, "", SQUATTER_BODY)
-    put(conn, "Known-01-02", SPOOF_TITLE, API_SAMPLE, API_SAMPLE, held_out=True)
-
-    def stored():
-        scores = [tuple(r) for r in conn.execute("SELECT snapshot_id, score, flagged FROM scores ORDER BY snapshot_id")]
-        labels = [tuple(r) for r in conn.execute("SELECT snapshot_id, category, score, assigned, is_primary FROM labels ORDER BY snapshot_id, category")]
-        return scores, labels
-
-    monkeypatch.setattr("graphwatch.cli.CLASSIFY_BATCH", 1000)
-    whole = dict(run_classify(conn, log=quiet))
-    whole_rows = stored()
-    monkeypatch.setattr("graphwatch.cli.CLASSIFY_BATCH", 1)
-    one_by_one = dict(run_classify(conn, log=quiet))
-    assert one_by_one == whole
-    assert stored() == whole_rows
 
 
 # --- --explain ---
@@ -1608,14 +1873,31 @@ def test_main_classify_needs_no_client_config_or_wordlists(classify_db, capsys, 
     proxy = next(line for line in lines if line.split()[:1] == ["proxy_list"])
     assert proxy.split() == ["proxy_list", "labelled", "1,", "primary", "1,", "near", "misses", "0"]
     # then the unlabelled share, the score distribution in order, and the run time
-    assert lines[-5].split() == ["unlabelled", "1", "(25.0%", "of", "pages)"]
+    assert lines[-6].split() == ["unlabelled", "1", "(25.0%", "of", "pages)"]
+    assert lines[-5] == "scored every page: 4 snapshots, and 0 older ones again"
     assert lines[-4:-1] == ["  score +0: 1", "  score +1: 2", "  score +6: 1"]
     assert re.fullmatch(SECONDS, lines[-1])
 
 
-def test_main_classify_threshold_option(classify_db, capsys, no_network):
+def test_main_classify_threshold_full_and_workers_options(classify_db, capsys, no_network, monkeypatch):
     main(["classify", "--db", str(classify_db), "--threshold", "1"])
     assert "at threshold 1: 3 flagged" in capsys.readouterr().out
+    # the same threshold again is an ordinary night, unless --full says otherwise
+    main(["classify", "--db", str(classify_db), "--threshold", "1"])
+    assert "scored 0 new or changed snapshots" in capsys.readouterr().out
+    started = []
+
+    def scorer(templated, threshold, workers):
+        started.append((threshold, workers))
+        return Scorer(templated, threshold, 1)
+
+    monkeypatch.setattr("graphwatch.cli.Scorer", scorer)
+    main(["classify", "--db", str(classify_db), "--threshold", "1", "--full", "--workers", "3"])
+    assert "scored every page: 4 snapshots" in capsys.readouterr().out
+    assert started == [(1, 3)]
+    # at 0 every page with no hit at all would be flagged and re-polled
+    with pytest.raises(SystemExit, match="--threshold has to be 1 or more"):
+        main(["classify", "--db", str(classify_db), "--threshold", "0"])
 
 
 def test_main_classify_explain_reads_the_stored_result(classify_db, capsys, no_network):

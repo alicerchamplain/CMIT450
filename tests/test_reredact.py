@@ -13,7 +13,17 @@ import sys
 import pytest
 
 from graphwatch.cli import run_classify
-from graphwatch.db import add_snapshot, connect, fingerprint, resweep_paths, save_labels, save_score, upsert_page
+from graphwatch.db import (
+    add_snapshot,
+    classify_mark,
+    connect,
+    fingerprint,
+    resweep_paths,
+    save_labels,
+    save_score,
+    set_classify_mark,
+    upsert_page,
+)
 from graphwatch.redact import BARE_LOGIN_PASSWORD_PATTERN, hash_secret, redact_page
 from graphwatch.reredact import (
     SCHEMES,
@@ -599,9 +609,28 @@ def test_the_hits_and_labels_of_a_rewritten_snapshot_are_deleted_and_its_score_k
     # it is what says the page was flagged, and classify scores it again.
     for snapshot_id in (LEAKY, CLEAN):
         classify_as_a_proxy_list(old_db, snapshot_id)
+    # the templated-body hit quotes a hash and no text, and classify finds
+    # an older snapshot's penalty by it
+    old_db.execute("INSERT INTO hits (snapshot_id, rule, weight, evidence) VALUES (?, 'templated_body', -2, 'body abc')", (LEAKY,))
+    set_classify_mark(old_db, "the rules of the last classify run")
+    old_db.commit()
+    # a dry run rewrites nothing, so the scores are as good as they were
+    reredact(old_db, KEY, dry_run=True, log=lambda s: None)
+    assert classify_mark(old_db) == "the rules of the last classify run"
     reredact(old_db, KEY, log=lambda s: None)
-    assert classifier_rows(old_db, LEAKY) == (1, 0, 0)
+    assert classifier_rows(old_db, LEAKY) == (1, 1, 0)
+    assert [r["rule"] for r in old_db.execute("SELECT rule FROM hits WHERE snapshot_id = ?", (LEAKY,))] == ["templated_body"]
     assert classifier_rows(old_db, CLEAN) == (1, 1, 1)
+    # The kept score was made from the old text, and classify scores a page
+    # again only when its mark is gone: the rewrite takes the mark with it
+    assert classify_mark(old_db) is None
+    old_db.rollback()  # and that was committed with the rewrite
+    assert classify_mark(old_db) is None
+    # a second pass finds nothing to rewrite and leaves a new mark alone
+    set_classify_mark(old_db, "after the next classify run")
+    old_db.commit()
+    assert reredact(old_db, KEY, log=lambda s: None)["changed"] == 0
+    assert classify_mark(old_db) == "after the next classify run"
 
 
 # --- what the second review of 22 November found -------------------------------------

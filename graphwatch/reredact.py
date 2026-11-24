@@ -27,8 +27,10 @@ for that line needs to see the port, and a port is one of 111,110 strings of
 one to five digits, so its hash is put back to the port first.
 
 The hits and labels of a rewritten snapshot are deleted, because a stored hit
-quotes the old text as evidence. Its score row is kept, so a page that was
-flagged stays on the re-poll's list. Run classify afterwards.
+quotes the old text as evidence (all but the templated-body hit, which quotes
+a hash). Its score row is kept, so a page that was
+flagged stays on the re-poll's list. Run classify afterwards: this pass clears
+classify's mark, so that run scores every page again.
 
 It needs the same HMAC_KEY the sweep used, or a secret hashed tonight would
 not match the same secret hashed in October. Back up the database first (#41).
@@ -42,8 +44,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from graphwatch.classify import TEMPLATED_RULE
 from graphwatch.config import CONFIG, hmac_key, load_config
-from graphwatch.db import connect, fingerprint
+from graphwatch.db import connect, fingerprint, set_classify_mark
 from graphwatch.redact import hash_secret, redact_page
 from graphwatch.telegraph import page_text
 
@@ -292,10 +295,18 @@ def reredact(
                 # A stored hit quotes the old text as its evidence. The score
                 # row stays: "has this page ever been flagged" is read from
                 # it, and classify scores a flagged older snapshot again
-                for table in ("hits", "labels"):
-                    conn.execute(
-                        f"DELETE FROM {table} WHERE snapshot_id = ?", (row["id"],)
-                    )
+                # The templated-body hit quotes nothing but a hash, and it
+                # is how classify finds an older snapshot whose penalty may
+                # have to come off again, so that one hit stays
+                conn.execute(
+                    "DELETE FROM hits WHERE snapshot_id = ? AND rule != ?",
+                    (row["id"], TEMPLATED_RULE),
+                )
+                conn.execute("DELETE FROM labels WHERE snapshot_id = ?", (row["id"],))
+                # The scores were made from the old text. classify only
+                # scores a page again when its mark is gone, so the mark
+                # goes in the same transaction as the first rewrite
+                set_classify_mark(conn, None)
         conn.commit()
         log(f"{counts['snapshots']:,} snapshots read, {counts['changed']:,} changed")
     counts["pages"] = len(pages)

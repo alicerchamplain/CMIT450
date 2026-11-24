@@ -5,18 +5,27 @@ Hello pages (the Hello-10-17-154 fixture and title shapes from the night-1
 database, held_out = 0). Nothing here reads a held-out page from known.txt.
 """
 
+import ast
 import hashlib
 import json
+import shutil
+import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
 
+import graphwatch.classify
 from graphwatch.classify import (
+    CODE,
+    SCORING_FILES,
     body_hash,
     body_of,
     classify_page,
     computed_rules,
+    fingerprint,
     link_targets,
+    scoring_code,
     templated_hashes,
 )
 from graphwatch.rules import (
@@ -377,3 +386,52 @@ def test_a_lure_with_hyperlinked_text_gets_the_file_link_and_not_prose():
     labels = labels_for(category_scores(hits))
     assert "malware_delivery" in labels
     assert "prose" not in labels
+
+
+# --- the fingerprint: what tells classify that the stored scores are still good ---
+
+
+def test_the_fingerprint_covers_the_threshold_the_versions_and_every_file_a_score_is_worked_out_by(tmp_path, monkeypatch):
+    assert fingerprint(4) == fingerprint(4)
+    assert fingerprint(5) != fingerprint(4)
+    assert fingerprint(4, "other code") != fingerprint(4)
+    # A Python or Unicode upgrade changes what a pattern matches
+    before = fingerprint(4)
+    monkeypatch.setattr(sys, "version", sys.version + " rebuilt")
+    assert fingerprint(4) != before
+    monkeypatch.undo()
+    monkeypatch.setattr(unicodedata, "unidata_version", "1.0.0")
+    assert fingerprint(4) != before
+    monkeypatch.undo()
+    # The code is what this process loaded: read once, and above the imports
+    # that load it, so that a deploy in between can only make it too old
+    package = Path(graphwatch.classify.__file__).parent
+    assert CODE == scoring_code(package)
+    source = (package / "classify.py").read_text(encoding="utf-8")
+    assert 0 < source.index("\nCODE = scoring_code(") < source.index("\nfrom graphwatch.")
+    # Which files a score is worked out by is read off the imports, starting
+    # from classify.py: a module imported there tomorrow has to be listed too
+    found, to_read = set(), ["classify"]
+    while to_read:
+        name = to_read.pop()
+        if name in found:
+            continue
+        found.add(name)
+        for node in ast.walk(ast.parse((package / f"{name}.py").read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("graphwatch."):
+                to_read.append(node.module.split(".")[1])
+            elif isinstance(node, ast.Import):
+                to_read += [alias.name.split(".")[1] for alias in node.names if alias.name.startswith("graphwatch.")]
+    assert {f"{name}.py" for name in found} == set(SCORING_FILES)
+    # One changed byte in any of them is other code. The files are copied
+    # first: the test never writes to the package.
+    for name in SCORING_FILES:
+        shutil.copy(package / name, tmp_path / name)
+    same = scoring_code(tmp_path)
+    assert same == CODE
+    for name in SCORING_FILES:
+        with (tmp_path / name).open("a", encoding="utf-8") as copy:
+            copy.write("# a comment\n")
+        changed = scoring_code(tmp_path)
+        assert changed != same, name
+        same = changed

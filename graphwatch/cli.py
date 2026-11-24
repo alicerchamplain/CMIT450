@@ -1,18 +1,20 @@
 """Command line interface: python -m graphwatch.cli <command> [options]"""
 
 import argparse
+import os
 import sys
 import time
+import uuid
 from collections import Counter
 from datetime import UTC, date, datetime
 from pathlib import Path
 from sqlite3 import Connection, Row
 
 from graphwatch.classify import (
+    TEMPLATED_RULE,
+    Scorer,
     body_hash,
-    classify_page,
-    computed_rules,
-    link_targets,
+    fingerprint,
     templated_hashes,
 )
 from graphwatch.config import CONFIG, hmac_key, load_config
@@ -29,16 +31,21 @@ from graphwatch.crowd import (
 )
 from graphwatch.db import (
     cached_feeds,
+    classify_mark,
     connect,
     delete_stale_indicators,
     release_indicator_to_file,
     explain_rows,
+    finish_classify_mark,
     http_logger,
     indicator_rows,
     label_rows,
     latest_snapshots,
+    live_older_snapshots,
     load_progress,
     mark_gone,
+    newest_label_counts,
+    newest_score_counts,
     parse_path,
     refresh_snapshot,
     resweep_cost,
@@ -47,10 +54,13 @@ from graphwatch.db import (
     save_lookup,
     save_progress,
     save_score,
+    set_classify_mark,
+    snapshots_by_id,
     stale_pages,
+    stale_templated_snapshots,
     store_fetch,
     store_meta,
-    superseded_flagged_snapshots,
+    unscored_newest_snapshots,
     upsert_indicator,
     upsert_title,
 )
@@ -71,16 +81,7 @@ from graphwatch.feeds import (
     failure_kind,
     feed_keys,
 )
-from graphwatch.rules import (
-    CATEGORIES,
-    RULES,
-    THRESHOLD,
-    body_of,
-    category_scores,
-    labels_for,
-    primary_label,
-    score,
-)
+from graphwatch.rules import CATEGORIES, RULES, THRESHOLD, body_of
 from graphwatch.slugify import (
     Entry,
     WordlistsChanged,
@@ -93,6 +94,8 @@ from graphwatch.sweep import sweep_day
 from graphwatch.telegraph import Ahead, BudgetExceeded, Fetch, Outcome, Pool, TelegraphClient
 
 CLASSIFY_BATCH = 1000
+# Scoring is CPU work: a process per CPU, and no more than a few
+CLASSIFY_WORKERS = min(4, os.cpu_count() or 1)
 
 
 def require_key(path: Path) -> bytes:
@@ -476,23 +479,15 @@ def snapshot_batches(conn: Connection, content: bool = True):
         after_page_id = rows[-1]["page_id"]
 
 
-def run_classify(conn: Connection, threshold: int = THRESHOLD, log=print) -> dict:
-    """Function to score the newest snapshot of every page and store the result
+def classify_counts(conn: Connection, threshold: int) -> dict:
+    """The counts classify logs, read from the stored score of every page's newest snapshot
 
-    Two passes over the snapshots. The first finds the templated bodies, which
-    needs every page; the second scores each page and saves its hits. Makes no
-    network requests.
-
-    Both passes read a batch of pages, finish reading, and only then work on
-    it, and the second writes a batch's results in one short transaction.
-    The ten-minute re-poll writes to the same file: it has to be able to get
-    its turn between two batches, and classify has to be able to wait for it.
+    They are read back and not added up while scoring, because most nights
+    most pages are not scored: they keep the score they have.
 
     Args:
         conn (Connection): SQL db connection
-        threshold (int, optional): flag at this score or above. Defaults to
-            THRESHOLD.
-        log (optional): Logging function. Defaults to print.
+        threshold (int): a page under it with a score above 0 is a near miss
 
     Returns:
         dict: pages, flagged and near_miss count the sweep's pages by their
@@ -500,19 +495,8 @@ def run_classify(conn: Connection, threshold: int = THRESHOLD, log=print) -> dic
             set; scores is a Counter of sweep pages per resolver score.
             labelled, primary and category_near_miss are Counters of sweep
             pages per category, and unlabelled is the sweep pages with no
-            label at all. rescored is how many older snapshots of flagged
-            pages were scored again.
+            label at all.
     """
-
-    def body_text(row) -> str:
-        return body_of(row["title"], row["description"], row["text"])
-
-    pairs = (
-        (body_hash(body_text(row)), row["title"])
-        for batch in snapshot_batches(conn, content=False)
-        for row in batch
-    )
-    templated = templated_hashes(pairs)
     counts = {
         "pages": 0,
         "flagged": 0,
@@ -524,86 +508,157 @@ def run_classify(conn: Connection, threshold: int = THRESHOLD, log=print) -> dic
         "primary": Counter(),
         "category_near_miss": Counter(),
         "unlabelled": 0,
-        "rescored": 0,
     }
+    for row in newest_score_counts(conn):
+        pages = row["pages"]
+        if row["held_out"]:
+            counts["held_out"] += pages
+            if row["flagged"]:
+                counts["held_out_flagged"] += pages
+            continue
+        counts["pages"] += pages
+        if row["flagged"]:
+            counts["flagged"] += pages
+        if 0 < row["score"] < threshold:
+            counts["near_miss"] += pages
+        counts["scores"][row["score"]] += pages
+    with_a_label = 0
+    for row in newest_label_counts(conn):
+        pages = row["pages"]
+        if row["assigned"]:
+            counts["labelled"][row["category"]] += pages
+        elif row["positive"]:
+            counts["category_near_miss"][row["category"]] += pages
+        if row["is_primary"]:
+            # One primary label a page, so these add up to the labelled pages
+            counts["primary"][row["category"]] += pages
+            with_a_label += pages
+    counts["unlabelled"] = counts["pages"] - with_a_label
+    return counts
+
+
+def run_classify(
+    conn: Connection,
+    threshold: int = THRESHOLD,
+    log=print,
+    workers: int = 1,
+    full: bool = False,
+) -> dict:
+    """Function to score the pages whose score may have changed and store the result
+
+    A page's score depends on its newest snapshot, on the rules, and on
+    whether its body is a template tonight (three titles sharing one body).
+    So on an ordinary night only three kinds of snapshot are scored:
+
+    - a page's newest snapshot that has no score yet: a new page, or one a
+      re-poll found changed;
+    - a scored snapshot whose templated-body hit no longer agrees with
+      tonight's templates (see db.stale_templated_snapshots);
+    - nothing else. Every other page keeps the rows it has.
+
+    Every page is scored, as it was each night until 24 November, when the
+    stored mark is not this code's fingerprint (see classify.fingerprint): on
+    the first run, after a change to the rules or the threshold, after
+    reredact, after a run that was cut short, and when full is asked for.
+    Such a run ends by scoring again the older snapshots that
+    db.live_older_snapshots lists. Either way the stored rows come out the
+    same; test_cli checks the two against each other.
+
+    The first pass finds the templated bodies, which needs every page, and
+    reads no content. Every read is of a batch that is read whole before it
+    is worked on, and a batch's results are written in one short
+    transaction. The ten-minute re-poll writes to the same file: it has to be
+    able to get its turn between two batches, and classify has to be able to
+    wait for it. Makes no network requests.
+
+    Args:
+        conn (Connection): SQL db connection
+        threshold (int, optional): flag at this score or above. Defaults to
+            THRESHOLD.
+        log (optional): Logging function. Defaults to print.
+        workers (int, optional): how many processes score. Defaults to 1,
+            this process and no other.
+        full (bool, optional): True scores every page whatever the stored
+            fingerprint says. Defaults to False.
+
+    Returns:
+        dict: the counts of classify_counts, over every page and not only
+            the ones scored in this run, and: templated, how many bodies are
+            templates; scored, how many newest snapshots this run scored;
+            rescored, how many older ones; full, whether every page was
+            scored.
+    """
+
+    def body_text(row) -> str:
+        return body_of(row["title"], row["description"], row["text"])
+
+    mark = fingerprint(threshold)
+    full = full or classify_mark(conn) != mark
+    pairs = (
+        (body_hash(body_text(row)), row["title"])
+        for batch in snapshot_batches(conn, content=False)
+        for row in batch
+    )
+    templated = templated_hashes(pairs)
     ts = time.time()
 
-    def scored(row) -> tuple:
-        """Everything classify stores for one snapshot, worked out with no write open"""
-        body = body_text(row)
-        digest = body_hash(body)
-        # The addresses behind the page's links, which its text does not show
-        links = link_targets(row["content"], row["text"])
-        computed = computed_rules(body, digest if digest in templated else None, links)
-        hits = classify_page(
-            row["title"], row["description"], row["text"], computed, links=links
-        )
-        # The resolver verdict, as before the categories existed
-        total = score(hits)
-        stored_hits = [
-            (hit.rule.name, hit.rule.weight, hit.evidence, hit.matches) for hit in hits
+    def score_and_store(scorer: Scorer, rows: list[Row]) -> int:
+        """Scores one batch with nothing open, then writes it and commits"""
+        items = [
+            (
+                row["snapshot_id"],
+                row["page_id"],
+                row["title"],
+                row["description"],
+                row["text"],
+                row["content"],
+            )
+            for row in rows
         ]
-        by_category = category_scores(hits)
-        labels = labels_for(by_category, threshold)
-        primary = primary_label(labels)
-        # A category that scored 0 gets no row, so a row with assigned = 0
-        # is a near miss or an excluded page
-        stored_labels = [
-            (category, value, category in labels, category == primary)
-            for category, value in by_category.items()
-            if value != 0
-        ]
-        return total, digest, stored_hits, by_category, labels, primary, stored_labels
-
-    def save(row, result) -> None:
-        total, digest, stored_hits, _by_category, _labels, _primary, stored_labels = result
-        save_score(
-            conn,
-            row["snapshot_id"],
-            row["page_id"],
-            total,
-            total >= threshold,
-            digest,
-            stored_hits,
-            ts,
-        )
-        save_labels(conn, row["snapshot_id"], row["page_id"], stored_labels)
-
-    for batch in snapshot_batches(conn):
-        results = [scored(row) for row in batch]
+        results = scorer.score(items)
         # Only now is anything written, and the commit follows at once
-        for row, result in zip(batch, results):
-            save(row, result)
+        for snapshot_id, page_id, total, flagged, digest, hits, labels in results:
+            save_score(conn, snapshot_id, page_id, total, flagged, digest, hits, ts)
+            save_labels(conn, snapshot_id, page_id, labels)
         conn.commit()
-        for row, result in zip(batch, results):
-            total, _digest, _hits, by_category, labels, primary, _stored = result
-            flagged = total >= threshold
-            if row["held_out"]:
-                counts["held_out"] += 1
-                counts["held_out_flagged"] += flagged
-                continue
-            counts["pages"] += 1
-            counts["flagged"] += flagged
-            counts["near_miss"] += 0 < total < threshold
-            counts["scores"][total] += 1
-            for category, value in by_category.items():
-                if category in labels:
-                    counts["labelled"][category] += 1
-                elif value > 0:
-                    counts["category_near_miss"][category] += 1
-            if primary is None:
-                counts["unlabelled"] += 1
-            else:
-                counts["primary"][primary] += 1
-    # The older snapshots that hold a flagged score are scored again too, so
-    # that a flag from an earlier rule table does not outlive the rule. They
-    # are not counted: every count above is of each page's newest snapshot.
-    older = superseded_flagged_snapshots(conn)
-    results = [scored(row) for row in older]
-    for row, result in zip(older, results):
-        save(row, result)
-        counts["rescored"] += 1
-    conn.commit()
+        return len(rows)
+
+    def by_id(scorer: Scorer, snapshot_ids: list[int]) -> int:
+        done = 0
+        for start in range(0, len(snapshot_ids), CLASSIFY_BATCH):
+            rows = snapshots_by_id(conn, snapshot_ids[start : start + CLASSIFY_BATCH])
+            done += score_and_store(scorer, rows)
+        return done
+
+    scored = 0
+    with Scorer(templated, threshold, workers) as scorer:
+        if full:
+            # Until this run ends the table is part old scores and part new.
+            # So the mark goes first, and this run's own token takes its
+            # place: a run that is cut short is not a complete one
+            token = f"running:{uuid.uuid4().hex}"
+            set_classify_mark(conn, token)
+            conn.commit()
+            for batch in snapshot_batches(conn):
+                scored += score_and_store(scorer, batch)
+            older = live_older_snapshots(conn, TEMPLATED_RULE, threshold)
+        else:
+            stale = stale_templated_snapshots(conn, templated, TEMPLATED_RULE)
+            older = [snapshot_id for snapshot_id, is_older in stale if is_older]
+            newest = set(unscored_newest_snapshots(conn))
+            newest.update(snapshot_id for snapshot_id, is_older in stale if not is_older)
+            scored = by_id(scorer, sorted(newest))
+        # The older snapshots are not counted as pages: every count below is
+        # of each page's newest snapshot
+        rescored = by_id(scorer, older)
+    if full:
+        # The token is traded for the fingerprint only if it is still there
+        complete = finish_classify_mark(conn, token, mark)
+        conn.commit()
+        if not complete:
+            log("the mark was cleared while classify ran: the next run scores every page again")
+    counts = classify_counts(conn, threshold)
+    counts.update(templated=len(templated), scored=scored, rescored=rescored, full=full)
     log(
         f"classified {counts['pages']:,} pages at threshold {threshold}: "
         f"{counts['flagged']:,} flagged, {counts['near_miss']:,} near misses, "
@@ -619,6 +674,13 @@ def run_classify(conn: Connection, threshold: int = THRESHOLD, log=print) -> dic
         )
     share = counts["unlabelled"] / counts["pages"] if counts["pages"] else 0
     log(f"  {'unlabelled':<20} {counts['unlabelled']:>18,} ({share:.1%} of pages)")
+    if full:
+        log(f"scored every page: {scored:,} snapshots, and {rescored:,} older ones again")
+    else:
+        log(
+            f"scored {scored:,} new or changed snapshots, and {rescored:,} older ones again; "
+            "every other page kept its score"
+        )
     return counts
 
 
@@ -937,6 +999,17 @@ def parse_args(argv: list[str]):
     classify.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
     classify.add_argument("--threshold", type=int, default=THRESHOLD)
     classify.add_argument(
+        "--workers",
+        type=int,
+        default=CLASSIFY_WORKERS,
+        help="processes that score; the default is one per CPU, up to 4",
+    )
+    classify.add_argument(
+        "--full",
+        action="store_true",
+        help="score every page again, not only the new and changed ones",
+    )
+    classify.add_argument(
         "--explain", metavar="PATH", help="show one page's stored score and hits"
     )
     enrich = sub.add_parser("enrich", help="look indicators up in the public feeds")
@@ -973,6 +1046,10 @@ def main(argv: list[str] | None = None):
         raise SystemExit("--days has to be 1 or more")
     if getattr(args, "workers", 1) < 1:
         raise SystemExit("--workers has to be 1 or more")
+    if args.command == "classify" and args.threshold < 1:
+        # At 0 a page with no hit at all would be flagged, and the re-poll
+        # would fetch every page there is
+        raise SystemExit("--threshold has to be 1 or more")
     if args.command == "freeze":
         run_freeze(args.wordlists, log=lambda s: print(s, flush=True))
         return
@@ -983,7 +1060,13 @@ def main(argv: list[str] | None = None):
             run_explain(conn, args.explain, log=lambda s: print(s, flush=True))
             return
         started = time.time()
-        counts = run_classify(conn, args.threshold, log=lambda s: print(s, flush=True))
+        counts = run_classify(
+            conn,
+            args.threshold,
+            log=lambda s: print(s, flush=True),
+            workers=args.workers,
+            full=args.full,
+        )
         for value, pages in sorted(counts["scores"].items()):
             print(f"  score {value:+d}: {pages:,}", flush=True)
         print(f"{time.time() - started:.0f}s", flush=True)

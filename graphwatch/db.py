@@ -112,6 +112,16 @@ CREATE TABLE IF NOT EXISTS scores (
 );
 CREATE INDEX IF NOT EXISTS scores_page ON scores (page_id);
 CREATE INDEX IF NOT EXISTS scores_score ON scores (score);
+-- The flagged scores only, a few hundred rows of several hundred thousand:
+-- the re-poll's list and classify's older snapshots are found from here
+CREATE INDEX IF NOT EXISTS scores_flagged ON scores (page_id) WHERE flagged = 1;
+
+CREATE TABLE IF NOT EXISTS classify_state (
+    -- one row, key 'fingerprint': the rules and code of the last classify
+    -- run that scored every page to the end. No row means no such run
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS hits (
     id          INTEGER PRIMARY KEY,
@@ -691,9 +701,10 @@ def _resweep_where(
     if flagged:
         # Any snapshot ever flagged: the actor edits pages in place, so a
         # page that stopped looking like a resolver is still one to watch
-        clauses.append(
-            "EXISTS (SELECT 1 FROM scores sc WHERE sc.page_id = p.id AND sc.flagged = 1)"
-        )
+        # IN and not EXISTS: SQLite reads the few flagged scores once and
+        # looks each up in pages. With EXISTS it walked every page and asked
+        # the scores about each, ten seconds for a list of 197
+        clauses.append("p.id IN (SELECT page_id FROM scores WHERE flagged = 1)")
     if match is not None:
         clauses.append(
             """instr((
@@ -895,34 +906,267 @@ def latest_snapshots(
     return conn.execute(sql, params)
 
 
-def superseded_flagged_snapshots(conn: Connection) -> list[sqlite3.Row]:
-    """Function to read the older snapshots that hold a flagged score
+# The id of a page's newest snapshot, as a subquery: NEWEST.format("p.id").
+# snapshots_page_time answers it from the index, without reading a snapshot
+NEWEST = """(
+        SELECT id FROM snapshots WHERE page_id = {}
+        ORDER BY fetched_at DESC, id DESC LIMIT 1
+    )"""
 
-    latest_snapshots gives the classifier each page's newest snapshot. An
-    older snapshot keeps whatever score it got on the night it was the
-    newest, under that night's rules. "Has this page ever been flagged" is
-    read from those rows, by the re-poll and by enrichment, so the ones that
-    say yes have to be scored again under today's rules. An older snapshot
-    with no score, or with a score that is not flagged, cannot make a page
-    flagged and is left alone; that is most of them once a page is polled
-    every ten minutes.
+
+# The id of a page's newest snapshot that has a score. After a classify run
+# that is the page's newest snapshot, unless the re-poll stored a newer one
+# while the run was under way: the page is then counted by the snapshot that
+# was scored, and not left out
+NEWEST_SCORED = """(
+        SELECT s.id FROM snapshots s JOIN scores scored ON scored.snapshot_id = s.id
+        WHERE s.page_id = {}
+        ORDER BY s.fetched_at DESC, s.id DESC LIMIT 1
+    )"""
+
+
+def classify_mark(conn: Connection) -> str | None:
+    """Function to read the fingerprint of the last complete classify run
 
     Args:
         conn (Connection): SQL db connection
 
     Returns:
-        list[sqlite3.Row]: rows of snapshot_id, page_id, title, description,
-            text and content, for snapshots that are not their page's newest
+        str | None: what set_classify_mark stored, or None if no run that
+            scored every page has finished since the mark was last cleared
+    """
+    row = conn.execute(
+        "SELECT value FROM classify_state WHERE key = 'fingerprint'"
+    ).fetchone()
+    return row["value"] if row else None
+
+
+def set_classify_mark(conn: Connection, fingerprint: str | None) -> None:
+    """Function to replace the classify mark, or clear it
+
+    The stored scores are only as good as the rules and the snapshot text
+    they were worked out from. Whatever changes either one behind classify's
+    back clears the mark (None), and the next classify scores every page
+    again. Does not commit.
+
+    Args:
+        conn (Connection): SQL db connection
+        fingerprint (str | None): the rules and code every stored score was
+            made with; or the token of a run that is scoring every page now
+            (see finish_classify_mark); or None when neither is known
+    """
+    conn.execute("DELETE FROM classify_state WHERE key = 'fingerprint'")
+    if fingerprint is not None:
+        conn.execute(
+            "INSERT INTO classify_state (key, value) VALUES ('fingerprint', ?)",
+            (fingerprint,),
+        )
+
+
+def finish_classify_mark(conn: Connection, token: str, fingerprint: str) -> bool:
+    """Function to store a run's fingerprint if the mark is still that run's token
+
+    A run that scores every page puts its own token in the mark's place
+    first and trades it for the fingerprint here, at its end. If the mark
+    was cleared in between (reredact rewrote snapshots this run had already
+    scored) or another run put its token there, the trade does not happen and
+    the next run scores every page again. Does not commit.
+
+    Args:
+        conn (Connection): SQL db connection
+        token (str): what this run stored with set_classify_mark when it began
+        fingerprint (str): the rules and code the run scored with
+
+    Returns:
+        bool: True if the fingerprint is the mark now
+    """
+    sql = "UPDATE classify_state SET value = ? WHERE key = 'fingerprint' AND value = ?"
+    return conn.execute(sql, (fingerprint, token)).rowcount == 1
+
+
+def unscored_newest_snapshots(conn: Connection) -> list[int]:
+    """Function to list the pages' newest snapshots that have no score yet
+
+    These are the pages the sweep stored since the last classify run and the
+    pages a re-poll found changed. A snapshot a later one has already
+    replaced is not listed: classify has only ever scored the snapshot that
+    is a page's newest on the night it runs.
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        list[int]: snapshot ids, lowest first
+    """
+    sql = f"""
+    SELECT n.snapshot_id FROM (
+        SELECT {NEWEST.format("p.id")} AS snapshot_id FROM pages p
+    ) n
+    WHERE n.snapshot_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM scores sc WHERE sc.snapshot_id = n.snapshot_id)
+    ORDER BY n.snapshot_id
+    """
+    return [row["snapshot_id"] for row in conn.execute(sql).fetchall()]
+
+
+def live_older_snapshots(conn: Connection, templated_rule: str, threshold: int) -> list[int]:
+    """Function to list the older snapshots whose score classify keeps up to date
+
+    latest_snapshots gives the classifier each page's newest snapshot. An
+    older snapshot keeps the score it got on the night it was the newest.
+    "Has this page ever been flagged" is read from those rows, by the re-poll
+    and by enrichment, so two kinds of older row are scored again whenever
+    every page is:
+
+    - a row that is flagged, so that a flag from an earlier rule table does
+      not outlive the rule;
+    - a row that holds the templated-body hit. That hit takes points off, and
+      a body stops being a template when the pages that shared it change. A
+      row that lost its flag to the penalty has to be able to get it back;
+    - a row that is not flagged although its score reaches the threshold. A
+      run at a higher threshold left it so, and it has to be able to come
+      back as well.
+
+    An older snapshot with no score, or with a score that is none of these,
+    cannot make a page flagged and is left alone; that is most of them once
+    a page is polled every ten minutes.
+
+    Args:
+        conn (Connection): SQL db connection
+        templated_rule (str): the name of the templated-body rule in hits
+        threshold (int): the score a page is flagged at in this run
+
+    Returns:
+        list[int]: ids of snapshots that are not their page's newest, lowest
+            first
+    """
+    sql = f"""
+    WITH live AS (
+        SELECT snapshot_id, page_id FROM scores WHERE flagged = 1
+        UNION
+        SELECT sc.snapshot_id, sc.page_id FROM hits h
+        JOIN scores sc ON sc.snapshot_id = h.snapshot_id
+        WHERE h.rule = ?
+        UNION
+        SELECT snapshot_id, page_id FROM scores WHERE flagged = 0 AND score >= ?
+    )
+    SELECT snapshot_id FROM live
+    WHERE snapshot_id != {NEWEST.format("live.page_id")}
+    ORDER BY snapshot_id
+    """
+    rows = conn.execute(sql, (templated_rule, threshold)).fetchall()
+    return [row["snapshot_id"] for row in rows]
+
+
+def stale_templated_snapshots(
+    conn: Connection, templated: set[str], templated_rule: str
+) -> list[tuple[int, bool]]:
+    """Function to list the scored snapshots whose templated-body hit is out of date
+
+    A body is a template while three titles share it, which is a fact about
+    every page and not about one. So a page's score can change on a night the
+    page did not: its body became a template, or stopped being one. Two kinds
+    of row are out of date:
+
+    - the row holds the hit and its body is not a template tonight;
+    - the row's body is a template tonight and the row does not hold the hit.
+      Only a page's newest snapshot and a flagged older one are listed here:
+      the penalty cannot make any other older row matter (see
+      live_older_snapshots).
+
+    Args:
+        conn (Connection): SQL db connection
+        templated (set[str]): tonight's templated body hashes
+        templated_rule (str): the name of the templated-body rule in hits
+
+    Returns:
+        list[tuple[int, bool]]: (snapshot id, True if it is not its page's
+            newest snapshot), lowest id first
+    """
+    older = f"sc.snapshot_id != {NEWEST.format('sc.page_id')}"
+    tonight = "(SELECT value FROM json_each(?))"
+    params = (json.dumps(sorted(templated)), templated_rule)
+    no_longer = f"""
+    SELECT sc.snapshot_id, {older} AS older
+    FROM hits h JOIN scores sc ON sc.snapshot_id = h.snapshot_id
+    WHERE (sc.body_sha256 IS NULL OR sc.body_sha256 NOT IN {tonight})
+      AND h.rule = ?
+    """
+    newly = f"""
+    SELECT sc.snapshot_id, {older} AS older
+    FROM scores sc
+    WHERE sc.body_sha256 IN {tonight}
+      AND NOT EXISTS (
+          SELECT 1 FROM hits h WHERE h.snapshot_id = sc.snapshot_id AND h.rule = ?
+      )
+      AND (sc.flagged = 1 OR NOT ({older}))
+    """
+    found = {}
+    for sql in (no_longer, newly):
+        for row in conn.execute(sql, params).fetchall():
+            found[row["snapshot_id"]] = bool(row["older"])
+    return sorted(found.items())
+
+
+def snapshots_by_id(conn: Connection, snapshot_ids: list[int]) -> list[sqlite3.Row]:
+    """Function to read a batch of snapshots for the classifier, by id
+
+    Args:
+        conn (Connection): SQL db connection
+        snapshot_ids (list[int]): the snapshots to read
+
+    Returns:
+        list[sqlite3.Row]: the rows latest_snapshots gives (snapshot_id,
+            page_id, path, held_out, title, description, text and content),
+            lowest snapshot id first
     """
     sql = """
-    SELECT s.id AS snapshot_id, s.page_id, s.title, s.description, s.text, s.content
-    FROM snapshots s
-    JOIN scores sc ON sc.snapshot_id = s.id AND sc.flagged = 1
-    WHERE s.id != (
-        SELECT id FROM snapshots WHERE page_id = s.page_id
-        ORDER BY fetched_at DESC, id DESC LIMIT 1
-      )
+    SELECT s.id AS snapshot_id, p.id AS page_id, p.path, p.held_out,
+           s.title, s.description, s.text, s.content
+    FROM snapshots s JOIN pages p ON p.id = s.page_id
+    WHERE s.id IN (SELECT value FROM json_each(?))
     ORDER BY s.id
+    """
+    return conn.execute(sql, (json.dumps(snapshot_ids),)).fetchall()
+
+
+def newest_score_counts(conn: Connection) -> list[sqlite3.Row]:
+    """Function to count the pages by the stored score of their newest scored snapshot
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        list[sqlite3.Row]: rows of held_out, score, flagged and pages, the
+            number of pages with that combination. A page with no scored
+            snapshot at all is in no row.
+    """
+    sql = f"""
+    SELECT p.held_out, sc.score, sc.flagged, COUNT(*) AS pages
+    FROM pages p JOIN scores sc ON sc.snapshot_id = {NEWEST_SCORED.format("p.id")}
+    GROUP BY p.held_out, sc.score, sc.flagged
+    """
+    return conn.execute(sql).fetchall()
+
+
+def newest_label_counts(conn: Connection) -> list[sqlite3.Row]:
+    """Function to count the sweep's pages by the stored labels of their newest scored snapshot
+
+    Held-out pages are left out, as they are from every count but their own.
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        list[sqlite3.Row]: rows of category, assigned, is_primary, positive
+            (1 when the category's score is above 0) and pages
+    """
+    sql = f"""
+    SELECT l.category, l.assigned, l.is_primary, l.score > 0 AS positive,
+           COUNT(*) AS pages
+    FROM pages p JOIN labels l ON l.snapshot_id = {NEWEST_SCORED.format("p.id")}
+    WHERE p.held_out = 0
+    GROUP BY l.category, l.assigned, l.is_primary, positive
     """
     return conn.execute(sql).fetchall()
 
