@@ -2,8 +2,11 @@
 
 import json
 import re
+import threading
 import time
 import urllib.parse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -231,12 +234,20 @@ class BudgetExceeded(Exception):
     """Raised by TelegraphClient.get_page when the request budget is spent"""
 
 
+class PoolClosed(Exception):
+    """Raised inside a call whose Pool was closed while it still had requests to make"""
+
+
 class TelegraphClient:
     """Paced, allowlisted, read-only client for Telegraph's getPage method
 
     Every request goes through get_page, which is the only place in the
     package that touches the network. The clock, sleep function, session and
     log sink are all injectable so tests can run without waiting or connecting.
+
+    The client may be used from several threads at once (see Pool). However
+    many there are, requests start one after another, a slot apart, and the
+    budget is counted once.
     """
 
     def __init__(
@@ -250,6 +261,7 @@ class TelegraphClient:
         user_agent: str = "graphwatch",
         retries: int = 2,
         backoff_s: float = 1.0,
+        workers: int = 1,
     ):
         """Stores the client settings and creates a requests.Session if none was given
 
@@ -263,10 +275,26 @@ class TelegraphClient:
             user_agent (str, optional): User-Agent header sent with every request. Defaults to "graphwatch".
             retries (int, optional): how many more attempts get_page makes after a FAILED outcome. Defaults to 2.
             backoff_s (float, optional): wait before the first retry, in seconds; doubles each retry. Defaults to 1.0.
+            workers (int, optional): how many requests a Pool may have under way at once. With 1 nothing runs
+                on another thread. More than 1 does not raise the rate: it lets the rate be reached when one
+                request takes longer than a slot. Defaults to 1.
         """
+        if workers < 1:
+            raise ValueError("workers has to be 1 or more")
         self.rate_per_s = rate_per_s
         self.budget = budget
-        self.session = session if session is not None else requests.Session()
+        if session is None:
+            session = requests.Session()
+            # One connection for each request that can be under way
+            session.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=max(10, workers)))
+        self.session = session
+        self.workers = workers
+        # Held while a request waits for its slot and is counted, so the
+        # threads of a Pool start their requests one at a time
+        self._turn = threading.Lock()
+        # On a Pool's thread: the list its log rows are kept in until the
+        # calling thread writes them. Not set on any other thread.
+        self._held = threading.local()
         self.clock = clock
         self.sleep = sleep
         self.log = log
@@ -280,12 +308,21 @@ class TelegraphClient:
         """Blocks until the next request slot opens, then books the slot after it
 
         Slots are 1 / rate_per_s seconds apart. The first call never waits.
+
+        The next slot is counted from when this one opened, not from when
+        the thread woke up: a sleep runs a little long, more so on a busy
+        machine, and counting from the wake-up let every late start push all
+        the later ones back (7.3 a second of 8 on the VPS, 24 November 2026).
+        A slot that nobody took is not saved up: after a pause the next
+        request goes at once and the slots are counted from there, so the
+        requests never come faster than the rate for longer than one sleep
+        ran late.
         """
         now = self.clock()
-        wait = self.next_allowed - now
-        if wait > 0:
-            self.sleep(wait)
-        self.next_allowed = self.clock() + 1.0 / self.rate_per_s
+        opens = max(now, self.next_allowed)
+        if opens > now:
+            self.sleep(opens - now)
+        self.next_allowed = opens + 1.0 / self.rate_per_s
 
     def _check_host(self, url: str) -> None:
         """Checks if url is in allowed hosts list
@@ -327,13 +364,19 @@ class TelegraphClient:
         Raises:
             BudgetExceeded: if requests_made has reached budget; nothing is sent
         """
-        if self.budget is not None and self.requests_made >= self.budget:
-            raise BudgetExceeded(
-                f"Requests Made:{self.requests_made}, Budget:{self.budget}"
-            )
-
-        self._wait_turn()
-        self.requests_made += 1
+        with self._turn:
+            closing = getattr(self._held, "closing", None)
+            if closing is not None and closing.is_set():
+                # On a Pool's thread, and the caller has stopped: a call of
+                # many requests, a whole crowd count, ends here and not at
+                # its last one
+                raise PoolClosed("the pool was closed")
+            if self.budget is not None and self.requests_made >= self.budget:
+                raise BudgetExceeded(
+                    f"Requests Made:{self.requests_made}, Budget:{self.budget}"
+                )
+            self._wait_turn()
+            self.requests_made += 1
         started = self.clock()
         try:
             resp = self.session.get(
@@ -353,20 +396,34 @@ class TelegraphClient:
             error = f"request error: {e}"
         elapsed_ms = int((self.clock() - started) * 1000)
         fetch = Fetch(path, outcome, page, error, status, elapsed_ms)
-        if self.log is not None:
-            self.log(
-                {
-                    "ts": time.time(),
-                    "path": log_path if log_path is not None else path,
-                    "attempt": attempt,
-                    "status": status,
-                    "outcome": outcome.name,
-                    "error": error,
-                    "elapsed_ms": elapsed_ms,
-                    "bytes": len(body),
-                }
-            )
+        self._log_row(
+            {
+                "ts": time.time(),
+                "path": log_path if log_path is not None else path,
+                "attempt": attempt,
+                "status": status,
+                "outcome": outcome.name,
+                "error": error,
+                "elapsed_ms": elapsed_ms,
+                "bytes": len(body),
+            }
+        )
         return fetch
+
+    def _log_row(self, row: dict) -> None:
+        """Writes one log row, or on a Pool's thread keeps it for the calling thread
+
+        The log sink is a database connection in production, and a
+        connection is only used on the thread that opened it.
+
+        Args:
+            row (dict): the log row of one request attempt
+        """
+        held = getattr(self._held, "rows", None)
+        if held is not None:
+            held.append(row)
+        elif self.log is not None:
+            self.log(row)
 
     def get_page(self, path: str, content: bool = True) -> Fetch:
         """Fetches one Telegraph page by path and returns the outcome as a Fetch
@@ -427,3 +484,249 @@ class TelegraphClient:
             if attempt <= self.retries:
                 self.sleep(self.backoff_s * 2 ** (attempt - 1))
         return fetch
+
+
+class Ticket:
+    """A call handed to a Pool, to be exchanged for its result"""
+
+    def __init__(self, call, args, future=None):
+        self.call = call
+        self.args = args
+        self.future = future  # None when the call runs on the calling thread
+
+
+class Pool:
+    """Runs calls that use one TelegraphClient, several at a time
+
+    A request spends most of its time waiting for the answer, about 150 ms
+    from the VPS, which is longer than the 125 ms slot of 8 requests a
+    second: one request at a time cannot reach the rate. With a few under
+    way at once it can. The client still starts them a slot apart and still
+    counts the budget once, so a Pool reaches the rate and never passes it.
+
+    Only the calls leave the calling thread. A call's result, the log rows
+    of its requests and whatever it raised come back through result() on the
+    calling thread, so the database behind the log, and everything a caller
+    does with a result, stays on one thread. With a client of 1 worker no
+    thread is started and each call runs when its result is asked for.
+    """
+
+    def __init__(self, client: TelegraphClient):
+        """Stores the client; threads are started with the first call that needs one
+
+        Args:
+            client (TelegraphClient): the client the calls use; its workers
+                attribute says how many calls may be under way at once
+        """
+        self.client = client
+        self.workers = client.workers
+        self._executor = None
+        self._waiting = []  # tickets whose result has not been handed out
+        self._closing = threading.Event()  # set while close() waits for what is under way
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _run(self, call, args) -> tuple[bool, object, list[dict]]:
+        """On a thread of the pool: makes the call and keeps its log rows
+
+        Returns:
+            tuple[bool, object, list[dict]]: whether it returned, what it
+                returned or raised, and the log rows of its requests
+        """
+        rows = []
+        self.client._held.rows = rows
+        self.client._held.closing = self._closing
+        try:
+            return True, call(*args), rows
+        except Exception as raised:  # noqa: BLE001  raised again on the calling thread
+            return False, raised, rows
+        finally:
+            self.client._held.rows = None
+            self.client._held.closing = None
+
+    def _write(self, rows: list[dict]) -> None:
+        """On the calling thread: writes the log rows a call made"""
+        if self.client.log is not None:
+            for row in rows:
+                self.client.log(row)
+
+    def submit(self, call, *args) -> Ticket:
+        """Hands a call to the pool
+
+        Args:
+            call: the function to call; it may use the client
+            *args: its arguments
+
+        Returns:
+            Ticket: what result() takes
+        """
+        if self.workers == 1:
+            ticket = Ticket(call, args)
+        else:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(self.workers, thread_name_prefix="graphwatch")
+            ticket = Ticket(call, args, self._executor.submit(self._run, call, args))
+        self._waiting.append(ticket)
+        return ticket
+
+    def result(self, ticket: Ticket):
+        """Waits for a call, writes its log rows and returns what it returned
+
+        Args:
+            ticket (Ticket): from submit, not yet used
+
+        Returns:
+            whatever the call returned
+
+        Raises:
+            whatever the call raised, BudgetExceeded included
+        """
+        if ticket.future is None:
+            self._waiting.remove(ticket)
+            return ticket.call(*ticket.args)
+        # The ticket stays in the list until the call is back: if this wait
+        # is interrupted, close() still knows the call and writes its rows
+        returned, value, rows = ticket.future.result()
+        self._waiting.remove(ticket)
+        self._write(rows)
+        if not returned:
+            raise value
+        return value
+
+    def map(self, call, items):
+        """Makes one call per item, several at a time, and gives the results in order
+
+        A few items past the one being handed out are already under way,
+        twice the workers at most, so a caller that stops early has asked
+        for little it did not use. Every call's requests would have been made
+        one by one as well.
+
+        If a call finds the budget spent, no more are started. The results
+        that were already obtained are still handed out, and BudgetExceeded
+        is raised after the last of them.
+
+        Args:
+            call: function of one item
+            items: iterable of items; read only as far as calls are started
+
+        Yields:
+            tuple: (item, result), in the order of items
+
+        Raises:
+            BudgetExceeded: after the last result, if any call raised it
+        """
+        ahead = 1 if self.workers == 1 else self.workers * 2
+        window = deque()
+        spent = None
+        for item in items:
+            window.append((item, self.submit(call, item)))
+            if len(window) < ahead:
+                continue
+            item, ticket = window.popleft()
+            try:
+                value = self.result(ticket)
+            except BudgetExceeded as raised:
+                spent = raised
+                break
+            yield item, value
+        for item, ticket in window:
+            try:
+                value = self.result(ticket)
+            except BudgetExceeded as raised:
+                spent = raised
+                continue
+            yield item, value
+        if spent is not None:
+            raise spent
+
+    def close(self) -> None:
+        """Ends the pool: nothing new starts, and what is under way is waited for
+
+        A call that had not started is dropped and makes no request. One
+        that had makes no further request (its next one raises PoolClosed
+        inside it), is waited for, and its log rows are written, so every
+        request that was sent is in the log; its result is not used.
+        """
+        self._closing.set()
+        waiting, self._waiting = self._waiting, []
+        # Everything that has not started is dropped first: while this
+        # thread waited for one call, the pool's threads would start the next
+        started = [
+            ticket
+            for ticket in waiting
+            if ticket.future is not None and not ticket.future.cancel()
+        ]
+        for ticket in started:
+            _returned, _value, rows = ticket.future.result()
+            self._write(rows)
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        self._closing.clear()
+
+
+class Ahead:
+    """Fetches for a walk that knows some of the paths it is going to ask for
+
+    A walk asks for one path at a time and decides from each answer what to
+    do next, but part of what lies ahead does not depend on the answers.
+    hint() takes those paths and starts fetching them; fetch() hands each
+    one out when the walk gets to it. A path is only ever hinted when the
+    walk is certain to ask for it, so no request is made that the walk
+    would not have made.
+    """
+
+    def __init__(self, pool: Pool, call):
+        """
+        Args:
+            pool (Pool): where the hinted paths are fetched
+            call: function of a path returning a Fetch, such as client.get_page
+        """
+        self.pool = pool
+        self.call = call
+        self.tickets = {}  # path to the ticket of its fetch
+
+    def hint(self, paths) -> None:
+        """Starts fetching paths that fetch() is certain to be asked for
+
+        Args:
+            paths: iterable of paths, in the order they will be asked for;
+                read only while there is room, twice the pool's workers
+        """
+        if self.pool.workers == 1:
+            return
+        room = self.pool.workers * 2 - len(self.tickets)
+        client = self.pool.client
+        if client.budget is not None:
+            # Never more than the budget can still pay for. The threads take
+            # their turns in no fixed order, and a later path must not get
+            # the last request while an earlier one is refused: the walk
+            # would stop at the earlier one and the later page be thrown away.
+            room = min(room, client.budget - client.requests_made - len(self.tickets))
+        for path in paths:
+            if room <= 0:
+                return
+            if path not in self.tickets:
+                self.tickets[path] = self.pool.submit(self.call, path)
+                room -= 1
+
+    def fetch(self, path: str) -> Fetch:
+        """Fetches one path, or hands out the fetch a hint started
+
+        Args:
+            path (str): the path to fetch
+
+        Returns:
+            Fetch: as the call returns it
+
+        Raises:
+            BudgetExceeded: if the budget was spent before this path's request
+        """
+        ticket = self.tickets.pop(path, None)
+        if ticket is None:
+            return self.call(path)
+        return self.pool.result(ticket)

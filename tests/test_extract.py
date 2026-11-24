@@ -335,3 +335,77 @@ def test_benign_fixtures_give_no_pointer_from_the_decoders():
 )
 def test_pointer_kind(pointer, kind):
     assert pointer_kind(pointer) == kind
+
+
+# --------------------------------------------------------------------------
+# the front of a longer name that ends at an @ (23 November)
+# --------------------------------------------------------------------------
+
+# A decoy on an ending the TLD list does not hold. The addresses are made up.
+UNLISTED_DECOY_TITLE = "example.com.ph@agfc.harper18.workers.dev/"
+
+
+def test_the_front_of_a_decoy_on_an_unlisted_ending_is_not_a_host():
+    # The stored text opens with a copy of the title. The title pass takes
+    # the whole decoy; the text pass must not cut "example.com" out of it.
+    text = UNLISTED_DECOY_TITLE + "\n\nHello,+world!"
+    assert pairs(extract(UNLISTED_DECOY_TITLE, text)) == [
+        ("decoy", "example.com.ph"),
+        ("host", "agfc.harper18.workers.dev"),
+    ]
+    # With no title to say it is a decoy, it is still not the name on the
+    # page. Nothing else is reported either: in text the right side of an @
+    # is an email's domain more often than a destination, as before.
+    for alone in (
+        "example.com.ph@agfc.harper18.workers.dev/",
+        "see example.com.ph@agfc.harper18.workers.dev now",
+        "shop.example.co.zw@agfc.harper18.workers.dev",
+        "a.example.com.x1.y2.zz@agfc.harper18.workers.dev",
+    ):
+        assert pairs(body(alone)) == [], alone
+
+
+@pytest.mark.parametrize(
+    "text,hosts",
+    [
+        ("c2.example.org", ["c2.example.org"]),
+        ("visit c2.example.org. Then wait", ["c2.example.org"]),
+        ("c2.example.org.", ["c2.example.org"]),
+        ("c2.example.org and files.example.net", ["c2.example.org", "files.example.net"]),
+        # an @ further on, after something that is not part of the name
+        ("c2.example.org, mail me@example.net", ["c2.example.org"]),
+        # a host with a path, a port or a bracket after it
+        ("c2.example.org/gate.php", ["c2.example.org"]),
+        ("(c2.example.org)", ["c2.example.org"]),
+        # an ending of two labels that the list holds is the whole name
+        ("files.example.com.ua", ["files.example.com.ua"]),
+        # A name on an ending the list does not hold. Its front is another
+        # server, which is not on the page: until 24 November it was reported,
+        # looked up, and came back novel.
+        ("c2.example.org.zz", []),
+        ("c2.example.com.ph is down", []),
+        ("Resolver: c2.example.com.ph", []),
+        ("shop.example.co.za", []),
+        ("see c2.example.com.ph.", []),
+        # and a decoy of more labels than the look ahead for an @ counts, or in capitals
+        ("paypal.com.secure.login.account.verify.id@agfc.harper18.workers.dev", []),
+        ("GOOGLE.COM.PH@agfc.harper18.workers.dev", []),
+        # The same whatever the case, and no shorter front either
+        ("C2.EXAMPLE.COM.PH is down", []),
+        ("C2.Example.Com.Ph", []),
+        ("a.com.Net.zz", []),
+        ("c2.example.org.2nd server", []),
+        # The price: a sentence that lost its space reads as a longer name
+        ("c2.example.org.Then wait", []),
+        ("c2.example.org.then wait", []),
+    ],
+)
+def test_a_host_is_reported_whole_or_not_at_all(text, hosts):
+    assert [value for kind, value in pairs(body(text)) if kind == "host"] == hosts
+
+
+def test_a_long_run_of_labels_is_searched_quickly(laptop_seconds):
+    # The look ahead counts its labels, so a page of them costs no more than the page
+    run = "a.co." * 12_000
+    assert laptop_seconds(lambda: extract("", run)) < 1.0
+    assert laptop_seconds(lambda: extract("", run + "@x.example.org")) < 1.0

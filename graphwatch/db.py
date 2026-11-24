@@ -160,6 +160,26 @@ CREATE TABLE IF NOT EXISTS feed_lookups (
     checked_at   REAL    NOT NULL,
     PRIMARY KEY (indicator_id, feed)
 );
+
+CREATE TABLE IF NOT EXISTS indicator_titles (
+    -- the titles of the flagged pages that hold an indicator: hello for the
+    -- actor's Hello pages, and whatever else the classifier flagged
+    indicator_id INTEGER NOT NULL REFERENCES indicators(id) ON DELETE CASCADE,
+    slug         TEXT    NOT NULL,
+    pages        INTEGER NOT NULL,  -- how many pages of that title hold it
+    PRIMARY KEY (indicator_id, slug)
+);
+
+CREATE TABLE IF NOT EXISTS first_lookups (
+    -- ON DELETE CASCADE: code from before this table existed deletes an
+    -- indicator without knowing of it, and must still be able to
+    indicator_id INTEGER NOT NULL REFERENCES indicators(id) ON DELETE CASCADE,
+    feed         TEXT    NOT NULL,
+    verdict      TEXT    NOT NULL,  -- what the feed said the first time it answered
+    detail       TEXT,
+    checked_at   REAL    NOT NULL,
+    PRIMARY KEY (indicator_id, feed)
+);
 """
 
 
@@ -1043,14 +1063,16 @@ def upsert_indicator(
     first_seen: float | None = None,
     last_seen: float | None = None,
     pages: int = 0,
+    titles: dict[str, int] | None = None,
 ) -> int:
     """Update and insert (upsert) an indicator in the db
 
     A second call for the same kind and value keeps the row and its id, so
     the lookups stored against it stay. A call with source 'pages' sets
-    first_seen, last_seen and pages to what the flagged pages say in this
-    run. A call from a file changes nothing on a row that exists, so an
-    indicator found on pages keeps the source 'pages' and its times.
+    first_seen, last_seen, pages and the titles to what the flagged pages
+    say in this run. A call from a file changes nothing on a row that
+    exists, so an indicator found on pages keeps the source 'pages', its
+    times and its titles.
 
     Args:
         conn (Connection): SQL db connection
@@ -1062,10 +1084,22 @@ def upsert_indicator(
         last_seen (float | None, optional): fetch time of the last snapshot
             that held it. Defaults to None.
         pages (int, optional): how many pages held it. Defaults to 0.
+        titles (dict[str, int] | None, optional): for source 'pages', the
+            slug of each title whose flagged pages hold it and how many of
+            them do. Defaults to None, for none.
 
     Returns:
         int: indicator id
     """
+
+    def set_titles(indicator_id: int) -> None:
+        # What the flagged pages say now replaces what they said last run
+        conn.execute("DELETE FROM indicator_titles WHERE indicator_id = ?", (indicator_id,))
+        conn.executemany(
+            "INSERT INTO indicator_titles (indicator_id, slug, pages) VALUES (?, ?, ?)",
+            [(indicator_id, slug, count) for slug, count in (titles or {}).items()],
+        )
+
     select = "SELECT * FROM indicators WHERE kind = ? AND value = ?"
     existing = conn.execute(select, (kind, value)).fetchone()
     if existing is None:
@@ -1074,6 +1108,8 @@ def upsert_indicator(
         VALUES (?, ?, ?, ?, ?, ?)
         """
         cur = conn.execute(insert, (kind, value, source, first_seen, last_seen, pages))
+        if source == "pages":
+            set_titles(cur.lastrowid)
         conn.commit()
         return cur.lastrowid
     if source != "pages":
@@ -1086,6 +1122,7 @@ def upsert_indicator(
     WHERE id = ?
     """
     conn.execute(update, ("pages", first_seen, last_seen, pages, existing["id"]))
+    set_titles(existing["id"])
     conn.commit()
     return existing["id"]
 
@@ -1095,8 +1132,8 @@ def release_indicator_to_file(conn: Connection, kind: str, value: str, source: s
 
     An indicator that a file names and that a flagged page also held has the
     source 'pages'. When no flagged page holds it any more the file still
-    names it, so it becomes the file's again: no times and no pages, and
-    delete_stale_indicators leaves it alone.
+    names it, so it becomes the file's again: no times, no pages and no
+    titles, and delete_stale_indicators leaves it alone.
 
     Args:
         conn (Connection): SQL db connection
@@ -1104,10 +1141,16 @@ def release_indicator_to_file(conn: Connection, kind: str, value: str, source: s
         value (str): the indicator itself
         source (str): the name of the file that names it
     """
+    held = """
+    DELETE FROM indicator_titles WHERE indicator_id IN (
+        SELECT id FROM indicators WHERE kind = ? AND value = ? AND source = 'pages'
+    )
+    """
     sql = """
     UPDATE indicators SET source = ?, first_seen = NULL, last_seen = NULL, pages = 0
     WHERE kind = ? AND value = ? AND source = 'pages'
     """
+    conn.execute(held, (kind, value))
     conn.execute(sql, (source, kind, value))
     conn.commit()
 
@@ -1129,10 +1172,18 @@ def delete_stale_indicators(conn: Connection, current: set[tuple[str, str]]) -> 
     Returns:
         int: how many indicators were deleted, with their stored lookups
     """
+    # A title belongs to an indicator that pages hold. Code from before the
+    # titles were kept gives an indicator back to its file and leaves them
+    conn.execute(
+        "DELETE FROM indicator_titles WHERE indicator_id IN "
+        "(SELECT id FROM indicators WHERE source != 'pages')"
+    )
     rows = conn.execute("SELECT id, kind, value FROM indicators WHERE source = 'pages'").fetchall()
     stale = [row["id"] for row in rows if (row["kind"], row["value"]) not in current]
     for indicator_id in stale:
         conn.execute("DELETE FROM feed_lookups WHERE indicator_id = ?", (indicator_id,))
+        conn.execute("DELETE FROM first_lookups WHERE indicator_id = ?", (indicator_id,))
+        conn.execute("DELETE FROM indicator_titles WHERE indicator_id = ?", (indicator_id,))
         conn.execute("DELETE FROM indicators WHERE id = ?", (indicator_id,))
     conn.commit()
     return len(stale)
@@ -1148,8 +1199,10 @@ def save_lookup(
 ) -> None:
     """Function to store what one feed said about one indicator
 
-    A second call for the same indicator and feed replaces the first, which
-    is what --refresh is for.
+    A second call for the same indicator and feed replaces the first in
+    feed_lookups, which is what --refresh and the recheck are for. The first
+    answer stays in first_lookups: what a feed knew when the indicator was
+    found is what Novelty measures, and a later answer must not write over it.
 
     Args:
         conn (Connection): SQL db connection
@@ -1167,22 +1220,58 @@ def save_lookup(
     detail     = excluded.detail,
     checked_at = excluded.checked_at
     """
+    # An answer stored before first_lookups existed is the first answer
+    keep_stored = """
+    INSERT OR IGNORE INTO first_lookups (indicator_id, feed, verdict, detail, checked_at)
+    SELECT indicator_id, feed, verdict, detail, checked_at FROM feed_lookups
+    WHERE indicator_id = ? AND feed = ?
+    """
+    keep_this = """
+    INSERT OR IGNORE INTO first_lookups (indicator_id, feed, verdict, detail, checked_at)
+    VALUES (?, ?, ?, ?, ?)
+    """
+    conn.execute(keep_stored, (indicator_id, feed))
+    conn.execute(keep_this, (indicator_id, feed, verdict, detail, ts))
     conn.execute(sql, (indicator_id, feed, verdict, detail, ts))
     conn.commit()
 
 
-def cached_feeds(conn: Connection, indicator_id: int) -> set[str]:
-    """Fetch the feeds that have already answered for an indicator
+def cached_feeds(
+    conn: Connection, indicator_id: int, recheck_s: float | None = None, now: float | None = None
+) -> set[str]:
+    """Fetch the feeds whose stored answer for an indicator does not have to be asked for again
+
+    With recheck_s, an UNKNOWN is left out once, so that it is asked for
+    again: when the feed's first answer is at least that old and the stored
+    one was given before it reached that age. A feed that did not know an
+    indicator on the day it was found may list it a week or two later.
 
     Args:
         conn (Connection): SQL db connection
         indicator_id (int): The indicator to look up
+        recheck_s (float | None, optional): the age in seconds at which an
+            UNKNOWN is asked for once more, or None for never. Defaults to None.
+        now (float | None, optional): the time to measure that age from;
+            needed with recheck_s. Defaults to None.
 
     Returns:
-        set[str]: feed names with a stored verdict
+        set[str]: feed names with a stored verdict that stands
     """
-    sql = "SELECT feed FROM feed_lookups WHERE indicator_id = ?"
-    return {row["feed"] for row in conn.execute(sql, (indicator_id,))}
+    sql = """
+    SELECT l.feed, l.verdict, l.checked_at, COALESCE(f.checked_at, l.checked_at) AS first_at
+    FROM feed_lookups l
+    LEFT JOIN first_lookups f ON f.indicator_id = l.indicator_id AND f.feed = l.feed
+    WHERE l.indicator_id = ?
+    """
+    cached = set()
+    for row in conn.execute(sql, (indicator_id,)).fetchall():
+        if recheck_s is not None and row["verdict"] == "UNKNOWN":
+            old_enough = now - row["first_at"] >= recheck_s
+            asked_since = row["checked_at"] - row["first_at"] >= recheck_s
+            if old_enough and not asked_since:
+                continue
+        cached.add(row["feed"])
+    return cached
 
 
 def indicator_rows(conn: Connection) -> list[sqlite3.Row]:
@@ -1210,33 +1299,93 @@ def lookup_rows(conn: Connection, indicator_id: int) -> list[sqlite3.Row]:
         indicator_id (int): The indicator to look up
 
     Returns:
-        list[sqlite3.Row]: rows of feed, verdict, detail and checked_at
+        list[sqlite3.Row]: rows of feed, verdict, detail and checked_at, and
+            first_verdict and first_checked_at: what the feed said the first
+            time, which is the same answer until the indicator is asked
+            about again
     """
     sql = """
-    SELECT feed, verdict, detail, checked_at FROM feed_lookups
-    WHERE indicator_id = ? ORDER BY feed
+    SELECT l.feed, l.verdict, l.detail, l.checked_at,
+           COALESCE(f.verdict, l.verdict) AS first_verdict,
+           COALESCE(f.checked_at, l.checked_at) AS first_checked_at
+    FROM feed_lookups l
+    LEFT JOIN first_lookups f ON f.indicator_id = l.indicator_id AND f.feed = l.feed
+    WHERE l.indicator_id = ? ORDER BY l.feed
     """
     return conn.execute(sql, (indicator_id,)).fetchall()
 
 
-def flagged_page_snapshots(conn: Connection) -> sqlite3.Cursor:
-    """Function to read every snapshot of every page the classifier has flagged
+def flagged_pages(conn: Connection) -> list[sqlite3.Row]:
+    """Function to list the pages the classifier has flagged, with their titles
 
-    Every snapshot, not only the newest: the actor edits pages in place, so
-    the address a page held last week is in an older snapshot. Held-out
-    pages are left out.
+    A page counts if any of its snapshots holds a flagged score. Held-out
+    pages are left out. The read starts from the scores, which is a short
+    scan, and not from the snapshots: the re-poll adds thousands of those a
+    day to the flagged pages.
 
     Args:
         conn (Connection): SQL db connection
 
     Returns:
-        sqlite3.Cursor: rows of page_id, fetched_at, title and text, oldest first
+        list[sqlite3.Row]: rows of id and slug, the title the page was found
+            under, lowest id first
     """
     sql = """
-    SELECT s.page_id, s.fetched_at, s.title, s.text
-    FROM snapshots s JOIN pages p ON p.id = s.page_id
-    WHERE p.held_out = 0
-      AND EXISTS (SELECT 1 FROM scores sc WHERE sc.page_id = p.id AND sc.flagged = 1)
-    ORDER BY s.fetched_at, s.id
+    SELECT id, slug FROM pages
+    WHERE held_out = 0 AND id IN (SELECT page_id FROM scores WHERE flagged = 1)
+    ORDER BY id
     """
-    return conn.execute(sql)
+    return conn.execute(sql).fetchall()
+
+
+def flagged_page_ids(conn: Connection) -> list[int]:
+    """Function to list the ids of the pages the classifier has flagged
+
+    Args:
+        conn (Connection): SQL db connection
+
+    Returns:
+        list[int]: page ids from flagged_pages, lowest first
+    """
+    return [row["id"] for row in flagged_pages(conn)]
+
+
+def title_rows(conn: Connection, indicator_id: int) -> list[sqlite3.Row]:
+    """Fetch the titles whose flagged pages hold one indicator
+
+    Args:
+        conn (Connection): SQL db connection
+        indicator_id (int): The indicator to look up
+
+    Returns:
+        list[sqlite3.Row]: rows of slug and pages, the title on most pages first
+    """
+    sql = """
+    SELECT slug, pages FROM indicator_titles
+    WHERE indicator_id = ? ORDER BY pages DESC, slug
+    """
+    return conn.execute(sql, (indicator_id,)).fetchall()
+
+
+def page_snapshots(conn: Connection, page_id: int) -> list[sqlite3.Row]:
+    """Function to read every snapshot of one page
+
+    Every snapshot, not only the newest: the actor edits pages in place, so
+    the address a page held last week is in an older snapshot. The rows are
+    read whole before they are handed out. A cursor left open while the
+    caller works would hold a read lock, and on this database an open read
+    makes every other writer's commit wait.
+
+    Args:
+        conn (Connection): SQL db connection
+        page_id (int): The page to read
+
+    Returns:
+        list[sqlite3.Row]: rows of id, page_id, fetched_at, title and text,
+            oldest first
+    """
+    sql = """
+    SELECT id, page_id, fetched_at, title, text FROM snapshots
+    WHERE page_id = ? ORDER BY fetched_at, id
+    """
+    return conn.execute(sql, (page_id,)).fetchall()

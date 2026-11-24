@@ -6,6 +6,8 @@ touches the network. The generator's DaySweep summary is read from
 StopIteration.value, the way the cli will read it.
 """
 
+import random
+
 import pytest
 
 from graphwatch.sweep import DaySweep, sweep_day
@@ -195,7 +197,20 @@ def test_a_tail_of_only_failures_leaves_the_day_not_done():
     assert asked == [1, 2, 3, 4, 5]
     assert s.failures == 3
     assert s.done is False
-    assert s.next_n == 6  # the next run retries from here
+    # The next run asks for the failed counters again, not for the ones after
+    # them: until 24 November it started at 6, and a page at 3, 4 or 5 that
+    # Telegraph had only failed to answer for was never fetched.
+    assert s.next_n == 3
+    found, retry, asked = sweep(existing={1, 2, 3, 4}, start=s.next_n, expected=2, gap=2)
+    assert asked == [3, 4, 5, 6, 7]
+    assert [fetch.path for fetch in found] == ["Hello-10-17-3", "Hello-10-17-4"]
+    assert (retry.done, retry.next_n) == (True, 8)
+    # a tail that fails again leaves the day open at the same counter
+    _, again, _ = sweep(existing={1, 2}, failed={3, 4, 5}, start=s.next_n, expected=2, gap=2)
+    assert (again.done, again.next_n) == (False, 3)
+    # and failures after a page past the crowd count go back to the first of them only
+    _, late, asked = sweep(existing={1, 2, 4}, failed={5, 6}, expected=2, gap=1)
+    assert (asked, late.done, late.next_n) == ([1, 2, 3, 4, 5, 6], False, 5)
 
 
 def test_a_mixed_tail_still_ends_the_day():
@@ -266,3 +281,67 @@ def test_sweep_day_is_lazy_the_caller_can_stop_early():
     next(gen)
     gen.close()
     assert asked == [1, 2]  # nothing fetched beyond what was consumed
+
+
+# --- hint: what the walk is certain to fetch next (23 November) -----------------
+
+
+def hinted_sweep(existing, failed=(), start=1, expected=0, gap=2, cap=None):
+    """sweep() with a hint that only records: the counters named by each call."""
+    fetch, asked = make_fetch(existing, failed)
+    hints = []
+
+    def hint(paths):
+        hints.append([counter(path) for path in paths])
+
+    gen = sweep_day(fetch, SLUG, MONTH, DAY, start, expected, gap, cap, hint=hint)
+    yielded, summary = drive(gen)
+    return yielded, summary, asked, hints
+
+
+def test_the_first_hint_is_everything_up_to_the_crowd_count_and_the_gap_past_it():
+    _, _, asked, hints = hinted_sweep({1, 2, 3, 4, 5}, expected=5, gap=2)
+    assert hints[0] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert asked == [1, 2, 3, 4, 5, 6, 7, 8]
+
+    # The commonest walk by far: gap + 1 requests, none of which depends on another
+    _, _, asked, hints = hinted_sweep(set(), expected=0, gap=2)
+    assert hints[0] == asked == [1, 2, 3]
+
+
+def test_a_page_past_the_crowd_count_moves_the_end_of_what_is_certain():
+    _, _, asked, hints = hinted_sweep({1, 2, 4}, expected=2, gap=2)
+    # after 1 and 2: 3, 4 and 5 are certain. 4 is a page, so 5, 6 and 7 are.
+    assert hints[2] == [3, 4, 5]
+    assert hints[4] == [5, 6, 7]
+    assert asked == [1, 2, 3, 4, 5, 6, 7]
+
+    _, _, asked, hints = hinted_sweep({1, 2, 3, 4, 5, 6}, expected=6, gap=2, cap=4)
+    assert max(max(hint) for hint in hints) == 4
+    assert asked == [1, 2, 3, 4]
+
+
+def test_the_walk_is_the_same_with_a_hint_and_never_hints_what_it_does_not_fetch():
+    # Any counter hinted and not fetched would be a request the one-at-a-time
+    # walk never made: against the budget, and against Telegraph.
+    rng = random.Random(20261123)
+    widest = 0
+    for _ in range(3000):
+        top = rng.randint(0, 30)
+        existing = {n for n in range(1, top + 1) if rng.random() < rng.choice([0.2, 0.6, 0.95])}
+        failed = {n for n in range(1, top + 8) if rng.random() < rng.choice([0.0, 0.0, 0.1, 0.5])}
+        start = rng.choice([1, 1, 1, rng.randint(1, top + 6)])
+        expected = rng.choice([0, top, rng.randint(0, top + 4)])
+        gap = rng.randint(0, 4)
+        cap = rng.choice([None, None, rng.randint(1, top + 5)])
+        plain = sweep(existing, failed, start, expected, gap, cap)
+        yielded, summary, asked, hints = hinted_sweep(existing, failed, start, expected, gap, cap)
+        case = (sorted(existing), sorted(failed), start, expected, gap, cap)
+        assert (yielded, summary, asked) == plain, case
+        assert len(hints) == len(asked), case
+        for position, hint in enumerate(hints):
+            # each hint is the next counters, in order, starting with the next one,
+            # and every one of them is fetched later in the walk
+            assert hint == asked[position : position + len(hint)], case
+            widest = max(widest, len(hint))
+    assert widest >= 10  # and it does look ahead

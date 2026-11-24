@@ -16,13 +16,17 @@ from graphwatch.feeds import (
     FEED_FUNCTIONS,
     FEEDS,
     FeedClient,
+    KeyCheck,
     Lookup,
     Request,
     Verdict,
     bare_host,
+    failure_kind,
     feed_keys,
     ioc_is,
+    otx_key_request,
     otx_requests,
+    parse_key_check,
     parse_otx,
     parse_threatfox,
     parse_urlhaus,
@@ -364,6 +368,16 @@ def test_ioc_is(ioc, term, same):
         (200, body({"query_status": "illegal_search_term"}), "200: illegal_search_term"),
         (401, body({"error": "Unauthorized"}), "401: unexpected answer"),
         (200, body(["a", "list"]), "200: answer is not a JSON object"),
+        # What abuse.ch sends for a key it does not know (seen 23 November 2026)
+        (403, body({"query_status": "unknown_auth_key"}), "403: unknown_auth_key"),
+        # A refusal or an error is not an answer, whatever its body says:
+        # read as UNKNOWN it would be stored and count towards novel
+        (401, body({"query_status": "no_result"}), "401: no_result"),
+        (403, body({"query_status": "no_result"}), "403: no_result"),
+        (429, body({"query_status": "no_result"}), "429: no_result"),
+        (500, body({"query_status": "no_result"}), "500: no_result"),
+        (403, body({"query_status": "ok", "data": [{"ioc": "8.8.8.8:443"}]}), "403: ok"),
+        (204, body({"query_status": "no_result"}), "204: no_result"),
     ],
 )
 def test_threatfox_anything_else_is_failed_never_unknown(status, answer, detail):
@@ -398,6 +412,13 @@ def test_urlhaus_reads_the_status_key_as_the_documentation_misspells_it():
     [
         (200, body({"query_status": "invalid_url"}), "200: invalid_url"),
         (401, body({"error": "Unauthorized"}), "401: unexpected answer"),
+        (403, body({"query_status": "unknown_auth_key"}), "403: unknown_auth_key"),
+        # As for ThreatFox: only a 200 is an answer
+        (401, body({"query_status": "no_results"}), "401: no_results"),
+        (403, body({"query_status": "no_results"}), "403: no_results"),
+        (429, body({"query_status": "no_results"}), "429: no_results"),
+        (500, body({"query_status": "ok", "url_count": "2"}), "500: ok"),
+        (403, body({"query_staus": "ok", "url_count": "2"}), "403: ok"),
     ],
 )
 def test_urlhaus_anything_else_is_failed(status, answer, detail):
@@ -753,3 +774,150 @@ def test_a_detail_that_is_not_text_is_made_text_before_it_leaves_the_client(monk
     monkeypatch.setitem(feeds.FEED_FUNCTIONS, "otx", (otx_requests, lambda status, content, term: (Verdict.KNOWN, {"n": 3})))
     client, _ = make_client(MISS)
     assert client.lookup("otx", "ip", IP).detail == "{'n': 3}"
+
+
+# --------------------------------------------------------------------------
+# the key check (23 November): OTX answers a lookup whatever the key
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "status,outcome,detail",
+    [
+        (200, KeyCheck.ACCEPTED, None),
+        (401, KeyCheck.REFUSED, None),
+        (403, KeyCheck.REFUSED, None),
+        (404, KeyCheck.FAILED, "404: unexpected answer"),
+        (429, KeyCheck.FAILED, "429: unexpected answer"),
+        (500, KeyCheck.FAILED, "500: unexpected answer"),
+        # Only a plain 200 is a yes: not another 2xx, and not a redirect to a login page
+        (204, KeyCheck.FAILED, "204: unexpected answer"),
+        (302, KeyCheck.FAILED, "302: unexpected answer"),
+    ],
+)
+def test_a_key_check_is_read_from_the_status_alone(status, outcome, detail):
+    # The body describes the account and is never read, kept or logged
+    assert parse_key_check(status, b"not json, and not looked at", "key check") == (outcome, detail)
+
+
+@pytest.mark.parametrize(
+    "status,outcome",
+    [
+        (200, KeyCheck.ACCEPTED),
+        (403, KeyCheck.REFUSED),
+        (401, KeyCheck.REFUSED),
+        (500, KeyCheck.FAILED),
+        (429, KeyCheck.FAILED),
+        (302, KeyCheck.FAILED),
+    ],
+)
+def test_check_key_says_whether_otx_accepted_the_key(status, outcome):
+    client, session = make_client({"otx": (status, b"{}")})
+    assert client.check_key("otx") is outcome
+    (call,) = session.calls
+    assert (call["method"], call["url"]) == ("GET", "https://otx.alienvault.com/api/v1/user/me")
+    # a GET to an allowed host, with the key in a header and nowhere else
+    assert call["url"].split("/")[2] in ALLOWED_HOSTS
+    assert call["headers"] == {"User-Agent": "graphwatch", "X-OTX-API-KEY": KEYS["otx"]}
+    assert (call["json"], call["data"]) == (None, None)
+    assert call["allow_redirects"] is False
+    assert client.requests_made == 1
+    # the term goes into the log, so it says what was asked and nothing else
+    assert otx_key_request(KEYS["otx"]).term == "key check"
+
+
+def test_check_key_cannot_tell_when_the_feed_does_not_answer_or_cannot_be_read(monkeypatch):
+    # Not None: that is the answer for a feed with no check, and the caller tells the two apart
+    from graphwatch import feeds
+
+    for error in (requests.Timeout("timed out"), requests.ConnectionError("reset")):
+        client, _ = make_client(error=error)
+        assert client.check_key("otx") is KeyCheck.FAILED
+
+    def broken(status, content, term):
+        raise TypeError("a shape no parser foresaw")
+
+    monkeypatch.setattr(feeds, "parse_key_check", broken)
+    client, _ = make_client({"otx": (200, b"{}")})
+    assert client.check_key("otx") is KeyCheck.FAILED
+
+
+def test_check_key_sends_nothing_where_it_has_no_check_no_key_or_no_budget():
+    # The other three refuse a lookup made with a wrong key, so they need no check
+    client, session = make_client()
+    for feed in ("threatfox", "urlhaus", "virustotal"):
+        assert client.check_key(feed) is None
+    assert (session.calls, client.requests_made) == ([], 0)
+    keyless, session = make_client(keys={"threatfox": "a"})
+    with pytest.raises(KeyError):
+        keyless.check_key("otx")
+    assert session.calls == []
+    spent, session = make_client(budget=0)
+    with pytest.raises(BudgetExceeded):
+        spent.check_key("otx")
+    assert session.calls == []
+
+
+@pytest.mark.parametrize(
+    "stray_url",
+    [
+        "http://c2.example.org/",
+        "https://not-otx.alienvault.com/",
+        "https://otx.alienvault.com.evil.test/",
+        "https://otx.alienvault.com@evil.test/",
+    ],
+)
+def test_check_key_refuses_a_url_off_the_allowlist(monkeypatch, stray_url):
+    # The key travels with this request, so it is checked like any lookup
+    from graphwatch import feeds
+
+    def stray(key):
+        return Request("GET", stray_url, {"X-OTX-API-KEY": key}, "key check")
+
+    monkeypatch.setitem(feeds.KEY_CHECKS, "otx", stray)
+    client, session = make_client()
+    with pytest.raises(ValueError) as refused:
+        client.check_key("otx")
+    assert session.calls == []
+    assert client.requests_made == 0
+    assert KEYS["otx"] not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "status,kind",
+    [
+        (429, "quota"),
+        (401, "refused"),
+        (403, "refused"),
+        (None, "transient"),
+        (500, "transient"),
+        (502, "transient"),
+        (503, "transient"),
+        (200, "other"),
+        (400, "other"),
+        (404, "other"),
+        (499, "other"),
+    ],
+)
+def test_failure_kind_reads_why_a_lookup_failed_from_its_status(status, kind):
+    assert failure_kind(status) == kind
+
+
+@pytest.mark.parametrize("status,outcome,error", [(200, "ACCEPTED", None), (403, "REFUSED", None), (500, "FAILED", "500: unexpected answer")])
+def test_a_key_check_writes_one_log_row_that_names_no_key(status, outcome, error):
+    rows = []
+    client, _ = make_client({"otx": (status, b'{"username": "someone"}')}, log=rows.append)
+    client.check_key("otx")
+    (row,) = rows
+    assert (row["path"], row["attempt"], row["status"]) == ("otx:key check", 1, status)
+    assert (row["outcome"], row["error"]) == (outcome, error)
+    assert KEYS["otx"] not in json.dumps(rows)
+    # and the row fits the table the request log is kept in
+    from graphwatch.db import connect, http_logger
+
+    conn = connect(":memory:")
+    http_logger(conn)(row)
+    assert tuple(conn.execute("SELECT path, outcome, error FROM http_log").fetchone()) == ("otx:key check", outcome, error)
+    conn.close()
+
+

@@ -1,6 +1,7 @@
 """Read-only client for the public threat intelligence feeds (issue #38)
 
-Every request here asks a feed what it already holds about one value. Nothing
+Every request here asks a feed what it already holds about one value, or
+whether it accepts the key it is asked with. Nothing
 is ever submitted for scanning: a scan would make the feed fetch the actor's
 server on our behalf, and the project is passive only. This is the second
 module that touches the network. It talks to the four feed hosts and nothing
@@ -57,6 +58,42 @@ class Verdict(Enum):
     KNOWN = auto()
     UNKNOWN = auto()
     FAILED = auto()
+
+
+class KeyCheck(Enum):
+    """The three ways a key check can end"""
+
+    ACCEPTED = auto()
+    REFUSED = auto()
+    FAILED = auto()
+
+
+# The HTTP statuses a feed answers a key it does not accept with: 401 from
+# VirusTotal, 403 from abuse.ch and OTX (seen 23 November 2026)
+KEY_REFUSED_STATUSES = frozenset([401, 403])
+
+
+def failure_kind(status: int | None) -> str:
+    """Why a lookup failed, as far as its HTTP status says
+
+    Args:
+        status (int | None): HTTP status of the failed lookup, or None if the
+            feed gave no answer at all (a timeout, a dropped connection)
+
+    Returns:
+        str: "quota" for a 429; "refused" for a 401 or 403, which is a key
+            the feed does not accept or a block on this address or this one
+            value; "transient" for no answer or a 5xx, which may well be
+            answered a minute later; "other" for an answer that will be the
+            same however often it is asked for
+    """
+    if status == 429:
+        return "quota"
+    if status in KEY_REFUSED_STATUSES:
+        return "refused"
+    if status is None or status >= 500:
+        return "transient"
+    return "other"
 
 
 @dataclass
@@ -249,6 +286,49 @@ def virustotal_requests(kind: str, value: str, key: str) -> list[Request]:
     ]
 
 
+def otx_key_request(key: str) -> Request:
+    """Builds the request that shows whether OTX accepts a key
+
+    OTX answers a lookup with any key or none, at a lower rate limit (a 429
+    after about 100 requests in an hour, seen 23 November 2026), so a wrong
+    key never shows in a lookup. Its own-account endpoint answers 200 with a
+    valid key and 403 without one.
+
+    Args:
+        key (str): the OTX API key
+
+    Returns:
+        Request: the one request to send
+    """
+    return Request(
+        "GET", "https://otx.alienvault.com/api/v1/user/me", {"X-OTX-API-KEY": key}, "key check"
+    )
+
+
+def parse_key_check(status: int, body: bytes, term: str) -> tuple[KeyCheck, str | None]:
+    """Reads the answer to a key check from its HTTP status alone
+
+    Args:
+        status (int): HTTP response status
+        body (bytes): HTTP response body; not read, it describes the account
+        term (str): not needed here
+
+    Returns:
+        tuple[KeyCheck, str | None]: ACCEPTED for a 200, REFUSED for a 401
+            or 403, FAILED with the status for anything else
+    """
+    if status == 200:
+        return KeyCheck.ACCEPTED, None
+    if status in KEY_REFUSED_STATUSES:
+        return KeyCheck.REFUSED, None
+    return KeyCheck.FAILED, f"{status}: unexpected answer"
+
+
+# The feeds whose key has to be checked by a request of its own, because a
+# lookup does not show a wrong one. feed name: request builder
+KEY_CHECKS = {"otx": otx_key_request}
+
+
 def _load(status: int, body: bytes) -> tuple[dict | None, str | None]:
     """Decodes a feed's JSON answer
 
@@ -311,6 +391,10 @@ def parse_threatfox(status: int, body: bytes, term: str) -> tuple[Verdict, str |
     if data is None:
         return Verdict.FAILED, error
     query_status = data.get("query_status")
+    if status != 200:
+        # ThreatFox answers a hit and a miss with 200 (seen 23 November 2026).
+        # Anything else is a refusal or an error, whatever its body says
+        return Verdict.FAILED, f"{status}: {query_status or 'unexpected answer'}"
     if query_status == "no_result":
         return Verdict.UNKNOWN, None
     iocs = data.get("data")
@@ -347,6 +431,9 @@ def parse_urlhaus(status: int, body: bytes, term: str) -> tuple[Verdict, str | N
         return Verdict.FAILED, error
     # The documentation's sample host answer spells the key query_staus
     query_status = data.get("query_status") or data.get("query_staus")
+    if status != 200:
+        # As for ThreatFox: a hit and a miss are both a 200
+        return Verdict.FAILED, f"{status}: {query_status or 'unexpected answer'}"
     if query_status == "no_results":
         return Verdict.UNKNOWN, None
     if query_status == "ok":
@@ -437,9 +524,9 @@ FEED_FUNCTIONS = {
 
 
 class FeedClient:
-    """Paced, allowlisted, lookup-only client for the four feeds
+    """Paced, allowlisted client for the four feeds: it looks up, and it checks a key
 
-    Every request goes through lookup and _send. The clock, sleep function,
+    Every request goes through lookup or check_key, and then _send. The clock, sleep function,
     session and log sink are all injectable so tests can run without waiting
     or connecting.
     """
@@ -505,7 +592,7 @@ class FeedClient:
 
     def _send(
         self, feed: str, request: Request, parse, attempt: int
-    ) -> tuple[Verdict, str | None, int | None, int]:
+    ) -> tuple[Verdict | KeyCheck, str | None, int | None, int]:
         """Sends one built request and returns what the feed said
 
         Counts against the budget, waits for the feed's pacer, sends the
@@ -515,12 +602,13 @@ class FeedClient:
         Args:
             feed (str): the feed being asked, for the pacer and the log row
             request (Request): the request to send, already host-checked
-            parse (func): the feed's answer parser
+            parse (func): the feed's answer parser, or parse_key_check
             attempt (int): 1 for the first request of a lookup, counting up; logged
 
         Returns:
-            tuple[Verdict, str | None, int | None, int]: verdict, detail,
-                HTTP status and elapsed milliseconds
+            tuple[Verdict | KeyCheck, str | None, int | None, int]: what the
+                parser made of the answer (FAILED if there was none),
+                detail, HTTP status and elapsed milliseconds
 
         Raises:
             BudgetExceeded: if requests_made has reached budget; nothing is sent
@@ -571,12 +659,43 @@ class FeedClient:
                     "attempt": attempt,
                     "status": status,
                     "outcome": verdict.name,
-                    "error": detail if verdict is Verdict.FAILED else None,
+                    # FAILED by name: a key check has an outcome of its own kind
+                    "error": detail if verdict.name == "FAILED" else None,
                     "elapsed_ms": elapsed_ms,
                     "bytes": len(body),
                 }
             )
         return verdict, detail, status, elapsed_ms
+
+    def check_key(self, feed: str) -> KeyCheck | None:
+        """Asks a feed whether it accepts its key, where a lookup would not show it
+
+        Only OTX needs this. The other feeds refuse a lookup made with a
+        wrong key (see KEY_REFUSED_STATUSES), so for them nothing is sent.
+
+        Args:
+            feed (str): one of FEEDS
+
+        Returns:
+            KeyCheck | None: ACCEPTED or REFUSED as the feed said, FAILED if
+                the check got no clear answer, and None for a feed that has
+                no check of its own
+
+        Raises:
+            BudgetExceeded: if the budget is reached; nothing is sent
+            KeyError: if the feed has a check and the client has no key for it
+            ValueError: if the built URL is not on an allowed host
+        """
+        build = KEY_CHECKS.get(feed)
+        if build is None:
+            return None
+        request = build(self.keys[feed])
+        self._check_host(request.url)
+        outcome, _detail, _status, _elapsed_ms = self._send(feed, request, parse_key_check, 1)
+        if outcome in (KeyCheck.ACCEPTED, KeyCheck.REFUSED):
+            return outcome
+        # No answer, or one no parser foresaw: _send calls both FAILED
+        return KeyCheck.FAILED
 
     def lookup(self, feed: str, kind: str, value: str) -> Lookup:
         """Asks one feed what it holds about one indicator

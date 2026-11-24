@@ -17,7 +17,10 @@ import warnings
 from datetime import date, datetime
 from pathlib import Path
 
+import threading
+
 import pytest
+import requests
 
 from graphwatch.cli import (
     main,
@@ -37,6 +40,7 @@ from graphwatch.config import CONFIG
 from graphwatch.crowd import DayCount, save_day_count
 from graphwatch.db import (
     add_snapshot,
+    http_logger,
     connect,
     load_progress,
     resweep_paths,
@@ -50,7 +54,7 @@ from graphwatch.feeds import FeedClient
 from graphwatch.redact import hash_secret
 from graphwatch.rules import CATEGORIES, RULES
 from graphwatch.slugify import Entry
-from graphwatch.telegraph import Outcome, TelegraphClient
+from graphwatch.telegraph import Outcome, TelegraphClient, build_path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "plan" / "fixtures"
 FOUND_BODY = (FIXTURES / "Vizit-12-28.json").read_bytes()
@@ -196,20 +200,23 @@ LISTS = Path("wordlists")
     [
         (
             ["crowd"],
-            dict(db=DB, wordlists=LISTS, days=14, gap=2, rate=8.0, budget=None, today=None, unfrozen=False),
+            dict(
+                db=DB, wordlists=LISTS, days=14, gap=2, rate=8.0, budget=None, today=None, unfrozen=False,
+                workers=4,
+            ),
         ),
         (
             ["sweep"],
             dict(
                 db=DB, wordlists=LISTS, days=None, gap=2, rate=8.0, budget=230000, cap=None,
                 count_only_above=700, today=None, unfrozen=False,
-                resweep=False, older_than=20.0, flagged=False, match=None,
+                resweep=False, older_than=20.0, flagged=False, match=None, workers=4,
             ),
         ),
-        (["meta", "--stale", "24"], dict(db=DB, rate=8.0, budget=230000, limit=5000, stale=24.0)),
+        (["meta", "--stale", "24"], dict(db=DB, rate=8.0, budget=230000, limit=5000, stale=24.0, workers=4)),
         (["freeze"], dict(wordlists=LISTS)),
         (["classify"], dict(db=DB, threshold=4, explain=None)),
-        (["enrich"], dict(db=DB, file=None, refresh=False, budget=None, table=False)),
+        (["enrich"], dict(db=DB, file=None, refresh=False, budget=None, table=False, recheck_days=14.0)),
     ],
 )
 def test_parse_args_defaults(argv, options):
@@ -510,10 +517,17 @@ def test_run_sweep_failed_tail_leaves_the_day_for_retry(conn, counted):
     )
     lines = []
     run_sweep(conn, client, ENTRIES[:1], [(10, 23)], KEY, 1, None, set(), log=lines.append)
-    assert load_progress(conn, "Hello", 10, 23) == (4, False)
+    # left open at the first counter that failed, so the retry asks for it again
+    assert load_progress(conn, "Hello", 10, 23) == (2, False)
     row = conn.execute("SELECT failures FROM sweep_progress").fetchone()
     assert row["failures"] == 2
     assert lines == ["Hello 10-23: 1 pages, 3 requests"]
+    # The next night Telegraph answers: the two pages behind the failures are stored
+    mended, session = make_sweep_client({"Hello-10-23", "Hello-10-23-2", "Hello-10-23-3"})
+    stored, _ = run_sweep(conn, mended, ENTRIES[:1], [(10, 23)], KEY, 1, None, set(), log=quiet)
+    assert (stored, session.paths[0]) == (2, "Hello-10-23-2")
+    assert stored_paths(conn) == ["Hello-10-23", "Hello-10-23-2", "Hello-10-23-3"]
+    assert load_progress(conn, "Hello", 10, 23) == (6, True)
 
 
 def test_run_sweep_stores_the_api_path_not_the_requested_one(conn, counted):
@@ -2015,17 +2029,38 @@ class FeedResp:
 
 class EnrichSession:
     """Answers every feed with a miss, except a hit for the (feed, value)
-    pairs in `known` and the given status for the feeds in `broken`."""
+    pairs in `known` and the given status for the feeds in `broken`.
 
-    def __init__(self, known=(), broken=None):
+    `first` gives a feed's first lookups a status each, an exception to raise,
+    or None to answer that one as usual. A key check is answered with
+    `key_status` and kept apart in `key_checks`, so `calls` holds lookups only;
+    `order` has both, as ("check" or "lookup", feed).
+    """
+
+    def __init__(self, known=(), broken=None, first=None, key_status=200):
         self.known = set(known)
         self.broken = dict(broken or {})
+        self.first = {feed: list(answers) for feed, answers in (first or {}).items()}
+        self.key_status = key_status
         self.calls = []
+        self.key_checks = []
+        self.order = []
 
     def request(self, method, url, **kwargs):
         feed = next(name for name, host in FEED_HOST.items() if host in url)
+        if url.endswith("/user/me"):
+            self.key_checks.append(feed)
+            self.order.append(("check", feed))
+            return FeedResp(self.key_status, b"{}")
         sent = json.dumps([url, kwargs.get("json"), kwargs.get("data")])
         self.calls.append((feed, sent))
+        self.order.append(("lookup", feed))
+        if self.first.get(feed):
+            answer = self.first[feed].pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            if answer is not None:
+                return FeedResp(answer, b"{}")
         if feed in self.broken:
             return FeedResp(self.broken[feed], b"{}")
         for known_feed, value in self.known:
@@ -2037,8 +2072,8 @@ class EnrichSession:
         return sum(1 for name, _sent in self.calls if name == feed)
 
 
-def make_feed_client(known=(), broken=None, keys=FEED_KEYS, **kwargs):
-    session = EnrichSession(known, broken)
+def make_feed_client(known=(), broken=None, keys=FEED_KEYS, first=None, key_status=200, **kwargs):
+    session = EnrichSession(known, broken, first, key_status)
     client = FeedClient(keys, session=session, sleep=lambda s: None, **kwargs)
     return client, session
 
@@ -2062,7 +2097,7 @@ def stored_lookups(conn):
 def test_run_enrich_asks_every_feed_about_every_indicator(indicators):
     client, session = make_feed_client()
     counts = run_enrich(indicators, client, log=quiet)
-    assert counts == {"looked_up": 8, "cached": 0, "known": 0, "unknown": 8, "failed": 0}
+    assert counts == {"looked_up": 8, "cached": 0, "known": 0, "unknown": 8, "failed": 0, "retried": 0, "set_aside": 0}
     assert {feed: session.asked(feed) for feed in FEED_KEYS} == dict.fromkeys(FEED_KEYS, 2)
     assert len(stored_lookups(indicators)) == 8
 
@@ -2087,8 +2122,9 @@ def test_run_enrich_does_not_ask_again_and_keeps_the_answer_and_the_day_it_was_g
     before = [tuple(r) for r in indicators.execute("SELECT * FROM feed_lookups ORDER BY rowid")]
     later, session = make_feed_client(known={("threatfox", "8.8.8.8")})
     counts = run_enrich(indicators, later, log=quiet)
-    assert session.calls == []
-    assert counts == {"looked_up": 0, "cached": 8, "known": 0, "unknown": 0, "failed": 0}
+    # nothing at all is sent, not even a key check: there is nothing to ask
+    assert session.order == []
+    assert counts == {"looked_up": 0, "cached": 8, "known": 0, "unknown": 0, "failed": 0, "retried": 0, "set_aside": 0}
     assert [tuple(r) for r in indicators.execute("SELECT * FROM feed_lookups ORDER BY rowid")] == before
 
 
@@ -2116,12 +2152,19 @@ def test_run_enrich_asks_only_the_feeds_it_has_a_key_for_and_a_feed_added_later_
 
 def test_run_enrich_a_failed_lookup_stores_nothing_and_is_tried_again(indicators):
     # A failure never becomes a verdict: stored as UNKNOWN it would count as novel.
-    client, _ = make_feed_client(broken={"urlhaus": 500})
+    client, session = make_feed_client(broken={"urlhaus": 500})
     lines = []
     counts = run_enrich(indicators, client, log=lines.append)
     assert (counts["failed"], counts["unknown"]) == (2, 6)
     assert not any(feed == "urlhaus" for _value, feed, _verdict in stored_lookups(indicators))
-    assert len(lines) == 2 and all(line.startswith("urlhaus ") for line in lines)
+    # each one fails in its turn and once more at the end of the run
+    assert lines == [
+        "urlhaus 8.8.8.8: 500: unexpected answer",
+        "urlhaus 9.9.9.9: 500: unexpected answer",
+        "urlhaus 8.8.8.8: 500: unexpected answer again, left for the next run",
+        "urlhaus 9.9.9.9: 500: unexpected answer again, left for the next run",
+    ]
+    assert (counts["looked_up"], counts["retried"], session.asked("urlhaus")) == (8, 2, 4)
     mended, session = make_feed_client()
     counts = run_enrich(indicators, mended, log=quiet)
     assert (counts["looked_up"], counts["cached"]) == (2, 6)
@@ -2141,7 +2184,8 @@ def test_run_enrich_leaves_a_feed_alone_once_its_quota_is_spent(indicators):
 
 
 def test_run_enrich_budget_exceeded_is_logged_and_what_was_asked_is_kept(indicators):
-    client, session = make_feed_client(budget=3)
+    # The key check is a request too: four requests are one check and three lookups
+    client, session = make_feed_client(budget=4)
     lines = []
     counts = run_enrich(indicators, client, log=lines.append)
     assert lines == ["budget exceeded"]
@@ -2150,6 +2194,250 @@ def test_run_enrich_budget_exceeded_is_logged_and_what_was_asked_is_kept(indicat
     rest, session = make_feed_client()
     counts = run_enrich(indicators, rest, log=quiet)
     assert (counts["looked_up"], counts["cached"]) == (5, 3)
+
+
+def test_run_enrich_with_no_budget_sends_nothing_not_even_the_key_check(indicators):
+    client, session = make_feed_client(budget=0)
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert lines == ["budget exceeded"]
+    assert session.order == []
+    assert counts["looked_up"] == 0
+
+    # Everything is cached, so nothing has to be sent and the budget is never met
+    client, _ = make_feed_client()
+    run_enrich(indicators, client, log=quiet)
+    later, session = make_feed_client(budget=0)
+    lines = []
+    counts = run_enrich(indicators, later, log=lines.append)
+    assert (lines, session.order, counts["cached"]) == ([], [], 8)
+
+
+# --- a key the feed does not accept ---
+
+
+def test_run_enrich_checks_the_otx_key_once_before_its_first_lookup(indicators):
+    # OTX answers a lookup whatever the key, so only its own check shows a wrong one
+    client, session = make_feed_client()
+    run_enrich(indicators, client, log=quiet)
+    assert session.order[:4] == [
+        ("lookup", "threatfox"),
+        ("lookup", "urlhaus"),
+        ("check", "otx"),
+        ("lookup", "otx"),
+    ]
+    assert session.key_checks == ["otx"]
+
+
+def test_run_enrich_does_not_ask_a_feed_whose_key_check_was_refused(indicators):
+    client, session = make_feed_client(key_status=403)
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert lines == ["otx: key refused (OTX_KEY), not asked in this run"]
+    assert "made-up" not in lines[0]
+    assert session.asked("otx") == 0
+    assert not any(feed == "otx" for _value, feed, _verdict in stored_lookups(indicators))
+    # the other feeds carry on, and nothing counts as failed: nothing was looked up there
+    assert counts == {"looked_up": 6, "cached": 0, "known": 0, "unknown": 6, "failed": 0, "retried": 0, "set_aside": 1}
+
+    # the key is checked again on a refresh, and what is stored is kept if it is refused
+    client, _ = make_feed_client(known={("otx", "8.8.8.8")})
+    run_enrich(indicators, client, log=quiet)
+    later, session = make_feed_client(key_status=403)
+    run_enrich(indicators, later, refresh=True, log=quiet)
+    assert session.asked("otx") == 0
+    assert ("8.8.8.8", "otx", "KNOWN") in stored_lookups(indicators)
+
+
+@pytest.mark.parametrize("key_status", [500, 429, 404])
+def test_run_enrich_carries_on_when_the_key_check_gives_no_clear_answer(indicators, key_status):
+    # Only a refusal stops the feed: its lookups are right whatever the check said
+    client, session = make_feed_client(key_status=key_status)
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    # and it says so once: a wrong key would otherwise go unnoticed on this run
+    assert lines == ["otx: the key check gave no clear answer, the key is not verified"]
+    assert (session.asked("otx"), counts["unknown"]) == (2, 8)
+    assert session.key_checks == ["otx"]
+
+
+@pytest.mark.parametrize(
+    "feed,status,name",
+    [("virustotal", 401, "VT_KEY"), ("threatfox", 403, "ABUSE_CH_KEY"), ("urlhaus", 403, "ABUSE_CH_KEY")],
+)
+def test_run_enrich_leaves_a_feed_alone_once_it_refuses_two_lookups_running(indicators, feed, status, name):
+    upsert_indicator(indicators, "ip", "1.1.1.1", "pages", T0 + 120, T0 + 120, 1)
+    client, session = make_feed_client(broken={feed: status})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert session.asked(feed) == 2  # not once per indicator, and not once more at the end
+    assert lines == [
+        f"{feed} 8.8.8.8: {status}: unexpected answer",
+        f"{feed} 9.9.9.9: {status}: unexpected answer",
+        f"{feed}: refused 2 lookups running, its key ({name}) or this address is not accepted; "
+        "not asked in this run",
+    ]
+    assert (counts["looked_up"], counts["failed"], counts["retried"], counts["unknown"]) == (11, 2, 0, 9)
+    assert "made-up" not in " ".join(lines)  # the lines name the config variable, never the key
+    assert not any(stored == feed for _value, stored, _verdict in stored_lookups(indicators))
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_run_enrich_one_refusal_is_about_one_value_and_the_feed_carries_on(indicators, status):
+    # Stopping at the first refusal would stop at the same indicator on every
+    # later run too: it is not stored, and the indicators come in the same order.
+    upsert_indicator(indicators, "ip", "1.1.1.1", "pages", T0 + 120, T0 + 120, 1)
+    client, session = make_feed_client(first={"otx": [status]})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert lines == [f"otx 8.8.8.8: {status}: unexpected answer"]
+    assert session.asked("otx") == 3  # the other two are asked, and the refused one is not asked again
+    assert (counts["failed"], counts["retried"]) == (1, 0)
+    assert ("9.9.9.9", "otx", "UNKNOWN") in stored_lookups(indicators)
+    assert ("1.1.1.1", "otx", "UNKNOWN") in stored_lookups(indicators)
+    # and refusals with an answer between them do not add up to a refused key
+    upsert_indicator(indicators, "ip", "1.0.0.1", "pages", T0 + 180, T0 + 180, 1)
+    client, session = make_feed_client(first={"urlhaus": [status, None, status]})
+    lines = []
+    run_enrich(indicators, client, refresh=True, log=lines.append)
+    assert session.asked("urlhaus") == 4
+    assert not any("not asked in this run" in line for line in lines)
+
+
+# --- a feed that does not answer ---
+
+
+def six_indicators(conn):
+    for n, value in enumerate(["1.1.1.1", "1.0.0.1", "8.8.4.4", "9.9.9.10"], start=2):
+        upsert_indicator(conn, "ip", value, "pages", T0 + 60 * n, T0 + 60 * n, 1)
+    return conn
+
+
+def test_run_enrich_leaves_a_feed_alone_after_five_lookups_running_get_no_answer(indicators):
+    # A feed that is down costs a 20 second timeout per lookup, and each
+    # second try would cost another
+    six_indicators(indicators)
+    client, session = make_feed_client(first={"otx": [requests.Timeout("timed out")] * 20})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert session.asked("otx") == 5  # the sixth is not asked, and no second try is made
+    assert lines[-1] == "otx: no answer to 5 lookups running, left for the next run"
+    assert len(lines) == 6
+    assert (counts["looked_up"], counts["failed"], counts["retried"], counts["unknown"]) == (23, 5, 0, 18)
+    assert session.asked("virustotal") == 6  # the other feeds carry on
+    # a server error counts as no answer too
+    client, session = make_feed_client(broken={"urlhaus": 503})
+    lines = []
+    run_enrich(indicators, client, refresh=True, log=lines.append)
+    assert session.asked("urlhaus") == 5
+    assert lines[-1] == "urlhaus: no answer to 5 lookups running, left for the next run"
+
+
+def test_run_enrich_timeouts_with_answers_between_them_do_not_stop_the_feed(indicators):
+    # What OTX really does: about one lookup in ten times out
+    six_indicators(indicators)
+    timeout = requests.Timeout("timed out")
+    client, session = make_feed_client(first={"otx": [timeout, timeout, None, timeout, timeout, None]})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert not any("left for the next run" in line for line in lines)
+    assert (counts["failed"], counts["retried"], counts["unknown"]) == (0, 4, 24)
+    assert session.asked("otx") == 10
+
+
+@pytest.mark.parametrize("status", [404, 400])
+def test_run_enrich_makes_no_second_try_for_an_answer_that_will_not_change(indicators, status):
+    # Asked again a minute later the feed would say the same, at the price of a request
+    client, session = make_feed_client(broken={"urlhaus": status})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert session.asked("urlhaus") == 2
+    assert lines == [
+        f"urlhaus 8.8.8.8: {status}: unexpected answer",
+        f"urlhaus 9.9.9.9: {status}: unexpected answer",
+    ]
+    assert (counts["failed"], counts["retried"]) == (2, 0)
+
+
+# --- a failed lookup is tried once more when the others are done ---
+
+
+@pytest.mark.parametrize("failure", [500, requests.Timeout("timed out"), requests.ConnectionError("reset")])
+def test_run_enrich_tries_a_failed_lookup_once_more_at_the_end_and_keeps_its_answer(indicators, failure):
+    client, session = make_feed_client(first={"otx": [failure]})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert len(lines) == 1 and lines[0].startswith("otx 8.8.8.8: ")
+    # the second try comes after every other lookup, not straight away
+    assert session.order[-1] == ("lookup", "otx")
+    assert session.order.index(("lookup", "virustotal")) < len(session.order) - 1
+    assert session.asked("otx") == 3
+    assert counts == {"looked_up": 8, "cached": 0, "known": 0, "unknown": 8, "failed": 0, "retried": 1, "set_aside": 0}
+    assert ("8.8.8.8", "otx", "UNKNOWN") in stored_lookups(indicators)
+    assert len(stored_lookups(indicators)) == 8
+
+
+def test_run_enrich_a_second_try_that_finds_the_indicator_stores_and_logs_it(indicators):
+    client, _ = make_feed_client(known={("otx", "8.8.8.8")}, first={"otx": [500]})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert lines == ["otx 8.8.8.8: 500: unexpected answer", "8.8.8.8: known to otx (3 pulses)"]
+    assert (counts["known"], counts["unknown"], counts["failed"]) == (1, 7, 0)
+    assert ("8.8.8.8", "otx", "KNOWN") in stored_lookups(indicators)
+
+
+def test_run_enrich_tries_a_failed_lookup_only_once_more(indicators):
+    client, session = make_feed_client(first={"otx": [500, None, 500, 500]})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    # 8.8.8.8 fails, 9.9.9.9 answers, then 8.8.8.8 fails its second try and is left
+    assert session.asked("otx") == 3
+    assert lines[-1] == "otx 8.8.8.8: 500: unexpected answer again, left for the next run"
+    assert (counts["looked_up"], counts["failed"], counts["retried"]) == (8, 1, 1)
+    assert ("8.8.8.8", "otx", "UNKNOWN") not in stored_lookups(indicators)
+
+
+def test_run_enrich_makes_no_second_try_for_a_feed_that_was_set_aside_meanwhile(indicators):
+    # 8.8.8.8 fails, then 9.9.9.9 finds the quota spent: the second try would only spend more
+    client, session = make_feed_client(first={"virustotal": [500, 429]})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert session.asked("virustotal") == 2
+    assert lines == [
+        "virustotal 8.8.8.8: 500: unexpected answer",
+        "virustotal: quota spent, left for the next run",
+    ]
+    assert (counts["looked_up"], counts["failed"], counts["retried"]) == (8, 2, 0)
+    # the same when the feed was set aside for refusing two lookups running
+    upsert_indicator(indicators, "ip", "1.1.1.1", "pages", T0 + 120, T0 + 120, 1)
+    client, session = make_feed_client(first={"urlhaus": [500, 403, 403]})
+    lines = []
+    counts = run_enrich(indicators, client, refresh=True, log=lines.append)
+    assert session.asked("urlhaus") == 3
+    assert sum("not asked in this run" in line for line in lines) == 1
+    assert (counts["failed"], counts["retried"]) == (3, 0)
+
+
+def test_run_enrich_a_second_try_can_find_the_quota_spent_or_be_refused(indicators):
+    client, session = make_feed_client(first={"virustotal": [500, None, 429]})
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert lines[-1] == "virustotal: quota spent, left for the next run"
+    assert (counts["failed"], counts["retried"]) == (1, 1)
+    refused, session = make_feed_client(first={"urlhaus": [500, None, 403]})
+    lines = []
+    counts = run_enrich(indicators, refused, refresh=True, log=lines.append)
+    assert lines[-1] == "urlhaus 8.8.8.8: 403: unexpected answer again, left for the next run"
+    assert (counts["failed"], counts["retried"]) == (1, 1)
+
+
+def test_run_enrich_budget_exceeded_in_the_second_tries_keeps_the_counts_adding_up(indicators):
+    # one key check, eight lookups, and nothing left for the second try
+    client, session = make_feed_client(first={"otx": [500]}, budget=9)
+    lines = []
+    counts = run_enrich(indicators, client, log=lines.append)
+    assert lines == ["otx 8.8.8.8: 500: unexpected answer", "budget exceeded"]
+    assert counts == {"looked_up": 8, "cached": 0, "known": 0, "unknown": 7, "failed": 1, "retried": 0, "set_aside": 0}
 
 
 # --- the command ---
@@ -2164,7 +2452,7 @@ def test_main_enrich_table_prints_the_stored_table_and_builds_no_client(tmp_path
     c.close()
     main(["--config", str(tmp_path / "missing.env"), "enrich", "--db", str(db), "--table"])
     out = capsys.readouterr().out
-    assert out.startswith("| Indicator | Kind | First seen | Pages | ThreatFox |")
+    assert out.startswith("| Indicator | Kind | First seen | Pages | Titles | ThreatFox |")
     assert "| `8.8.8[.]8` | ip |" in out
     assert "1 indicators: 1 novel, 0 known, 0 unchecked." in out
     assert "8.8.8.8" not in out
@@ -2217,8 +2505,10 @@ def test_main_enrich_looks_up_the_flagged_pages_indicators_and_never_shows_a_key
     skipped, found, looked_up, verdicts = captured.out.splitlines()
     assert skipped == "no key for virustotal (VT_KEY), skipped"
     assert found == "1 indicators from flagged pages, 0 from the file, feeds: threatfox, urlhaus, otx"
+    # five requests: the OTX key check, one lookup each for ThreatFox and
+    # URLhaus, and two for OTX, which is asked for a host under two names
     assert re.fullmatch(
-        rf"looked up 3, cached 0, known 0, unknown 3, failed 0, 4 requests, {SECONDS}", looked_up
+        rf"looked up 3, cached 0, known 0, unknown 3, failed 0, retried 0, 5 requests, {SECONDS}", looked_up
     )
     assert verdicts == "1 indicators: 1 novel, 0 known, 0 unchecked"
     sent = " ".join(sent for _feed, sent in session.calls)
@@ -2229,19 +2519,194 @@ def test_main_enrich_looks_up_the_flagged_pages_indicators_and_never_shows_a_key
     assert [tuple(r) for r in c.execute("SELECT kind, value, source, first_seen, last_seen, pages FROM indicators")] == [
         ("host", "agfc.harper18.workers.dev", "pages", T0, T0, 1)
     ]
+    # and with the title of the page that holds it, which the table then prints
+    assert [tuple(r) for r in c.execute("SELECT slug, pages FROM indicator_titles")] == [("hello", 1)]
     # every request is in the http log, and no key is there or on the screen
     logged = [tuple(r) for r in c.execute("SELECT * FROM http_log")]
+    paths = [r["path"] for r in c.execute("SELECT path FROM http_log ORDER BY id")]
     c.close()
-    assert len(logged) == 4
+    assert len(logged) == 5
+    # the key is checked before OTX's first lookup, which is its third row from the end
+    assert paths.index("otx:key check") == 2
+    assert paths[3:] == ["otx:agfc.harper18.workers.dev"] * 2
     assert "made-up" not in json.dumps(logged) + captured.out + captured.err
+
+
+def test_main_enrich_stores_every_title_an_indicator_is_under_and_the_table_prints_them(enrich_workdir, capsys):
+    # The same address on a page that is not the actor's: the table has to show both
+    workdir, _session = enrich_workdir
+    c = connect(workdir / "g.sqlite")
+    put(c, "botnet-11-20", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    put(c, "botnet-11-21", SPOOF_TITLE, API_SAMPLE, API_SAMPLE)
+    run_classify(c, log=quiet)
+    c.close()
+    main(enrich_argv(workdir))
+    c = connect(workdir / "g.sqlite")
+    stored = [tuple(r) for r in c.execute("SELECT slug, pages FROM indicator_titles ORDER BY slug")]
+    c.close()
+    assert stored == [("botnet", 2), ("hello", 1)]
+    capsys.readouterr()
+    main(enrich_argv(workdir, "--table"))
+    out = capsys.readouterr().out
+    assert "| host | 2023-11-14 | 3 | botnet, hello |" in out
+    assert (
+        "By the title of the pages that hold them: botnet: 1 novel, 0 known, 0 unchecked; "
+        "hello: 1 novel, 0 known, 0 unchecked (an indicator on pages of several titles counts under each)."
+    ) in out
 
 
 def test_main_enrich_budget_stops_the_lookups(enrich_workdir, capsys):
     workdir, session = enrich_workdir
     main(enrich_argv(workdir, "--budget", "2"))
     out = capsys.readouterr().out
-    assert len(session.calls) == 2
+    assert len(session.order) == 2  # the key check and one lookup
     assert "budget exceeded" in out
+
+
+def with_virustotal(workdir, session, virustotal_answers):
+    """Adds a VirusTotal key to the config and a second indicator in a file,
+    and scripts VirusTotal's first answers."""
+    config = workdir / "config.env"
+    config.write_text(config.read_text(encoding="utf-8") + "VT_KEY=vt-key-made-up\n", encoding="utf-8")
+    listed = workdir / "indicators.tsv"
+    listed.write_text("kind\tvalue\nhost\tprobe-only.trycloudflare.com\n", encoding="utf-8")
+    session.first = {"virustotal": list(virustotal_answers)}
+    return listed
+
+
+def test_main_enrich_a_run_cut_short_by_a_quota_does_not_print_more_novel_indicators(enrich_workdir, capsys):
+    # The defect of 23 November: with VirusTotal's quota spent part of the way,
+    # the indicators it was never asked about were printed as novel.
+    workdir, session = enrich_workdir
+    listed = with_virustotal(workdir, session, [None, 429])
+    with pytest.raises(SystemExit):
+        main(enrich_argv(workdir, "--file", str(listed)))
+    out = capsys.readouterr().out
+    assert "virustotal: quota spent, left for the next run" in out
+    assert out.splitlines()[-1] == "2 indicators: 1 novel, 0 known, 1 unchecked"
+    main(enrich_argv(workdir, "--table"))
+    assert "2 indicators: 1 novel, 0 known, 1 unchecked." in capsys.readouterr().out
+
+
+def test_main_enrich_a_feed_cut_off_before_its_first_answer_is_still_waited_for(enrich_workdir, capsys):
+    # Nothing of VirusTotal's is stored, and it has a key: both indicators wait for it
+    workdir, session = enrich_workdir
+    listed = with_virustotal(workdir, session, [429])
+    with pytest.raises(SystemExit):
+        main(enrich_argv(workdir, "--file", str(listed)))
+    assert capsys.readouterr().out.splitlines()[-1] == "2 indicators: 0 novel, 0 known, 2 unchecked"
+    main(enrich_argv(workdir, "--table"))
+    out = capsys.readouterr().out
+    assert "2 indicators: 0 novel, 0 known, 2 unchecked." in out
+    assert "Novel means unknown to every one of: ThreatFox, URLhaus, OTX, VirusTotal." in out
+    # The table printed where there is no config goes by the stored answers alone
+    main(["--config", str(workdir / "missing.env"), "enrich", "--db", str(workdir / "g.sqlite"), "--table"])
+    out = capsys.readouterr().out
+    assert "2 indicators: 2 novel, 0 known, 0 unchecked." in out
+    assert "Novel means unknown to every one of: ThreatFox, URLhaus, OTX." in out
+
+
+# --- the exit status ---
+
+
+def test_main_enrich_ends_with_a_failing_status_when_a_feed_was_left_alone(enrich_workdir, capsys):
+    # Under cron nobody reads the lines: the status is what says the table is not whole
+    workdir, session = enrich_workdir
+    listed = with_virustotal(workdir, session, [None, 429])
+    with pytest.raises(SystemExit) as stopped:
+        main(enrich_argv(workdir, "--file", str(listed)))
+    assert stopped.value.code == "1 feed was left alone part of the way, see above; run enrich again"
+    out = capsys.readouterr().out
+    # everything is printed and stored before it stops
+    assert out.splitlines()[-1] == "2 indicators: 1 novel, 0 known, 1 unchecked"
+    c = connect(workdir / "g.sqlite")
+    assert c.execute("SELECT COUNT(*) FROM feed_lookups").fetchone()[0] == 7
+    c.close()
+    # and it counts every feed that was left alone: here OTX's key is refused as well
+    session.first = {"virustotal": [429]}
+    session.key_status = 403
+    with pytest.raises(SystemExit) as stopped:
+        main(enrich_argv(workdir, "--file", str(listed), "--refresh"))
+    assert str(stopped.value.code).startswith("2 feeds were left alone")
+
+
+def test_main_enrich_ends_normally_on_a_budget_stop_or_a_lookup_that_failed(enrich_workdir, capsys):
+    # A budget stop is how a run is meant to end, and one failed lookup is tried again next run
+    workdir, session = enrich_workdir
+    main(enrich_argv(workdir, "--budget", "2"))
+    session.first = {"otx": [404]}
+    main(enrich_argv(workdir))
+    assert "failed 1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "broken,set_aside",
+    [({}, 0), ({"virustotal": 429}, 1), ({"virustotal": 401, "urlhaus": 503}, 1), ({"virustotal": 429, "threatfox": 403}, 2)],
+)
+def test_run_enrich_counts_the_feeds_it_set_aside(indicators, broken, set_aside):
+    # Two indicators: enough for two refusals in a row, not for five lookups with no answer
+    client, _ = make_feed_client(broken=broken)
+    assert run_enrich(indicators, client, log=quiet)["set_aside"] == set_aside
+
+
+# --- an UNKNOWN is asked for once more when it is old enough ---
+
+RECHECK_S = 14 * 86400.0
+
+
+def test_run_enrich_asks_once_more_for_an_unknown_that_is_two_weeks_old(indicators):
+    # ThreatFox listed this actor's indicators up to 14 days after the sweep had them
+    first, _ = make_feed_client()
+    run_enrich(indicators, first, log=quiet, recheck_s=RECHECK_S, clock=lambda: T0)
+    # with no recheck age nothing is asked again, however old the answers are
+    never, session = make_feed_client()
+    run_enrich(indicators, never, log=quiet, clock=lambda: T0 + 10 * RECHECK_S)
+    assert session.order == []
+    early, session = make_feed_client(known={("threatfox", "8.8.8.8")})
+    counts = run_enrich(indicators, early, log=quiet, recheck_s=RECHECK_S, clock=lambda: T0 + RECHECK_S - 1)
+    assert (session.order, counts["cached"]) == ([], 8)
+    due, session = make_feed_client(known={("threatfox", "8.8.8.8")})
+    lines = []
+    counts = run_enrich(indicators, due, log=lines.append, recheck_s=RECHECK_S, clock=lambda: T0 + RECHECK_S)
+    assert (counts["looked_up"], counts["known"], counts["unknown"]) == (8, 1, 7)
+    assert lines == ["8.8.8.8: known to threatfox (1 IOCs, Made-up RAT)"]
+    # the new answer and its day are stored, and the first answer is kept beside it
+    row = indicators.execute(
+        "SELECT l.verdict, l.checked_at, f.verdict, f.checked_at FROM feed_lookups l "
+        "JOIN first_lookups f USING (indicator_id, feed) JOIN indicators i ON i.id = l.indicator_id "
+        "WHERE i.value = '8.8.8.8' AND l.feed = 'threatfox'"
+    ).fetchone()
+    assert tuple(row) == ("KNOWN", T0 + RECHECK_S, "UNKNOWN", T0)
+    # once asked at that age it is not asked again, and a KNOWN never is
+    later, session = make_feed_client()
+    counts = run_enrich(indicators, later, log=quiet, recheck_s=RECHECK_S, clock=lambda: T0 + 10 * RECHECK_S)
+    assert (session.order, counts["cached"]) == ([], 8)
+
+
+def test_run_enrich_a_recheck_that_fails_keeps_the_stored_answer_and_stays_due(indicators):
+    first, _ = make_feed_client()
+    run_enrich(indicators, first, log=quiet, recheck_s=RECHECK_S, clock=lambda: T0)
+    down, _ = make_feed_client(broken={"otx": 404})
+    counts = run_enrich(indicators, down, log=quiet, recheck_s=RECHECK_S, clock=lambda: T0 + RECHECK_S)
+    assert counts["failed"] == 2
+    assert ("8.8.8.8", "otx", "UNKNOWN") in stored_lookups(indicators)
+    mended, session = make_feed_client()
+    counts = run_enrich(indicators, mended, log=quiet, recheck_s=RECHECK_S, clock=lambda: T0 + RECHECK_S + 60)
+    assert (session.asked("otx"), counts["looked_up"]) == (2, 2)
+
+
+@pytest.mark.parametrize("days,asked_again", [("14", True), ("0", False), ("30", False)])
+def test_main_enrich_recheck_days_sets_the_age(enrich_workdir, capsys, days, asked_again):
+    workdir, session = enrich_workdir
+    main(enrich_argv(workdir))
+    c = connect(workdir / "g.sqlite")
+    for table in ("feed_lookups", "first_lookups"):
+        c.execute(f"UPDATE {table} SET checked_at = checked_at - ?", (15 * 86400,))
+    c.commit()
+    c.close()
+    session.calls.clear()
+    main(enrich_argv(workdir, "--recheck-days", days))
+    assert bool(session.calls) is asked_again
 
 
 def test_main_enrich_refresh_asks_again_for_what_is_stored(enrich_workdir, capsys):
@@ -2348,3 +2813,312 @@ def test_main_enrich_gives_a_file_indicator_back_to_the_file_when_no_page_holds_
     assert tuple(row) == ("indicators.tsv", None, None, 0)
     assert c.execute("SELECT COUNT(*) FROM feed_lookups").fetchone()[0] == 3  # its answers are kept
     c.close()
+
+
+# --------------------------------------------------------------------------
+# several requests under way at once (23 November): whatever the number of
+# workers, a run asks for the same pages, stores the same rows and prints
+# the same lines as it does with one
+# --------------------------------------------------------------------------
+
+MANY = ENTRIES + [
+    Entry(title, title, "made-up", False)
+    for title in ("Alfa", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf")
+]
+
+
+def day_paths(slug, month, day, counters) -> set[str]:
+    return {build_path(slug, month, day, None if n == 1 else n) for n in counters}
+
+
+# Days of every shape a walk meets: long with holes, short, a page behind a
+# hole, a page past the hole the crowd check stopped at, and none at all
+CROWDED = (
+    day_paths("Alfa", 10, 23, set(range(1, 41)) - {7, 8, 20})
+    | day_paths("Bravo", 10, 24, {1, 2, 3})
+    | day_paths("Charlie", 10, 23, {1, 2, 5})
+    | day_paths("Echo", 10, 24, range(1, 18))
+    | day_paths("Echo", 10, 23, {1})
+    | day_paths("Hello", 10, 24, {1, 2})
+    | day_paths("Golf", 10, 24, {1, 2, 3, 4, 9})
+)
+
+
+def table(conn, sql) -> list[tuple]:
+    return [tuple(row) for row in conn.execute(sql)]
+
+
+def crowd_run(workers, budget=None, conn=None):
+    """One crowd check over MANY on its own database, with the request log in
+    that database: a connection refuses any thread but the one that opened it."""
+    conn = conn or connect(":memory:")
+    session = PathSession(CROWDED)
+    client = TelegraphClient(
+        session=session, sleep=lambda s: None, retries=0, workers=workers, budget=budget, log=http_logger(conn)
+    )
+    lines = []
+    checked = run_crowd(conn, client, MANY, DAYS, gap=2, log=lines.append)
+    return {
+        "conn": conn,
+        "checked": checked,
+        "lines": lines,
+        "asked": sorted(session.paths),
+        "requests": client.requests_made,
+        "crowd": table(conn, "SELECT slug, month, day, highest, requests, failures FROM crowd ORDER BY slug, month, day"),
+        "logged": conn.execute("SELECT COUNT(*) FROM http_log").fetchone()[0],
+    }
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_run_crowd_with_several_workers_counts_what_one_worker_counts(workers):
+    one, many = crowd_run(1), crowd_run(workers)
+    for part in ("checked", "lines", "asked", "requests", "crowd", "logged"):
+        assert many[part] == one[part], part
+    assert one["checked"] == len(MANY) * len(DAYS)
+    assert one["logged"] == one["requests"] > 60
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_run_crowd_a_budget_stop_with_several_workers_loses_nothing_and_sends_no_more(workers):
+    whole = crowd_run(1)
+    cut = crowd_run(workers, budget=40)
+    assert cut["lines"][-1] == "budget exceeded"
+    assert cut["requests"] == cut["logged"] == 40
+    # what was counted is counted right, and the next run finishes the rest
+    assert set(cut["crowd"]) < set(whole["crowd"])
+    rest = crowd_run(workers, conn=cut["conn"])
+    assert rest["crowd"] == whole["crowd"]
+    assert rest["checked"] == whole["checked"] - cut["checked"]
+
+
+def sweep_run(workers, budget=None, conn=None, cap=None, failing=()):
+    """One sweep over MANY, on the crowd counts a crowd check gave."""
+    if conn is None:
+        conn = crowd_run(1)["conn"]
+        conn.execute("DELETE FROM http_log")
+        conn.commit()
+    session = SweepSession(CROWDED, failing)
+    client = TelegraphClient(
+        session=session, sleep=lambda s: None, retries=0, workers=workers, budget=budget, log=http_logger(conn)
+    )
+    lines = []
+    stored, requests = run_sweep(conn, client, MANY, DAYS, KEY, 2, cap, set(), log=lines.append)
+    return {
+        "conn": conn,
+        "stored": stored,
+        "summed": requests,
+        "lines": lines,
+        "asked": sorted(session.paths),
+        "requests": client.requests_made,
+        "pages": table(conn, "SELECT path FROM pages ORDER BY id"),
+        "snapshots": table(conn, "SELECT p.path, s.sha256 FROM snapshots s JOIN pages p ON p.id = s.page_id ORDER BY s.id"),
+        "progress": table(
+            conn, "SELECT slug, month, day, next_n, done, requests, failures FROM sweep_progress ORDER BY slug, month, day"
+        ),
+        "events": table(conn, "SELECT page_id, kind FROM events ORDER BY id"),
+        "logged": conn.execute("SELECT COUNT(*) FROM http_log").fetchone()[0],
+    }
+
+
+SWEEP_PARTS = ("stored", "summed", "lines", "asked", "requests", "pages", "snapshots", "progress", "events", "logged")
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_run_sweep_with_several_workers_stores_what_one_worker_stores(workers):
+    one, many = sweep_run(1), sweep_run(workers)
+    for part in SWEEP_PARTS:
+        assert many[part] == one[part], part
+    # every page is there, in counter order, and not one request more was made
+    assert {path for (path,) in one["pages"]} == CROWDED
+    assert one["logged"] == one["requests"]
+
+    # and the same with a cap, and with failures in the walk and at its end
+    failing = day_paths("Alfa", 10, 23, {3, 41, 42, 43}) | day_paths("Bravo", 10, 24, {4, 5, 6})
+    for kwargs in ({"cap": 10}, {"failing": failing}):
+        one, many = sweep_run(1, **kwargs), sweep_run(workers, **kwargs)
+        for part in SWEEP_PARTS:
+            assert many[part] == one[part], (part, kwargs)
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_run_sweep_a_budget_stop_with_several_workers_resumes_to_the_same_pages(workers):
+    whole = sweep_run(1)
+    cut = sweep_run(workers, budget=30)
+    assert cut["lines"][-1] == "budget exceeded"
+    assert cut["requests"] == cut["logged"] == 30
+    # every page stored so far is one the walk reached, in the order it reached them
+    assert cut["pages"] == whole["pages"][: len(cut["pages"])]
+    rest = sweep_run(workers, conn=cut["conn"])
+    assert rest["pages"] == whole["pages"]
+    assert [row[:5] for row in rest["progress"]] == [row[:5] for row in whole["progress"]]
+    # The last requests of a budget go to the next counters, not to later
+    # ones fetched ahead: eight pages and a budget of five store the first five
+    for _ in range(25):
+        conn = connect(":memory:")
+        seed_crowd(conn, [("Hello", 10, 23, 8)])
+        session = SweepSession(day_paths("Hello", 10, 23, range(1, 9)))
+        client = TelegraphClient(session=session, sleep=lambda s: None, retries=0, workers=workers, budget=5)
+        stored, _ = run_sweep(conn, client, ENTRIES[:1], DAYS[:1], KEY, 2, None, set(), log=quiet)
+        assert (stored, sorted(session.paths)) == (5, sorted(day_paths("Hello", 10, 23, range(1, 6))))
+
+
+def resweep_run(workers, budget=None):
+    conn = connect(":memory:")
+    live = {f"Hello-10-17-{n}": live_page(f"title {n}") for n in range(2, 42)}
+    for path, page in live.items():
+        add_snapshot(conn, upsert_page(conn, path, T0), {"path": path, **page}, T0, KEY)
+    for n in (5, 6, 20):
+        live[f"Hello-10-17-{n}"] = live_page(f"rotated {n}")
+    for n in (9, 30):
+        del live[f"Hello-10-17-{n}"]
+    session = ResweepSession(live, failing={"Hello-10-17-12", "Hello-10-17-13"})
+    client = TelegraphClient(
+        session=session, sleep=lambda s: None, retries=0, workers=workers, budget=budget, log=http_logger(conn)
+    )
+    lines = []
+    counts = run_resweep(conn, client, everything(conn), KEY, log=lines.append)
+    return {
+        "counts": counts,
+        "lines": lines,
+        "asked": sorted(session.paths),
+        "events": table(conn, "SELECT p.path, e.kind FROM events e JOIN pages p ON p.id = e.page_id ORDER BY e.id"),
+        "snapshots": table(conn, "SELECT p.path, s.title FROM snapshots s JOIN pages p ON p.id = s.page_id ORDER BY s.id"),
+        "views": table(conn, "SELECT p.path, v.views FROM views v JOIN pages p ON p.id = v.page_id ORDER BY p.path"),
+        "logged": conn.execute("SELECT COUNT(*) FROM http_log").fetchone()[0],
+    }
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_run_resweep_and_run_meta_with_several_workers_record_what_one_worker_records(workers):
+    one, many = resweep_run(1), resweep_run(workers)
+    assert many == one
+    assert one["counts"] == {"refreshed": 36, "changed": 3, "gone": 2, "failed": 2}
+    assert one["logged"] == 40
+
+    # and the same for the timestamps
+    one, many = meta_run(1), meta_run(workers)
+    assert many == one
+    assert one["counts"] == {"fetched": 22, "changed": 0, "not_found": 6, "failed": 2}
+
+
+def test_run_resweep_a_budget_stop_with_several_workers_keeps_every_answer_it_paid_for():
+    cut = resweep_run(4, budget=10)
+    assert cut["lines"][-1] == "budget exceeded"
+    assert cut["logged"] == len(cut["asked"]) == 10
+    counts = cut["counts"]
+    assert counts["refreshed"] + counts["gone"] + counts["failed"] == 10
+
+
+def meta_run(workers):
+    conn = connect(":memory:")
+    paths = [f"Hello-10-17-{n}" for n in range(2, 32)]
+    rows = seed_pages(conn, paths)
+    times = {path: ("2026-10-17T08:00:00+0000", f"2026-10-17T09:{n:02d}:00+0000") for n, path in enumerate(paths[:24])}
+    session = HtmlSession(times, failing={paths[3], paths[4]})
+    client = TelegraphClient(
+        session=session, sleep=lambda s: None, retries=0, workers=workers, log=http_logger(conn)
+    )
+    lines = []
+    counts = run_meta(conn, client, rows, log=lines.append)
+    return {
+        "counts": counts,
+        "lines": lines,
+        "asked": sorted(session.paths),
+        "meta": table(conn, "SELECT path, published_at, modified_at FROM pages ORDER BY id"),
+        "logged": conn.execute("SELECT COUNT(*) FROM http_log").fetchone()[0],
+    }
+
+
+# --- the option ---
+
+
+def crowd_argv(workdir, *extra):
+    return ["--config", str(workdir / "nope.env"), "crowd", *common(workdir, budget="5"),
+            "--days", "1", "--today", "2026-11-01", *extra]
+
+
+def test_main_gives_the_client_four_workers_or_as_many_as_asked_for(workdir, offline, capsys):
+    main(crowd_argv(workdir))
+    assert offline["workers"] == 4
+    # more workers do not raise the rate: it is still the 8 a second of --rate
+    assert offline["rate_per_s"] == 8.0
+    main(crowd_argv(workdir, "--workers", "6"))
+    assert offline["workers"] == 6
+
+
+@pytest.mark.parametrize("command", ["crowd", "sweep", "meta"])
+def test_main_refuses_fewer_than_one_worker(command, tmp_path):
+    extra = ["--stale", "24"] if command == "meta" else []
+    with pytest.raises(SystemExit) as stopped:
+        main(["--config", str(tmp_path / "missing.env"), command, "--db", str(tmp_path / "g.sqlite"), "--workers", "0", *extra])
+    assert str(stopped.value) == "--workers has to be 1 or more"
+
+
+# --- and the requests really are under way together ---
+
+
+def slowed(session, delay=0.01):
+    """Makes a fake session take `delay` seconds an answer and count how many
+    requests were under way at once, in session.most."""
+    answer = session.get
+    lock = threading.Lock()
+    session.most = session.under_way = 0
+
+    def get(url, **kwargs):
+        with lock:
+            session.under_way += 1
+            session.most = max(session.most, session.under_way)
+        time.sleep(delay)
+        try:
+            return answer(url, **kwargs)
+        finally:
+            with lock:
+                session.under_way -= 1
+
+    session.get = get
+    return session
+
+
+def threaded_client(session, workers):
+    return TelegraphClient(session=session, sleep=lambda s: None, retries=0, workers=workers)
+
+
+@pytest.mark.parametrize("workers,least", [(1, 1), (4, 2)])
+def test_run_sweep_fetches_what_a_walk_is_sure_to_ask_for_ahead_of_it(workers, least):
+    conn = crowd_run(1)["conn"]
+    session = slowed(SweepSession(CROWDED), 0.003)
+    stored, _ = run_sweep(conn, threaded_client(session, workers), MANY, DAYS, KEY, 2, None, set(), log=quiet)
+    assert stored == len(CROWDED)
+    assert least <= session.most <= workers
+
+    # Most title-days hold nothing and cost gap + 1 requests, none of which
+    # depends on another. One at a time they are what kept the rate under 8.
+    conn = connect(":memory:")
+    seed_crowd(conn, [("Hello", 10, 23, 0)])
+    session = slowed(SweepSession(set()), 0.02)
+    run_sweep(conn, threaded_client(session, 4), ENTRIES[:1], DAYS[:1], KEY, 2, None, set(), log=quiet)
+    assert (session.paths.__len__(), session.most) == (3, 3)
+
+
+@pytest.mark.parametrize("workers,least", [(1, 1), (4, 2)])
+def test_run_resweep_run_meta_and_run_crowd_have_several_requests_under_way_at_once(workers, least):
+    conn = connect(":memory:")
+    live = {f"Hello-10-17-{n}": live_page(f"title {n}") for n in range(2, 22)}
+    for path, page in live.items():
+        add_snapshot(conn, upsert_page(conn, path, T0), {"path": path, **page}, T0, KEY)
+    session = slowed(ResweepSession(live))
+    counts = run_resweep(conn, threaded_client(session, workers), everything(conn), KEY, log=quiet)
+    assert counts["refreshed"] == 20
+    assert least <= session.most <= workers
+    rows = conn.execute("SELECT id, path FROM pages ORDER BY id").fetchall()
+    html = slowed(HtmlSession({path: ("2026-10-17T08:00:00+0000", "2026-10-17T09:00:00+0000") for path in live}))
+    counts = run_meta(conn, threaded_client(html, workers), rows, log=quiet)
+    assert counts["fetched"] == 20
+    assert least <= html.most <= workers
+
+    # and the crowd check counts several title-days at once
+    session = slowed(PathSession(CROWDED), 0.003)
+    run_crowd(connect(":memory:"), threaded_client(session, workers), MANY, DAYS, gap=2, log=quiet)
+    assert least <= session.most <= workers
+
+

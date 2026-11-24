@@ -197,11 +197,29 @@ def crowd_check(
     Yields:
         DayCount: one per (slug, day) not in done, slugs outer, days inner
     """
+    for slug, month, day in crowd_units(slugs, days, done):
+        yield count_day(probe, slug, month, day, gap=gap)
+
+
+def crowd_units(slugs: list[str], days: list[tuple[int, int]], done=frozenset()):
+    """The (slug, day) pairs a crowd check has to count
+
+    Each pair is counted on its own, whatever the others hold, so several
+    can be counted at once.
+
+    Args:
+        slugs (list[str]): slugs to check, outer loop
+        days (list[tuple[int, int]]): (month, day) pairs to check, inner loop
+        done (optional): set of (slug, month, day) already recorded, from
+            load_done. Defaults to an empty frozenset.
+
+    Yields:
+        tuple[str, int, int]: (slug, month, day) for each pair not in done
+    """
     for slug in slugs:
         for month, day in days:
-            if (normalize_slug(slug), month, day) in done:
-                continue
-            yield count_day(probe, slug, month, day, gap=gap)
+            if (normalize_slug(slug), month, day) not in done:
+                yield slug, month, day
 
 
 def save_day_count(conn: Connection, dc: DayCount, ts: float):

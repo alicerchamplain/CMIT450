@@ -20,7 +20,8 @@ from graphwatch.db import (
     delete_stale_indicators,
     explain_rows,
     fingerprint,
-    flagged_page_snapshots,
+    flagged_page_ids,
+    flagged_pages,
     held_out_paths,
     http_logger,
     indicator_rows,
@@ -30,6 +31,8 @@ from graphwatch.db import (
     load_known,
     load_progress,
     lookup_rows,
+    page_snapshots,
+    title_rows,
     mark_gone,
     parse_path,
     refresh_snapshot,
@@ -57,6 +60,8 @@ KNOWN = ROOT / "known.txt"
 
 T0 = 1_700_000_000.0  # a fixed "now" so timestamps are predictable
 HOUR = 3600.0
+DAY = 86400.0
+RECHECK = 14 * DAY  # the age at which an UNKNOWN is asked for once more
 KEY = b"test-key"  # any fixed HMAC key; redaction output only has to be stable
 
 ALL_TABLES = {
@@ -73,6 +78,8 @@ ALL_TABLES = {
     "views",
     "indicators",
     "feed_lookups",
+    "first_lookups",
+    "indicator_titles",
 }
 
 
@@ -1370,9 +1377,10 @@ def test_save_lookup_round_trip(conn):
     save_lookup(conn, indicator_id, "threatfox", "KNOWN", "2 IOCs", T0 + 5)
     save_lookup(conn, indicator_id, "otx", "UNKNOWN", None, T0 + 6)
     save_lookup(conn, other, "urlhaus", "UNKNOWN", None, T0 + 7)
+    # the answer, and after it the first answer, which is the same one so far
     assert [tuple(r) for r in lookup_rows(conn, indicator_id)] == [
-        ("otx", "UNKNOWN", None, T0 + 6),
-        ("threatfox", "KNOWN", "2 IOCs", T0 + 5),
+        ("otx", "UNKNOWN", None, T0 + 6, "UNKNOWN", T0 + 6),
+        ("threatfox", "KNOWN", "2 IOCs", T0 + 5, "KNOWN", T0 + 5),
     ]
 
 
@@ -1382,8 +1390,105 @@ def test_save_lookup_twice_replaces_the_answer_for_that_feed(conn):
     save_lookup(conn, indicator_id, "otx", "UNKNOWN", None, T0)
     save_lookup(conn, indicator_id, "otx", "KNOWN", "1 pulses", T0 + 99)
     assert [tuple(r) for r in lookup_rows(conn, indicator_id)] == [
-        ("otx", "KNOWN", "1 pulses", T0 + 99)
+        ("otx", "KNOWN", "1 pulses", T0 + 99, "UNKNOWN", T0)
     ]
+
+
+def test_save_lookup_keeps_the_first_answer_however_often_it_is_replaced(conn):
+    # What a feed knew when the indicator was found is the Novelty measure
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    save_lookup(conn, indicator_id, "otx", "UNKNOWN", None, T0)
+    save_lookup(conn, indicator_id, "otx", "KNOWN", "1 pulses", T0 + 99)
+    save_lookup(conn, indicator_id, "otx", "KNOWN", "3 pulses", T0 + 200)
+    assert [tuple(r) for r in conn.execute("SELECT * FROM first_lookups")] == [
+        (indicator_id, "otx", "UNKNOWN", None, T0)
+    ]
+    assert tuple(lookup_rows(conn, indicator_id)[0])[1:4] == ("KNOWN", "3 pulses", T0 + 200)
+
+
+def test_an_answer_stored_before_first_lookups_existed_becomes_the_first_answer(conn):
+    # Production's first 152 answers were stored the day before the table was added
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    conn.execute(
+        "INSERT INTO feed_lookups (indicator_id, feed, verdict, detail, checked_at) VALUES (?, ?, ?, ?, ?)",
+        (indicator_id, "threatfox", "UNKNOWN", None, T0),
+    )
+    conn.commit()
+    # read as it stands, the stored answer is its own first answer
+    assert tuple(lookup_rows(conn, indicator_id)[0]) == ("threatfox", "UNKNOWN", None, T0, "UNKNOWN", T0)
+    # and its age is measured from that day
+    assert cached_feeds(conn, indicator_id, RECHECK, T0 + RECHECK - 1) == {"threatfox"}
+    assert cached_feeds(conn, indicator_id, RECHECK, T0 + RECHECK) == set()
+    save_lookup(conn, indicator_id, "threatfox", "KNOWN", "1 IOCs, Made-up RAT", T0 + 14 * DAY)
+    assert tuple(lookup_rows(conn, indicator_id)[0]) == (
+        "threatfox", "KNOWN", "1 IOCs, Made-up RAT", T0 + 14 * DAY, "UNKNOWN", T0,
+    )
+
+
+def test_an_indicators_titles_are_what_the_flagged_pages_say_in_this_run(conn):
+    def titles(indicator_id):
+        return [tuple(row) for row in title_rows(conn, indicator_id)]
+
+    a = upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0, 4, {"botnet": 1, "hello": 3})
+    listed = upsert_indicator(conn, "ip", "9.9.9.9", "indicators.tsv")
+    other = upsert_indicator(conn, "ip", "8.8.4.4", "pages", T0, T0, 1, {"hello": 1})
+    assert titles(a) == [("hello", 3), ("botnet", 1)]  # the title on most pages first
+    assert titles(listed) == []
+    # the next run replaces them, as it replaces the times and the page count
+    assert upsert_indicator(conn, "ip", "8.8.8.8", "pages", T0, T0 + 60, 2, {"hello": 1, "alfa": 1}) == a
+    assert titles(a) == [("alfa", 1), ("hello", 1)]
+    # a file that names the indicator changes nothing on a row the pages gave
+    upsert_indicator(conn, "ip", "8.8.8.8", "indicators.tsv")
+    assert titles(a) == [("alfa", 1), ("hello", 1)]
+    # given back to the file it is on no page any more
+    release_indicator_to_file(conn, "ip", "8.8.8.8", "indicators.tsv")
+    assert titles(a) == []
+    assert titles(other) == [("hello", 1)]  # and no other indicator loses its own
+    # Code from before the titles were kept gives an indicator back to its
+    # file and leaves them behind. The next run of this code clears them.
+    conn.execute("INSERT INTO indicator_titles (indicator_id, slug, pages) VALUES (?, 'hello', 2)", (a,))
+    assert delete_stale_indicators(conn, {("ip", "8.8.4.4")}) == 0
+    assert (titles(a), titles(other)) == ([], [("hello", 1)])
+    # and a stale indicator takes its titles with it
+    assert delete_stale_indicators(conn, set()) == 1
+    assert conn.execute("SELECT COUNT(*) FROM indicator_titles").fetchone()[0] == 0
+
+
+def test_delete_stale_indicators_takes_the_first_answers_with_it(conn):
+    gone = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    kept = upsert_indicator(conn, "ip", "9.9.9.9", "pages")
+    save_lookup(conn, gone, "otx", "UNKNOWN", None, T0)
+    save_lookup(conn, kept, "otx", "UNKNOWN", None, T0)
+    assert delete_stale_indicators(conn, {("ip", "9.9.9.9")}) == 1
+    assert [r[0] for r in conn.execute("SELECT indicator_id FROM first_lookups")] == [kept]
+    # Code from before the table existed deletes the answers and the indicator
+    # and knows nothing of first_lookups: after a rollback it must still work
+    conn.execute("DELETE FROM feed_lookups WHERE indicator_id = ?", (kept,))
+    conn.execute("DELETE FROM indicators WHERE id = ?", (kept,))
+    assert conn.execute("SELECT COUNT(*) FROM first_lookups").fetchone()[0] == 0
+
+
+
+
+@pytest.mark.parametrize(
+    "verdict,first_at,asked_at,now,stands",
+    [
+        ("UNKNOWN", T0, T0, T0 + RECHECK - 1, True),  # not old enough yet
+        ("UNKNOWN", T0, T0, T0 + RECHECK, False),  # old enough: asked for once more
+        ("UNKNOWN", T0, T0 + 3 * DAY, T0 + RECHECK, False),  # a refresh on day 3 was too early to count
+        ("UNKNOWN", T0, T0 + RECHECK, T0 + 40 * DAY, True),  # asked at that age: never again
+        ("UNKNOWN", T0, T0 + 20 * DAY, T0 + 400 * DAY, True),
+        ("KNOWN", T0, T0, T0 + 400 * DAY, True),  # a KNOWN is not asked for again
+    ],
+)
+def test_cached_feeds_lets_an_old_unknown_be_asked_for_once_more(conn, verdict, first_at, asked_at, now, stands):
+    indicator_id = upsert_indicator(conn, "ip", "8.8.8.8", "pages")
+    save_lookup(conn, indicator_id, "otx", verdict, None, first_at)
+    if asked_at != first_at:
+        save_lookup(conn, indicator_id, "otx", verdict, None, asked_at)
+    assert cached_feeds(conn, indicator_id, RECHECK, now) == ({"otx"} if stands else set())
+    # with no recheck age nothing is ever asked for again
+    assert cached_feeds(conn, indicator_id) == {"otx"}
 
 
 def test_cached_feeds_names_the_feeds_that_answered_for_one_indicator(conn):
@@ -1411,22 +1516,23 @@ def test_indicator_rows_is_by_kind_then_first_seen_with_untimed_ones_last(conn):
     ]
 
 
-def test_flagged_page_snapshots_reads_every_snapshot_of_a_flagged_page_oldest_first(conn):
-    # collect_indicators takes the first time it meets an indicator as the
-    # earliest, so the order is by fetch time, across pages.
+def test_flagged_page_ids_lists_each_flagged_page_once_lowest_first(conn):
     a = seen_page(conn, "Hello-10-17-1", T0)
-    add_snapshot(conn, a, {"title": "t", "content": ["rotated"]}, T0 + 60, KEY)
     b = seen_page(conn, "Hello-10-17-2", T0 + 30)
-    flag(conn, a, True)
     flag(conn, b, True)
-    rows = flagged_page_snapshots(conn).fetchall()
-    assert [(r["page_id"], r["fetched_at"]) for r in rows] == [(a, T0), (b, T0 + 30), (a, T0 + 60)]
-    assert (rows[2]["title"], rows[2]["text"]) == ("t", "t\n\nrotated")
-    # No author field: those are stored raw and never published
-    assert set(rows[0].keys()) == {"page_id", "fetched_at", "title", "text"}
+    flag(conn, a, True)
+    # a second flagged snapshot of the same page is still one page
+    add_snapshot(conn, a, {"title": "t", "content": ["rotated"]}, T0 + 60, KEY)
+    flag(conn, a, True)
+    assert conn.execute("SELECT COUNT(*) FROM scores WHERE flagged = 1").fetchone()[0] == 3
+    assert flagged_page_ids(conn) == [a, b]
+    # with the title each was found under, which says whose page it is
+    c = seen_page(conn, "botnet-11-20", T0 + 90)
+    flag(conn, c, True)
+    assert [tuple(row) for row in flagged_pages(conn)] == [(a, "hello"), (b, "hello"), (c, "botnet")]
 
 
-def test_flagged_page_snapshots_leaves_out_unflagged_and_held_out_pages(conn):
+def test_flagged_page_ids_leaves_out_unflagged_and_held_out_pages(conn):
     a = seen_page(conn, "Hello-10-17-1", T0)
     b = seen_page(conn, "Hello-10-17-2", T0)
     seen_page(conn, "Hello-10-17-3", T0)  # never classified
@@ -1435,7 +1541,36 @@ def test_flagged_page_snapshots_leaves_out_unflagged_and_held_out_pages(conn):
     flag(conn, a, True)
     flag(conn, b, False)
     flag(conn, known, True)
-    assert [r["page_id"] for r in flagged_page_snapshots(conn)] == [a]
+    assert flagged_page_ids(conn) == [a]
+    # The actor edits in place: the newest snapshot need not be the flagged one.
+    add_snapshot(conn, a, {"title": "t", "content": ["rotated"]}, T0 + 60, KEY)
+    flag(conn, a, False)
+    assert flagged_page_ids(conn) == [a]
+
+
+def test_page_snapshots_reads_every_snapshot_of_the_one_page_oldest_first(conn):
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    b = seen_page(conn, "Hello-10-17-2", T0 + 30)
+    add_snapshot(conn, a, {"title": "t", "content": ["rotated"]}, T0 + 60, KEY)
+    rows = page_snapshots(conn, a)
+    assert [(r["page_id"], r["fetched_at"]) for r in rows] == [(a, T0), (a, T0 + 60)]
+    assert (rows[1]["title"], rows[1]["text"]) == ("t", "t\n\nrotated")
+    assert rows[0]["id"] < rows[1]["id"]
+    # No author field: those are stored raw and never published
+    assert set(rows[0].keys()) == {"id", "page_id", "fetched_at", "title", "text"}
+    assert [r["page_id"] for r in page_snapshots(conn, b)] == [b]
+    assert page_snapshots(conn, 999) == []
+    # a tie in time is broken by the order they were stored
+    tied, _changed = add_snapshot(conn, a, {"title": "t", "content": ["again"]}, T0 + 60, KEY)
+    assert [r["id"] for r in page_snapshots(conn, a)][-1] == tied
+
+
+def test_page_snapshots_hands_out_a_list_and_leaves_no_read_open(conn):
+    # A cursor left open holds a read lock, and every other writer's commit
+    # waits behind it. A list has been read to its end.
+    a = seen_page(conn, "Hello-10-17-1", T0)
+    assert isinstance(page_snapshots(conn, a), list)
+    assert isinstance(flagged_page_ids(conn), list)
 
 
 # --------------------------------------------------------------------------

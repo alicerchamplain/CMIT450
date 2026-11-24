@@ -13,7 +13,7 @@ class DaySweep:
     slug: str  # the slug as probed, from slugify
     month: int  # 1 to 12
     day: int  # 1 to 31
-    next_n: int  # next counter to check
+    next_n: int  # next counter to check; after a tail of failures, the first counter that failed
     done: bool  # if the day has been swept already
     requests: int  # probes spent on this day
     failures: int  # probes that came back FAILED
@@ -29,25 +29,38 @@ def sweep_day(
     expected: int,
     gap: int,
     cap: int | None = None,
+    hint=None,
 ) -> Iterator[Fetch]:
-    """_summary_
+    """Walks the counters of one slug on one day, from start until the day has ended
+
+    Counters up to expected, the crowd count, are fetched whatever they
+    hold. Past it the walk ends at the first run of more than gap counters
+    with no page. A run that is all failures leaves the day not done, to be
+    walked again from the first counter that failed.
 
     Args:
-        fetch (_type_): _description_
-        slug (str): _description_
-        month (int): _description_
-        day (int): _description_
-        start (int): _description_
-        expected (int): _description_
-        gap (int): _description_
-        cap (int | None, optional): _description_. Defaults to None.
+        fetch: callable taking a path and returning a Fetch
+        slug (str): the slug to walk, already through slugify
+        month (int): 1 to 12
+        day (int): 1 to 31
+        start (int): the first counter to fetch; 1 is the bare path
+        expected (int): the highest counter the crowd check confirmed
+        gap (int): how many consecutive missing counters to tolerate past expected
+        cap (int | None, optional): the last counter to fetch. Defaults to None.
+        hint (optional): callable taking an iterable of the paths the walk is
+            certain to fetch next, so that they can be fetched ahead of it;
+            see telegraph.Ahead. Defaults to None.
 
     Returns:
-        _type_: _description_
+        DaySweep: where the walk stopped, whether the day is done, and what it cost
 
     Yields:
-        Iterator[Fetch]: _description_
+        Iterator[Fetch]: each page found, in counter order
     """
+
+    def path_of(counter: int) -> str:
+        return build_path(slug, month, day, None if counter == 1 else counter)
+
     n = start
     miss = 0
     miss_failed = 0
@@ -56,7 +69,15 @@ def sweep_day(
     found = []
     done = False
     while True:
-        path = build_path(slug, month, day, None if n == 1 else n)
+        if hint is not None:
+            # How far the walk goes whatever the next answers are. Up to
+            # expected nothing stops it, and past it a run of gap + 1 misses
+            # does, so it reads on until the run it is in could be that long.
+            sure = expected + gap + 1 if n <= expected else n + gap - miss
+            if cap is not None:
+                sure = min(sure, cap)
+            hint(path_of(counter) for counter in range(n, sure + 1))
+        path = path_of(n)
         result = fetch(path)
         requests += 1
         if result.outcome is Outcome.FOUND:
@@ -83,7 +104,12 @@ def sweep_day(
             continue
         if miss > gap:
             if miss_failed == miss:
+                # Every counter of this run failed: nothing says the day is
+                # over, only that Telegraph did not answer. The day stays
+                # open, and the next walk starts at the first of them, not
+                # after the last: a page behind a failure is still to fetch.
                 done = False
+                n -= miss
             else:
                 done = True
             break

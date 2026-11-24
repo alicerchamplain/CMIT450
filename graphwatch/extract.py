@@ -38,7 +38,15 @@ URL_TRAILING = ".,;:!?)]}"
 # (?<![\w.@-]) : not the tail of a longer name and not an email's domain
 # HOST         : labels ending in a known TLD
 # (?![\w@-])   : the name ends here and is not an email's local part
-HOST_TOKEN_PATTERN = re.compile(rf"(?<![\w.@-])(?:{HOST})(?![\w@-])", re.IGNORECASE)
+# (?!\.[a-z0-9]) : and it does not go on with another label, in either case.
+#                A name on an ending the TLD list does not hold,
+#                c2.example.com.ph, or the decoy of google.com.ph@host, would
+#                otherwise give its front: c2.example.com is another server
+#                and is not on the page. A host is reported whole or not at
+#                all. The price is a sentence that lost its space: in
+#                "evil.com.Then he" the host is not reported either, and a
+#                host that is missed costs less than one that is wrong.
+HOST_TOKEN_PATTERN = re.compile(rf"(?<![\w.@-])(?:{HOST})(?![\w@-])(?!\.[a-z0-9])", re.IGNORECASE)
 
 # Regex for a run of hex that could hide a pointer
 # (?<![0-9A-Za-z])     : start of a token

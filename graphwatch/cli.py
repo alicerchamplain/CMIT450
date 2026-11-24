@@ -6,7 +6,7 @@ import time
 from collections import Counter
 from datetime import UTC, date, datetime
 from pathlib import Path
-from sqlite3 import Connection
+from sqlite3 import Connection, Row
 
 from graphwatch.classify import (
     body_hash,
@@ -17,8 +17,9 @@ from graphwatch.classify import (
 )
 from graphwatch.config import CONFIG, hmac_key, load_config
 from graphwatch.crowd import (
+    count_day,
+    crowd_units,
     count_only_slugs,
-    crowd_check,
     fit_window,
     load_done,
     load_expected,
@@ -55,13 +56,21 @@ from graphwatch.db import (
 )
 from graphwatch.enrich import (
     collect_indicators,
-    novelty,
+    count_verdicts,
     novelty_rows,
     read_indicator_file,
     render_novelty_table,
 )
 from graphwatch.extract import extract
-from graphwatch.feeds import FEEDS, KEY_NAMES, FeedClient, Verdict, feed_keys
+from graphwatch.feeds import (
+    FEEDS,
+    KEY_NAMES,
+    FeedClient,
+    KeyCheck,
+    Verdict,
+    failure_kind,
+    feed_keys,
+)
 from graphwatch.rules import (
     CATEGORIES,
     RULES,
@@ -81,7 +90,7 @@ from graphwatch.slugify import (
     write_sums,
 )
 from graphwatch.sweep import sweep_day
-from graphwatch.telegraph import BudgetExceeded, Fetch, Outcome, TelegraphClient
+from graphwatch.telegraph import Ahead, BudgetExceeded, Fetch, Outcome, Pool, TelegraphClient
 
 CLASSIFY_BATCH = 1000
 
@@ -185,6 +194,10 @@ def run_crowd(
 ) -> int:
     """Run the crowd check over every word list entry and day, saving as it goes
 
+    Each title-day is counted on its own, so as many as the client has
+    workers are counted at once. The counts are saved here, in order, on the
+    calling thread.
+
     Args:
         conn (Connection): database connection from db.connect
         client (TelegraphClient): the client to probe with
@@ -203,16 +216,22 @@ def run_crowd(
     done = load_done(conn)
     probe = make_probe(client)
     checked = 0
-    try:
-        for dc in crowd_check(probe, slugs, days, gap=gap, done=done):
-            save_day_count(conn, dc, time.time())
-            checked += 1
-            if dc.highest:
-                log(
-                    f"{dc.slug} {dc.month:02d}-{dc.day:02d}: {dc.highest} pages, {dc.requests} requests"
-                )
-    except BudgetExceeded:
-        log("budget exceeded")
+
+    def count(unit: tuple[str, int, int]):
+        slug, month, day = unit
+        return count_day(probe, slug, month, day, gap=gap)
+
+    with Pool(client) as pool:
+        try:
+            for _unit, dc in pool.map(count, crowd_units(slugs, days, done)):
+                save_day_count(conn, dc, time.time())
+                checked += 1
+                if dc.highest:
+                    log(
+                        f"{dc.slug} {dc.month:02d}-{dc.day:02d}: {dc.highest} pages, {dc.requests} requests"
+                    )
+        except BudgetExceeded:
+            log("budget exceeded")
     return checked
 
 
@@ -227,100 +246,109 @@ def run_sweep(
     exclude: set[str],
     log=print,
 ) -> tuple[int, int]:
-    """Function to manage running sweeps
+    """Function to walk every title on every day and store the pages found
+
+    A title-day is walked from where the last run left it, to the crowd
+    count and then on to the first hole. Each page is stored, and the place
+    reached is saved, before the next one is looked at, so a budget stop or
+    a crash loses nothing. The counters a walk is certain to ask for are
+    fetched ahead of it, as many at once as the client has workers; storing
+    stays in counter order on the calling thread.
 
     Args:
-        conn (Connection): _description_
-        client (TelegraphClient): _description_
-        entries (list[Entry]): _description_
-        days (list[tuple[int, int]]): _description_
-        key (bytes): _description_
-        gap (int): _description_
-        cap (int | None): _description_
-        exclude (set[str]): _description_
-        log (_type_, optional): _description_. Defaults to print.
+        conn (Connection): SQL db connection
+        client (TelegraphClient): Telegraph client
+        entries (list[Entry]): word list entries from load_wordlists
+        days (list[tuple[int, int]]): (month, day) pairs from recent_days
+        key (bytes): the hmac key for redaction
+        gap (int): missing counters to tolerate past the crowd count
+        cap (int | None): the last counter to fetch on a day, or None
+        exclude (set[str]): normalized slugs that are counted, not swept
+        log (optional): Logging function. Defaults to print.
 
     Returns:
-        tuple[int, int]: _description_
+        tuple[int, int]: pages stored, and requests the finished walks made
     """
 
     for entry in entries:
         upsert_title(conn, entry, time.time())
     expected = load_expected(conn)
-    fetch = make_fetch(client)
     stored = 0
     requests = 0
     uncounted = 0
-    try:
-        for entry in entries:
-            # The database speaks normalized keys; the network speaks the raw slug.
-            slug = entry.slug
-            slug_key = normalize_slug(slug)
-            if slug_key in exclude:
-                continue
-            for month, day in days:
-                next_n, done = load_progress(conn, slug_key, month, day)
-                if done:
+    with Pool(client) as pool:
+        ahead = Ahead(pool, make_fetch(client))
+        try:
+            for entry in entries:
+                # The database speaks normalized keys; the network speaks the raw slug.
+                slug = entry.slug
+                slug_key = normalize_slug(slug)
+                if slug_key in exclude:
                     continue
-                if (slug_key, month, day) not in expected:
-                    # Without a crowd count the walk has no known end and would
-                    # stop at the first hole, so the day is left for a later run.
-                    uncounted += 1
-                    continue
-                gen = sweep_day(
-                    fetch,
-                    slug,
-                    month,
-                    day,
-                    next_n,
-                    expected[(slug_key, month, day)],
-                    gap,
-                    cap,
-                )
-                while True:
-                    try:
-                        f = next(gen)
-                    except StopIteration as stop:
-                        summary = stop.value
-                        break
-                    try:
-                        store_fetch(conn, f, time.time(), key)
-                        stored += 1
-                    except RecursionError:
-                        # A page nested deeper than Python can walk cannot be
-                        # redacted, so it is not stored. The walk moves on:
-                        # stopping here would stop it here every night.
-                        log(f"{f.page['path']}: nested too deep to redact, not stored")
-                    counter = parse_path(f.page["path"])[3] or 1
+                for month, day in days:
+                    next_n, done = load_progress(conn, slug_key, month, day)
+                    if done:
+                        continue
+                    if (slug_key, month, day) not in expected:
+                        # Without a crowd count the walk has no known end and would
+                        # stop at the first hole, so the day is left for a later run.
+                        uncounted += 1
+                        continue
+                    gen = sweep_day(
+                        ahead.fetch,
+                        slug,
+                        month,
+                        day,
+                        next_n,
+                        expected[(slug_key, month, day)],
+                        gap,
+                        cap,
+                        hint=ahead.hint,
+                    )
+                    while True:
+                        try:
+                            f = next(gen)
+                        except StopIteration as stop:
+                            summary = stop.value
+                            break
+                        try:
+                            store_fetch(conn, f, time.time(), key)
+                            stored += 1
+                        except RecursionError:
+                            # A page nested deeper than Python can walk cannot be
+                            # redacted, so it is not stored. The walk moves on:
+                            # stopping here would stop it here every night.
+                            log(f"{f.page['path']}: nested too deep to redact, not stored")
+                        counter = parse_path(f.page["path"])[3] or 1
+                        save_progress(
+                            conn,
+                            slug_key,
+                            month,
+                            day,
+                            counter + 1,
+                            False,
+                            0,
+                            0,
+                            time.time(),
+                        )
                     save_progress(
                         conn,
                         slug_key,
                         month,
                         day,
-                        counter + 1,
-                        False,
-                        0,
-                        0,
+                        summary.next_n,
+                        summary.done,
+                        summary.requests,
+                        summary.failures,
                         time.time(),
                     )
-                save_progress(
-                    conn,
-                    slug_key,
-                    month,
-                    day,
-                    summary.next_n,
-                    summary.done,
-                    summary.requests,
-                    summary.failures,
-                    time.time(),
-                )
-                requests += summary.requests
-                if summary.found:
-                    log(
-                        f"{slug} {month:02d}-{day:02d}: {len(summary.found)} pages, {summary.requests} requests"
-                    )
-    except BudgetExceeded:
-        log("budget exceeded")
+                    requests += summary.requests
+                    if summary.found:
+                        log(
+                            f"{slug} {month:02d}-{day:02d}: {len(summary.found)} pages, {summary.requests} requests"
+                        )
+        except BudgetExceeded:
+            log("budget exceeded")
     if uncounted:
         log(
             f"skipped {uncounted} title-days with no crowd count; run crowd for those days, then sweep again"
@@ -350,70 +378,78 @@ def run_resweep(
         dict: counts of refreshed, changed, gone and failed
     """
     counts = {"refreshed": 0, "changed": 0, "gone": 0, "failed": 0}
-    try:
-        for row in pages:
-            fetch = client.get_page(row["path"])
-            ts = time.time()
-            if fetch.outcome is Outcome.FOUND:
-                # By the row's id: Telegraph may answer with the path in
-                # another spelling than the one stored, and the row asked
-                # for is the one that has to leave the work list
-                try:
-                    changed = refresh_snapshot(conn, row["id"], fetch.page, ts, key)
-                except RecursionError:
-                    # Nested deeper than Python can walk: it cannot be
-                    # redacted, so it is not stored, and the run goes on
-                    conn.rollback()
+
+    def again(row) -> Fetch:
+        return client.get_page(row["path"])
+
+    with Pool(client) as pool:
+        try:
+            for row, fetch in pool.map(again, pages):
+                ts = time.time()
+                if fetch.outcome is Outcome.FOUND:
+                    # By the row's id: Telegraph may answer with the path in
+                    # another spelling than the one stored, and the row asked
+                    # for is the one that has to leave the work list
+                    try:
+                        changed = refresh_snapshot(conn, row["id"], fetch.page, ts, key)
+                    except RecursionError:
+                        # Nested deeper than Python can walk: it cannot be
+                        # redacted, so it is not stored, and the run goes on
+                        conn.rollback()
+                        counts["failed"] += 1
+                        log(f"{row['path']}: nested too deep to redact, not stored")
+                        continue
+                    counts["refreshed"] += 1
+                    if changed:
+                        counts["changed"] += 1
+                        log(f"{row['path']}: content changed")
+                elif fetch.outcome is Outcome.NOT_FOUND:
+                    mark_gone(conn, row["id"], ts)
+                    counts["gone"] += 1
+                    log(f"{row['path']}: gone")
+                else:
                     counts["failed"] += 1
-                    log(f"{row['path']}: nested too deep to redact, not stored")
-                    continue
-                counts["refreshed"] += 1
-                if changed:
-                    counts["changed"] += 1
-                    log(f"{row['path']}: content changed")
-            elif fetch.outcome is Outcome.NOT_FOUND:
-                mark_gone(conn, row["id"], ts)
-                counts["gone"] += 1
-                log(f"{row['path']}: gone")
-            else:
-                counts["failed"] += 1
-    except BudgetExceeded:
-        log("budget exceeded")
+        except BudgetExceeded:
+            log("budget exceeded")
     return counts
 
 
 def run_meta(conn: Connection, client: TelegraphClient, pages: list, log=print) -> dict:
-    """Function to orchestrate store_meta
+    """Function to fetch pages' HTML for their timestamps and store what changed
 
     Args:
         conn (Connection): Sql db connection
         client (TelegraphClient): Telegraph client
-        pages (list): List of pages
-        log (_type_, optional): Log. Defaults to print.
+        pages (list): rows of id and path from stale_pages
+        log (optional): Logging function. Defaults to print.
 
     Returns:
-        dict: dictionary of counts
+        dict: counts of fetched, changed, not_found and failed
     """
     counts = {"fetched": 0, "changed": 0, "not_found": 0, "failed": 0}
-    try:
-        for row in pages:
-            fetch = client.get_html(row["path"])
-            if fetch.outcome is Outcome.FOUND:
-                changed = store_meta(conn, row["id"], fetch.page, time.time())
-                counts["fetched"] += 1
-                if changed:
-                    counts["changed"] += 1
-                    iso = datetime.fromtimestamp(
-                        fetch.page["modified_at"], UTC
-                    ).isoformat()
-                    log(f"{row['path']}: modified_at changed to {iso}")
-            elif fetch.outcome is Outcome.NOT_FOUND:
-                counts["not_found"] += 1
-            else:
-                counts["failed"] += 1
-                log(f"{row['path']}: {fetch.error}")
-    except BudgetExceeded:
-        log("budget exceeded")
+
+    def html(row) -> Fetch:
+        return client.get_html(row["path"])
+
+    with Pool(client) as pool:
+        try:
+            for row, fetch in pool.map(html, pages):
+                if fetch.outcome is Outcome.FOUND:
+                    changed = store_meta(conn, row["id"], fetch.page, time.time())
+                    counts["fetched"] += 1
+                    if changed:
+                        counts["changed"] += 1
+                        iso = datetime.fromtimestamp(
+                            fetch.page["modified_at"], UTC
+                        ).isoformat()
+                        log(f"{row['path']}: modified_at changed to {iso}")
+                elif fetch.outcome is Outcome.NOT_FOUND:
+                    counts["not_found"] += 1
+                else:
+                    counts["failed"] += 1
+                    log(f"{row['path']}: {fetch.error}")
+        except BudgetExceeded:
+            log("budget exceeded")
     return counts
 
 
@@ -643,15 +679,37 @@ def run_explain(conn: Connection, path: str, log=print) -> bool:
     return True
 
 
+# How many lookups in a row a feed may refuse (401 or 403) before run_enrich
+# takes its key to be refused, and how many in a row may get no answer before
+# it takes the feed to be down. One refusal can be about one value, and OTX
+# times out on about one lookup in ten (five of 50 on 23 November 2026).
+REFUSED_LIMIT = 2
+NO_ANSWER_LIMIT = 5
+
+
 def run_enrich(
-    conn: Connection, client: FeedClient, refresh: bool = False, log=print
+    conn: Connection,
+    client: FeedClient,
+    refresh: bool = False,
+    log=print,
+    recheck_s: float | None = None,
+    clock=time.time,
 ) -> dict:
     """Function to look every stored indicator up in every feed the client has a key for
 
     An answer that is already stored is not asked for again unless refresh
-    is set, so a run that was cut off picks up where it stopped. A failed
-    lookup stores nothing and is tried again next run. A feed that answers
-    429 has run out of quota and is left alone for the rest of the run.
+    is set, so a run that was cut off picks up where it stopped. The one
+    exception is an UNKNOWN whose first answer has become recheck_s old: it
+    is asked for once more, because a feed may list an indicator days after
+    the sweep found it. A failed lookup stores nothing. One that got no answer, or a server error, is
+    tried once more when the others are done, because a feed that timed out
+    has usually answered by then; after that it is left for the next run.
+
+    A feed is left alone for the rest of the run when its quota is spent
+    (a 429), when it refuses REFUSED_LIMIT lookups in a row or its key
+    check, or when NO_ANSWER_LIMIT lookups in a row get no answer. A feed
+    whose wrong key would not show in a lookup is asked about its key before
+    its first lookup of the run.
 
     Args:
         conn (Connection): SQL db connection
@@ -659,47 +717,144 @@ def run_enrich(
         refresh (bool, optional): ask again for answers that are already
             stored. Defaults to False.
         log (optional): Logging function. Defaults to print.
+        recheck_s (float | None, optional): the age in seconds at which a
+            stored UNKNOWN is asked for once more, or None for never.
+            Defaults to None.
+        clock (optional): function returning the time in seconds since the
+            epoch, for the answers' dates. Defaults to time.time.
 
     Returns:
-        dict: counts of looked_up, cached, known, unknown and failed
+        dict: counts of looked_up, cached, known, unknown, failed, retried
+            and set_aside. looked_up counts each indicator and feed once and
+            is the sum of known, unknown and failed; retried is how many of
+            them were asked a second time; set_aside is how many feeds were
+            left alone part of the way, so the table is not whole.
     """
-    counts = {"looked_up": 0, "cached": 0, "known": 0, "unknown": 0, "failed": 0}
-    spent = set()
+    counts = {
+        "looked_up": 0,
+        "cached": 0,
+        "known": 0,
+        "unknown": 0,
+        "failed": 0,
+        "retried": 0,
+        "set_aside": 0,
+    }
+    aside = set()  # feeds left alone for the rest of the run
+    checked = set()  # feeds whose key check has been made
+    again = []  # (indicator, feed) of the lookups to try once more
+    streak = {}  # feed to (kind of failure, how many lookups in a row ended in it)
+
+    def set_aside(feed: str, why: str) -> None:
+        aside.add(feed)
+        counts["set_aside"] += 1
+        log(f"{feed}: {why}")
+
+    def ask(indicator: Row, feed: str, second_try: bool) -> None:
+        lookup = client.lookup(feed, indicator["kind"], indicator["value"])
+        if not second_try:
+            counts["looked_up"] += 1
+        if lookup.verdict is not Verdict.FAILED:
+            streak.pop(feed, None)
+            if second_try:
+                # It was counted as failed the first time and has an answer now
+                counts["failed"] -= 1
+            save_lookup(
+                conn,
+                indicator["id"],
+                feed,
+                lookup.verdict.name,
+                lookup.detail,
+                clock(),
+            )
+            if lookup.verdict is Verdict.KNOWN:
+                counts["known"] += 1
+                log(f"{indicator['value']}: known to {feed} ({lookup.detail})")
+            else:
+                counts["unknown"] += 1
+            return
+        if not second_try:
+            counts["failed"] += 1
+        kind = failure_kind(lookup.status)
+        if kind == "quota":
+            set_aside(feed, "quota spent, left for the next run")
+            return
+        # Any other failure is about this one lookup until the next ones end the same way
+        before = streak.get(feed, (kind, 0))
+        running = before[1] + 1 if before[0] == kind else 1
+        streak[feed] = (kind, running)
+        if second_try:
+            log(f"{feed} {indicator['value']}: {lookup.detail} again, left for the next run")
+        else:
+            log(f"{feed} {indicator['value']}: {lookup.detail}")
+            if kind == "transient":
+                again.append((indicator, feed))
+        if kind == "refused" and running >= REFUSED_LIMIT:
+            set_aside(
+                feed,
+                f"refused {running} lookups running, its key ({KEY_NAMES[feed]}) "
+                "or this address is not accepted; not asked in this run",
+            )
+        elif kind == "transient" and running >= NO_ANSWER_LIMIT:
+            set_aside(feed, f"no answer to {running} lookups running, left for the next run")
+
     try:
         for indicator in indicator_rows(conn):
-            cached = set() if refresh else cached_feeds(conn, indicator["id"])
+            cached = set() if refresh else cached_feeds(conn, indicator["id"], recheck_s, clock())
             for feed in client.feeds():
                 if feed in cached:
                     counts["cached"] += 1
                     continue
-                if feed in spent:
+                if feed in aside:
                     continue
-                lookup = client.lookup(feed, indicator["kind"], indicator["value"])
-                counts["looked_up"] += 1
-                if lookup.verdict is Verdict.FAILED:
-                    counts["failed"] += 1
-                    if lookup.status == 429:
-                        spent.add(feed)
-                        log(f"{feed}: quota spent, left for the next run")
-                    else:
-                        log(f"{feed} {indicator['value']}: {lookup.detail}")
-                    continue
-                save_lookup(
-                    conn,
-                    indicator["id"],
-                    feed,
-                    lookup.verdict.name,
-                    lookup.detail,
-                    time.time(),
-                )
-                if lookup.verdict is Verdict.KNOWN:
-                    counts["known"] += 1
-                    log(f"{indicator['value']}: known to {feed} ({lookup.detail})")
-                else:
-                    counts["unknown"] += 1
+                if feed not in checked:
+                    # Before the feed's first lookup and not before: a run
+                    # with nothing to ask sends nothing
+                    checked.add(feed)
+                    key = client.check_key(feed)
+                    if key is KeyCheck.REFUSED:
+                        set_aside(feed, f"key refused ({KEY_NAMES[feed]}), not asked in this run")
+                        continue
+                    if key is KeyCheck.FAILED:
+                        log(f"{feed}: the key check gave no clear answer, the key is not verified")
+                ask(indicator, feed, second_try=False)
+        for indicator, feed in again:
+            if feed in aside:
+                continue
+            ask(indicator, feed, second_try=True)
+            counts["retried"] += 1
     except BudgetExceeded:
         log("budget exceeded")
     return counts
+
+
+def keyed_feeds(path: Path) -> tuple[str, ...]:
+    """The feeds the config file has a key for, for the novelty table
+
+    The table is printed from what is stored and needs no key. It reads the
+    config only to learn which feeds are in use, so that a feed with a key
+    and no answer yet is waited for. With no config file it goes by the
+    answers alone.
+
+    Args:
+        path (Path): Path to the config.env file
+
+    Returns:
+        tuple[str, ...]: feed names in FEEDS order, or none if the file
+            cannot be read
+    """
+    try:
+        keys = feed_keys(load_config(path))
+    except OSError:
+        return ()
+    return tuple(feed for feed in FEEDS if feed in keys)
+
+
+# How many requests are under way at once. A request takes about 150 ms from
+# the VPS (146 to 149 ms at the median over the nights of 22 and 23 November
+# 2026), so 8 a second needs one or two under way; four leaves room for a
+# slow answer without ever going past --rate.
+WORKERS = 4
+WORKERS_HELP = "requests under way at once; they reach --rate, never pass it"
 
 
 def parse_args(argv: list[str]):
@@ -725,6 +880,7 @@ def parse_args(argv: list[str]):
     crowd.add_argument("--gap", type=int, default=2)
     crowd.add_argument("--rate", type=float, default=8.0)
     crowd.add_argument("--budget", type=int, default=None)
+    crowd.add_argument("--workers", type=int, default=WORKERS, help=WORKERS_HELP)
     crowd.add_argument("--today", type=date.fromisoformat, default=None)
     crowd.add_argument(
         "--unfrozen", action="store_true", help="skip the SHA256SUMS check"
@@ -736,6 +892,7 @@ def parse_args(argv: list[str]):
     sweep.add_argument("--gap", type=int, default=2)
     sweep.add_argument("--rate", type=float, default=8.0)
     sweep.add_argument("--budget", type=int, default=230000)
+    sweep.add_argument("--workers", type=int, default=WORKERS, help=WORKERS_HELP)
     sweep.add_argument("--cap", type=int, default=None)
     sweep.add_argument(
         "--count-only-above",
@@ -771,6 +928,7 @@ def parse_args(argv: list[str]):
     meta.add_argument("--db", type=Path, default=Path("data/graphwatch.sqlite"))
     meta.add_argument("--rate", type=float, default=8.0)
     meta.add_argument("--budget", type=int, default=230000)
+    meta.add_argument("--workers", type=int, default=WORKERS, help=WORKERS_HELP)
     meta.add_argument("--limit", type=int, default=5000)
     meta.add_argument("--stale", type=float, required=True, help="hours")
     freeze = sub.add_parser("freeze", help="write wordlists/SHA256SUMS")
@@ -791,6 +949,12 @@ def parse_args(argv: list[str]):
     )
     enrich.add_argument("--budget", type=int, default=None)
     enrich.add_argument(
+        "--recheck-days",
+        type=float,
+        default=14.0,
+        help="ask once more for an UNKNOWN whose first answer is this many days old; 0 for never",
+    )
+    enrich.add_argument(
         "--table", action="store_true", help="print the novelty table and exit"
     )
 
@@ -807,6 +971,8 @@ def main(argv: list[str] | None = None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
     if args.command == "sweep" and args.days is not None and args.days < 1:
         raise SystemExit("--days has to be 1 or more")
+    if getattr(args, "workers", 1) < 1:
+        raise SystemExit("--workers has to be 1 or more")
     if args.command == "freeze":
         run_freeze(args.wordlists, log=lambda s: print(s, flush=True))
         return
@@ -826,7 +992,8 @@ def main(argv: list[str] | None = None):
         conn = connect(args.db)
         if args.table:
             # No client is built: the table is read from what is stored.
-            print(render_novelty_table(novelty_rows(conn)), end="", flush=True)
+            table = render_novelty_table(novelty_rows(conn), in_use=keyed_feeds(args.config))
+            print(table, end="", flush=True)
             return
         try:
             keys = feed_keys(load_config(args.config))
@@ -849,6 +1016,7 @@ def main(argv: list[str] | None = None):
                 seen.first_seen,
                 seen.last_seen,
                 seen.pages,
+                dict(seen.titles),
             )
         listed = []
         if args.file is not None:
@@ -875,21 +1043,24 @@ def main(argv: list[str] | None = None):
         )
         client = FeedClient(keys, budget=args.budget, log=http_logger(conn))
         started = time.time()
-        counts = run_enrich(conn, client, args.refresh, log=out)
+        recheck_s = args.recheck_days * 86400 if args.recheck_days > 0 else None
+        counts = run_enrich(conn, client, args.refresh, log=out, recheck_s=recheck_s)
         out(
             f"looked up {counts['looked_up']:,}, cached {counts['cached']:,}, "
             f"known {counts['known']:,}, unknown {counts['unknown']:,}, "
-            f"failed {counts['failed']:,}, {client.requests_made:,} requests, "
-            f"{time.time() - started:.0f}s"
+            f"failed {counts['failed']:,}, retried {counts['retried']:,}, "
+            f"{client.requests_made:,} requests, {time.time() - started:.0f}s"
         )
-        verdicts = Counter(
-            novelty({feed: verdict for feed, (verdict, _detail) in row["lookups"].items()})
-            for row in novelty_rows(conn)
-        )
+        verdicts = count_verdicts(novelty_rows(conn), in_use=client.feeds())
         out(
             f"{sum(verdicts.values())} indicators: {verdicts['novel']} novel, "
             f"{verdicts['known']} known, {verdicts['unchecked']} unchecked"
         )
+        if counts["set_aside"]:
+            # Everything that was answered is stored. The status is for cron:
+            # a feed that was left alone means the table is not whole
+            feeds_left = "1 feed was" if counts["set_aside"] == 1 else f"{counts['set_aside']} feeds were"
+            raise SystemExit(f"{feeds_left} left alone part of the way, see above; run enrich again")
         return
     if args.command == "sweep":
         key = require_key(args.config)
@@ -899,7 +1070,7 @@ def main(argv: list[str] | None = None):
         entries = load_frozen(args.wordlists, args.unfrozen)
     conn = connect(args.db)
     client = TelegraphClient(
-        rate_per_s=args.rate, budget=args.budget, log=http_logger(conn)
+        rate_per_s=args.rate, budget=args.budget, log=http_logger(conn), workers=args.workers
     )
     if resweep:
         started = time.time()
